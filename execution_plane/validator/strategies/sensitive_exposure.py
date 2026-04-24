@@ -48,8 +48,18 @@ class SensitiveExposureStrategy(ValidationStrategy):
         if confidence < _MIN_PROOF_CONFIDENCE_THRESHOLD:
             return None
 
+        probe_context = self._extract_probe_context(attack_probe.request)
+        probe_type = str(probe_context.get("probe_type") or "")
+        parent_finding_id = probe_context.get("parent_finding_id")
+
         summary = "Sensitive exposure proof: response contains credential/token/PII indicator patterns"
         evidence_notes = f"matches={', '.join(sorted(matches))}; request_has_auth={request_has_auth}"
+        if probe_type.startswith("impact_"):
+            summary = f"Sensitive exposure impact proof: {probe_type} confirmed sensitive material remains reachable"
+            evidence_notes = (
+                f"{evidence_notes}; follow_up=true; impact_probe={probe_type}; "
+                f"parent_finding_id={parent_finding_id or 'unknown'}; safe_mode=true"
+            )
 
         return ProofArtifact(
             attack_task_id=attack_probe.attack_task_id,
@@ -113,3 +123,15 @@ class SensitiveExposureStrategy(ValidationStrategy):
             if key.lower() in _AUTH_HEADER_NAMES:
                 return True
         return False
+
+    def _extract_probe_context(self, request: dict[str, Any]) -> dict[str, Any]:
+        body = request.get("body")
+        if not isinstance(body, str) or not body.strip():
+            return {}
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        return parsed

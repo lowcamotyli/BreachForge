@@ -271,3 +271,34 @@ async def test_execute_fails_closed_when_rate_limiter_denies(monkeypatch: pytest
 
     redis_client.xadd.assert_not_called()
     assert len(rate_limiter.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_impact_unauthenticated_repeat_omits_auth_material(monkeypatch: pytest.MonkeyPatch) -> None:
+    call_order: list[str] = []
+    redis_client = MagicMock()
+    redis_client.xadd.return_value = "1-0"
+    rate_limiter = _FakeRateLimiter(allow=True)
+
+    async def _to_thread_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(attack_worker_module.asyncio, "to_thread", _to_thread_inline)
+    monkeypatch.setattr(
+        attack_worker_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: _FakeAsyncClient(call_order=call_order, **kwargs),
+    )
+
+    worker = AttackWorker(redis_client=redis_client, rate_limiter=rate_limiter)
+    task = _build_task()
+    task.hypothesis = '{"probe_type": "impact_unauthenticated_repeat", "safe_mode": true}'
+    task.endpoint.method = "get"
+    session = _build_session(task.scan_id)
+
+    raw_probe = await worker.execute(task, session)
+
+    request_headers = {str(k).lower(): v for k, v in raw_probe.request["headers"].items()}
+    assert "authorization" not in request_headers
+    assert "x-csrf-token" not in request_headers
+    assert "cookie" not in request_headers

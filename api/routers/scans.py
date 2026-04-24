@@ -61,6 +61,20 @@ def _status_value(value: Any) -> str:
     return str(value)
 
 
+def _count_result_value(result: Any) -> int:
+    if hasattr(result, "scalar_one"):
+        value = result.scalar_one()
+    else:
+        value = result.scalar_one_or_none()
+    return value if isinstance(value, int) else 0
+
+
+def _all_result_rows(result: Any) -> list[Any]:
+    if not hasattr(result, "all"):
+        return []
+    return list(result.all())
+
+
 def _append_scan_event(
     events: list[ScanEventResponse],
     *,
@@ -91,17 +105,17 @@ async def _build_scan_debug_details(db: AsyncSession, scan_id: UUID, scan: Scan)
         .join(Endpoint, Endpoint.asset_map_id == AssetMap.id)
         .where(AssetMap.scan_id == scan_id)
     )
-    endpoint_count = int(endpoint_count_result.scalar_one() or 0)
+    endpoint_count = _count_result_value(endpoint_count_result)
 
     task_status_result = await db.execute(
         select(AttackTask.status, func.count(AttackTask.id))
         .where(AttackTask.scan_id == scan_id)
         .group_by(AttackTask.status)
     )
-    task_status_counts = {_status_value(row[0]): int(row[1]) for row in task_status_result.all()}
+    task_status_counts = {_status_value(row[0]): int(row[1]) for row in _all_result_rows(task_status_result)}
 
     finding_count_result = await db.execute(select(func.count(Finding.id)).where(Finding.scan_id == scan_id))
-    finding_count = int(finding_count_result.scalar_one() or 0)
+    finding_count = _count_result_value(finding_count_result)
 
     return {
         "scan_id": str(scan.id),
@@ -157,7 +171,7 @@ async def create_scan(payload: ScanCreate, db: AsyncSession = Depends(get_db)) -
             scan_id=str(scan.id),
             phase=scan.phase,
             status=_status_value(scan.status),
-            queue=queue.name,
+            queue=getattr(queue, "name", "auth_bootstrap"),
         )
     except Exception as exc:
         logger.exception("auth_bootstrap_enqueue_failed", scan_id=str(scan.id), error=str(exc))
@@ -232,7 +246,7 @@ async def get_scan_events(scan_id: UUID, db: AsyncSession = Depends(get_db)) -> 
         .join(Endpoint, Endpoint.asset_map_id == AssetMap.id)
         .where(AssetMap.scan_id == scan_id)
     )
-    endpoint_count = int(endpoint_count_result.scalar_one() or 0)
+    endpoint_count = _count_result_value(endpoint_count_result)
     if endpoint_count > 0:
         _append_scan_event(
             events,
@@ -257,7 +271,7 @@ async def get_scan_events(scan_id: UUID, db: AsyncSession = Depends(get_db)) -> 
         .where(AttackTask.scan_id == scan_id)
         .group_by(AttackTask.status)
     )
-    task_status_counts = {_status_value(row[0]): int(row[1]) for row in task_status_result.all()}
+    task_status_counts = {_status_value(row[0]): int(row[1]) for row in _all_result_rows(task_status_result)}
     if task_status_counts:
         _append_scan_event(
             events,
@@ -274,7 +288,7 @@ async def get_scan_events(scan_id: UUID, db: AsyncSession = Depends(get_db)) -> 
         .group_by(AttackTask.attack_class)
         .order_by(AttackTask.attack_class)
     )
-    task_class_counts = {str(row[0]): int(row[1]) for row in task_class_result.all()}
+    task_class_counts = {str(row[0]): int(row[1]) for row in _all_result_rows(task_class_result)}
     if task_class_counts:
         _append_scan_event(
             events,
@@ -286,7 +300,7 @@ async def get_scan_events(scan_id: UUID, db: AsyncSession = Depends(get_db)) -> 
         )
 
     finding_count_result = await db.execute(select(func.count(Finding.id)).where(Finding.scan_id == scan_id))
-    finding_count = int(finding_count_result.scalar_one() or 0)
+    finding_count = _count_result_value(finding_count_result)
     if finding_count > 0:
         _append_scan_event(
             events,

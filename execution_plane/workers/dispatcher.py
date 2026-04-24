@@ -1,6 +1,9 @@
 from __future__ import annotations
 # dispatcher.py - RQ jobs for attack dispatch and scan finalization
 
+AUTONOMOUS_ATTACK_ROUNDS_ENV = "AUTONOMOUS_ATTACK_ROUNDS"
+DEFAULT_AUTONOMOUS_ATTACK_ROUNDS = 2
+
 
 def dispatch_attack_tasks(scan_id: str) -> None:
     import asyncio
@@ -210,7 +213,24 @@ async def _finalize_scan_async(scan_id: str) -> None:
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     connection = Redis.from_url(redis_url, decode_responses=True)
-    await _validate_and_score_evidence(scan_uuid=scan_uuid, redis_connection=connection, logger=logger)
+    max_rounds = _autonomous_attack_rounds(os.getenv(AUTONOMOUS_ATTACK_ROUNDS_ENV))
+    for round_index in range(max_rounds + 1):
+        await _validate_and_score_evidence(scan_uuid=scan_uuid, redis_connection=connection, logger=logger)
+        if round_index >= max_rounds:
+            break
+
+        follow_up_task_ids = await _create_autonomous_follow_up_tasks(scan_uuid=scan_uuid, logger=logger)
+        if not follow_up_task_ids:
+            break
+
+        logger.info(
+            "autonomous_attack_followups_executing",
+            scan_id=str(scan_uuid),
+            round=round_index + 1,
+            task_count=len(follow_up_task_ids),
+        )
+        for task_id in follow_up_task_ids:
+            await _execute_attack_async(str(task_id))
 
     async with AsyncSessionLocal() as db:
         from control_plane.orchestrator import ScanOrchestrator
@@ -223,6 +243,129 @@ async def _finalize_scan_async(scan_id: str) -> None:
         await orchestrator.on_all_validated(scan_uuid)
 
     logger.info("scan_finalized", scan_id=scan_id)
+
+
+def _autonomous_attack_rounds(raw_value: object) -> int:
+    if raw_value is None:
+        return DEFAULT_AUTONOMOUS_ATTACK_ROUNDS
+    try:
+        parsed = int(str(raw_value))
+    except ValueError:
+        return DEFAULT_AUTONOMOUS_ATTACK_ROUNDS
+    return min(max(parsed, 0), 5)
+
+
+async def _create_autonomous_follow_up_tasks(*, scan_uuid: object, logger: object) -> list[object]:
+    import json
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+    from storage.db.models import AttackTask, AttackTaskStatus, Finding, ProofArtifact
+    from storage.db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Finding)
+            .where(Finding.scan_id == scan_uuid)
+            .options(
+                selectinload(Finding.affected_endpoint),
+                selectinload(Finding.proof_artifacts).selectinload(ProofArtifact.attack_task),
+            )
+        )
+        findings = result.scalars().all()
+
+        created_task_ids: list[object] = []
+        for finding in findings:
+            if finding.attack_class != "sensitive_exposure":
+                continue
+            endpoint = finding.affected_endpoint
+            if endpoint is None:
+                continue
+
+            evidence_notes = " ".join(str(artifact.evidence_notes or "") for artifact in finding.proof_artifacts)
+            follow_ups = _sensitive_exposure_follow_up_payloads(
+                finding_id=str(finding.id),
+                evidence_notes=evidence_notes,
+            )
+            for target_parameter, payload in follow_ups:
+                existing = await db.execute(
+                    select(AttackTask.id).where(
+                        AttackTask.scan_id == scan_uuid,
+                        AttackTask.endpoint_id == endpoint.id,
+                        AttackTask.attack_class == "sensitive_exposure",
+                        AttackTask.target_parameter == target_parameter,
+                    )
+                )
+                if existing.scalar_one_or_none() is not None:
+                    continue
+
+                task = AttackTask(
+                    scan_id=scan_uuid,
+                    endpoint_id=endpoint.id,
+                    attack_class="sensitive_exposure",
+                    target_parameter=target_parameter,
+                    hypothesis=json.dumps(payload, sort_keys=True),
+                    priority_score=99.0,
+                    status=AttackTaskStatus.pending,
+                )
+                db.add(task)
+                await db.flush()
+                created_task_ids.append(task.id)
+
+        await db.commit()
+
+    logger.info(
+        "autonomous_attack_followups_created",
+        scan_id=str(scan_uuid),
+        task_count=len(created_task_ids),
+    )
+    return created_task_ids
+
+
+def _sensitive_exposure_follow_up_payloads(
+    *,
+    finding_id: str,
+    evidence_notes: str,
+) -> list[tuple[str, dict[str, object]]]:
+    normalized_notes = evidence_notes.lower()
+    payloads: list[tuple[str, dict[str, object]]] = [
+        (
+            f"impact.unauthenticated_repeat.{finding_id}",
+            {
+                "probe_type": "impact_unauthenticated_repeat",
+                "parent_finding_id": finding_id,
+                "safe_mode": True,
+                "goal": "repeat the exposure safely to prove unauthenticated reachability",
+            },
+        )
+    ]
+
+    if "credential" in normalized_notes or "token" in normalized_notes:
+        payloads.append(
+            (
+                f"impact.secret_classification.{finding_id}",
+                {
+                    "probe_type": "impact_secret_classification",
+                    "parent_finding_id": finding_id,
+                    "safe_mode": True,
+                    "goal": "classify exposed secret-like material without replaying it destructively",
+                },
+            )
+        )
+
+    if "pii" in normalized_notes:
+        payloads.append(
+            (
+                f"impact.data_abuse.{finding_id}",
+                {
+                    "probe_type": "impact_data_abuse",
+                    "parent_finding_id": finding_id,
+                    "safe_mode": True,
+                    "goal": "confirm whether exposed data supports user targeting or privacy impact",
+                },
+            )
+        )
+    return payloads
 
 
 async def _validate_and_score_evidence(*, scan_uuid: object, redis_connection: object, logger: object) -> None:

@@ -100,7 +100,7 @@ class AttackWorker:
                 await self._enforce_rate_limit(scan_id=str(task.scan_id), domain=domain, method=method, worker_id=worker_id)
                 await self._apply_timing_profile(hypothesis_config.get("timing_profile"))
 
-                cookies = self._to_httpx_cookies(execution_session.cookies)
+                cookies = self._build_probe_cookies(session=execution_session, probe_type=probe_type)
                 async with httpx.AsyncClient(headers=request_headers, cookies=cookies, follow_redirects=True) as client:
                     request, response, latency_ms = await self._send_request(
                         client=client,
@@ -239,6 +239,9 @@ class AttackWorker:
         return headers
 
     def _build_probe_headers(self, session: SessionSnapshot, probe_type: Any) -> dict[str, str]:
+        if probe_type == "impact_unauthenticated_repeat":
+            return {}
+
         if probe_type == "replay":
             replay_headers: dict[str, str] = {}
             for key, value in session.auth_headers.items():
@@ -253,6 +256,11 @@ class AttackWorker:
         elif probe_type == "stale_session":
             headers["X-Session-Age"] = "99999"
         return headers
+
+    def _build_probe_cookies(self, session: SessionSnapshot, probe_type: Any) -> httpx.Cookies:
+        if probe_type == "impact_unauthenticated_repeat":
+            return httpx.Cookies()
+        return self._to_httpx_cookies(session.cookies)
 
     def _build_request_body(self, task: AttackTask) -> bytes | None:
         if not task.hypothesis:

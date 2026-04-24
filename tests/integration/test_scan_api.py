@@ -107,7 +107,7 @@ def test_post_and_get_scan_with_mock_db_and_mock_redis(monkeypatch) -> None:
     assert get_response.status_code == 200
     get_body = get_response.json()
     assert get_body["id"] == scan_id
-    assert get_body["status"] == "created"
+    assert get_body["status"] == "running"
     assert len(fake_queue.calls) == 1
 
     app.dependency_overrides.clear()

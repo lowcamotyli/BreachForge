@@ -243,6 +243,8 @@ class ExploitValidator:
 
         finding_id = artifact.finding_id or uuid4()
         artifact.finding_id = finding_id
+        if artifact.id is None:
+            artifact.id = uuid4()
 
         await self._persist_probes_to_db(attack_probe=attack_probe, control_probe=control_probe)
 

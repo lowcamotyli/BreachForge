@@ -320,7 +320,8 @@ async def _score_artifact_async(scan_id: str, finding_id: str, artifact_payload:
         )
 
         scorer = FindingScorer(db=db)
-        finding = await scorer.score(artifact=artifact, endpoint=attack_task.endpoint)
+        with db.no_autoflush:
+            finding = await scorer.score(artifact=artifact, endpoint=attack_task.endpoint)
         scoring_output = scorer.score_output(artifact=artifact)
         await db.commit()
 

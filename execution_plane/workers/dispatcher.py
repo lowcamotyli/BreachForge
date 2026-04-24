@@ -198,9 +198,7 @@ def finalize_scan(scan_id: str) -> None:
 
 
 async def _finalize_scan_async(scan_id: str) -> None:
-    import asyncio
     import os
-    import time
     from uuid import UUID
 
     import structlog
@@ -212,15 +210,7 @@ async def _finalize_scan_async(scan_id: str) -> None:
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     connection = Redis.from_url(redis_url, decode_responses=True)
-    score_queue_name = os.getenv("RQ_FINDING_SCORER_QUEUE", "finding_scorer")
-    score_queue_key = f"rq:queue:{score_queue_name}"
-
-    deadline = time.monotonic() + 120
-    while time.monotonic() < deadline:
-        queued = await asyncio.to_thread(connection.llen, score_queue_key)
-        if queued == 0:
-            break
-        await asyncio.sleep(3)
+    await _validate_and_score_evidence(scan_uuid=scan_uuid, redis_connection=connection, logger=logger)
 
     async with AsyncSessionLocal() as db:
         from control_plane.orchestrator import ScanOrchestrator
@@ -233,3 +223,41 @@ async def _finalize_scan_async(scan_id: str) -> None:
         await orchestrator.on_all_validated(scan_uuid)
 
     logger.info("scan_finalized", scan_id=scan_id)
+
+
+async def _validate_and_score_evidence(*, scan_uuid: object, redis_connection: object, logger: object) -> None:
+    from control_plane.finding_scorer import _score_artifact_async
+    from execution_plane.validator.validator import ExploitValidator
+    from storage.evidence.store import EvidenceStore
+
+    class _InlineFindingQueue:
+        def __init__(self) -> None:
+            self.jobs: list[tuple[str, str, dict[str, object]]] = []
+
+        def enqueue(self, _job_path: str, scan_id: str, finding_id: str, artifact_payload: dict[str, object]) -> None:
+            self.jobs.append((scan_id, finding_id, artifact_payload))
+
+    inline_queue = _InlineFindingQueue()
+    validator = ExploitValidator(redis_client=redis_connection, evidence_store=EvidenceStore())
+    validator._finding_queue = inline_queue
+
+    processed_messages = 0
+    while True:
+        processed = await validator.process_once(scan_uuid)
+        if processed == 0:
+            break
+        processed_messages += processed
+
+    for score_scan_id, finding_id, artifact_payload in inline_queue.jobs:
+        await _score_artifact_async(
+            scan_id=score_scan_id,
+            finding_id=finding_id,
+            artifact_payload=artifact_payload,
+        )
+
+    logger.info(
+        "scan_evidence_validated",
+        scan_id=str(scan_uuid),
+        evidence_messages=processed_messages,
+        scoring_jobs=len(inline_queue.jobs),
+    )

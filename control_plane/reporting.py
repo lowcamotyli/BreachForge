@@ -89,6 +89,12 @@ class ReportingService:
                         finding_description=finding.description,
                         artifacts=artifacts,
                     ),
+                    "attacker_impact": self._build_attacker_impact(
+                        attack_class=finding.attack_class,
+                        endpoint_method=finding.affected_endpoint.method,
+                        endpoint_url=finding.affected_endpoint.url_pattern,
+                        artifacts=artifacts,
+                    ),
                     "score_explanation": self._score_explanation_for_artifacts(artifacts),
                 }
             )
@@ -179,6 +185,18 @@ class ReportingService:
                         "",
                     ]
                 )
+
+            lines.append("### Attacker Impact")
+            attacker_impact = finding.get("attacker_impact", [])
+            if not attacker_impact:
+                lines.extend(["- No attacker impact expansion available", ""])
+            else:
+                for impact_item in attacker_impact:
+                    lines.append(
+                        f"- {impact_item.get('stage', '')}: {impact_item.get('description', '')} "
+                        f"(confidence: {impact_item.get('confidence', '')})"
+                    )
+                lines.append("")
 
         return "\n".join(lines)
 
@@ -498,6 +516,98 @@ class ReportingService:
             return None
         scored_artifacts.sort(key=lambda item: item[0], reverse=True)
         return scored_artifacts[0][1]
+
+    def _build_attacker_impact(
+        self,
+        *,
+        attack_class: str,
+        endpoint_method: str,
+        endpoint_url: str,
+        artifacts: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        if attack_class != "sensitive_exposure":
+            return []
+
+        notes = " ".join(str(artifact.get("evidence_notes") or "") for artifact in artifacts)
+        evidence_text = " ".join(
+            json.dumps(artifact.get(key, {}), ensure_ascii=False, default=str)
+            for artifact in artifacts
+            for key in ("request", "response")
+        )
+        combined = f"{notes}\n{evidence_text}".lower()
+        unauthenticated = "request_has_auth=false" in combined
+
+        impacts: list[dict[str, str]] = [
+            {
+                "stage": "exposure",
+                "description": (
+                    f"{endpoint_method.upper()} {endpoint_url} returned sensitive-looking material "
+                    f"{'without authentication' if unauthenticated else 'inside an authenticated response'}."
+                ),
+                "confidence": "high" if unauthenticated else "medium",
+            }
+        ]
+
+        if "devtools://" in combined or "__nextjs_attach-nodejs-inspector" in combined or "127.0.0.1:9229" in combined:
+            impacts.append(
+                {
+                    "stage": "pivot",
+                    "description": (
+                        "The response exposes a Next.js/Node inspector attachment signal. "
+                        "A real attacker would next check whether any debug transport is reachable from their network "
+                        "and whether it exposes runtime inspection or source/context data."
+                    ),
+                    "confidence": "high",
+                }
+            )
+
+        if "matches=token" in combined or "bearer" in combined or "session" in combined:
+            impacts.append(
+                {
+                    "stage": "credential replay",
+                    "description": (
+                        "Token-like material was detected. The next proof step is a constrained replay check against "
+                        "an in-scope low-risk endpoint to determine whether the token is valid, scoped, and expired."
+                    ),
+                    "confidence": "medium",
+                }
+            )
+
+        if "matches=credential" in combined or "api_key" in combined or "secret" in combined or "password" in combined:
+            impacts.append(
+                {
+                    "stage": "secret use",
+                    "description": (
+                        "Credential-like material was detected. A real attacker would classify the secret type, infer "
+                        "its service boundary, then try read-only access first; defenders should rotate it and review logs."
+                    ),
+                    "confidence": "medium",
+                }
+            )
+
+        if "matches=pii" in combined or "email" in combined:
+            impacts.append(
+                {
+                    "stage": "data abuse",
+                    "description": (
+                        "PII-like material was detected. Practical impact includes account targeting, phishing context, "
+                        "and privacy exposure, even when no direct account takeover is proven."
+                    ),
+                    "confidence": "medium",
+                }
+            )
+
+        impacts.append(
+            {
+                "stage": "next safe probe",
+                "description": (
+                    "Recommended follow-up: run an in-scope, read-only validation probe that proves reachability or "
+                    "scope of the exposed material without mutating data or reusing credentials destructively."
+                ),
+                "confidence": "advisory",
+            }
+        )
+        return impacts
 
     def _redact_value(self, value: Any) -> Any:
         if isinstance(value, dict):

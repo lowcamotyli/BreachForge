@@ -78,6 +78,15 @@ class EvidenceStore:
         self._put_gzip_json(key, payload)
         return key
 
+    def read_probe(self, scan_id: UUID | str, finding_id: UUID | str, probe_id: UUID | str) -> dict[str, object]:
+        key = f"{self._stringify(scan_id)}/{self._stringify(finding_id)}/{self._stringify(probe_id)}.json.gz"
+        response = self._s3.get_object(Bucket=self._bucket_name, Key=key)
+        body = response["Body"].read()
+        payload = json.loads(gzip.decompress(body).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"Probe evidence payload is not an object: {key}")
+        return payload
+
     def _put_gzip_json(self, key: str, payload: dict[str, object]) -> None:
         body = gzip.compress(json.dumps(payload, default=self._serialize_value, separators=(",", ":")).encode("utf-8"))
         self._s3.put_object(

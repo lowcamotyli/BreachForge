@@ -3,6 +3,8 @@ from __future__ import annotations
 from execution_plane.workers.dispatcher import (
     DEFAULT_AUTONOMOUS_ATTACK_ROUNDS,
     _autonomous_attack_rounds,
+    _extract_replayable_secret,
+    _redacted_follow_up_payload,
     _sensitive_exposure_follow_up_payloads,
 )
 
@@ -34,3 +36,25 @@ def test_sensitive_exposure_follow_ups_expand_by_evidence_type() -> None:
         "impact_data_abuse",
     ]
     assert all(payload["safe_mode"] is True for _target_parameter, payload in follow_ups)
+
+
+def test_extract_replayable_secret_prefers_token_material() -> None:
+    secret = _extract_replayable_secret(
+        {
+            "response": {
+                "body": '{"access_token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature"}',
+            }
+        }
+    )
+
+    assert secret == ("bearer", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature")
+
+
+def test_redacted_follow_up_payload_does_not_persist_secret_value() -> None:
+    payload = {
+        "probe_type": "impact_secret_replay",
+        "secret_kind": "bearer",
+        "secret_value": "live-token",
+    }
+
+    assert _redacted_follow_up_payload(payload)["secret_value"] == "[REDACTED]"

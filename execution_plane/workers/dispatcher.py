@@ -70,7 +70,7 @@ def execute_attack(attack_task_id: str) -> None:
     asyncio.run(_execute_attack_async(attack_task_id))
 
 
-async def _execute_attack_async(attack_task_id: str) -> None:
+async def _execute_attack_async(attack_task_id: str, hypothesis_override: str | None = None) -> None:
     from uuid import UUID
 
     import structlog
@@ -131,7 +131,7 @@ async def _execute_attack_async(attack_task_id: str) -> None:
 
         worker = AttackWorker(auth_manager=manager)
         try:
-            await worker.execute(task, session_snapshot)
+            await worker.execute(task, session_snapshot, hypothesis_override=hypothesis_override)
             task.status = AttackTaskStatus.done
             await db.commit()
         except Exception:
@@ -219,18 +219,21 @@ async def _finalize_scan_async(scan_id: str) -> None:
         if round_index >= max_rounds:
             break
 
-        follow_up_task_ids = await _create_autonomous_follow_up_tasks(scan_uuid=scan_uuid, logger=logger)
-        if not follow_up_task_ids:
+        follow_ups = await _create_autonomous_follow_up_tasks(scan_uuid=scan_uuid, logger=logger)
+        if not follow_ups:
             break
 
         logger.info(
             "autonomous_attack_followups_executing",
             scan_id=str(scan_uuid),
             round=round_index + 1,
-            task_count=len(follow_up_task_ids),
+            task_count=len(follow_ups),
         )
-        for task_id in follow_up_task_ids:
-            await _execute_attack_async(str(task_id))
+        for follow_up in follow_ups:
+            await _execute_attack_async(
+                str(follow_up["task_id"]),
+                hypothesis_override=follow_up.get("hypothesis_override"),
+            )
 
     async with AsyncSessionLocal() as db:
         from control_plane.orchestrator import ScanOrchestrator
@@ -255,14 +258,16 @@ def _autonomous_attack_rounds(raw_value: object) -> int:
     return min(max(parsed, 0), 5)
 
 
-async def _create_autonomous_follow_up_tasks(*, scan_uuid: object, logger: object) -> list[object]:
+async def _create_autonomous_follow_up_tasks(*, scan_uuid: object, logger: object) -> list[dict[str, str | None]]:
     import json
 
     from sqlalchemy import select
     from sqlalchemy.orm import selectinload
     from storage.db.models import AttackTask, AttackTaskStatus, Finding, ProofArtifact
     from storage.db.session import AsyncSessionLocal
+    from storage.evidence.store import EvidenceStore
 
+    evidence_store = EvidenceStore()
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(Finding)
@@ -274,7 +279,7 @@ async def _create_autonomous_follow_up_tasks(*, scan_uuid: object, logger: objec
         )
         findings = result.scalars().all()
 
-        created_task_ids: list[object] = []
+        created_follow_ups: list[dict[str, str | None]] = []
         for finding in findings:
             if finding.attack_class != "sensitive_exposure":
                 continue
@@ -287,7 +292,16 @@ async def _create_autonomous_follow_up_tasks(*, scan_uuid: object, logger: objec
                 finding_id=str(finding.id),
                 evidence_notes=evidence_notes,
             )
+            follow_ups.extend(
+                _safe_secret_replay_follow_up_payloads(
+                    scan_id=str(scan_uuid),
+                    finding_id=str(finding.id),
+                    proof_artifacts=finding.proof_artifacts,
+                    evidence_store=evidence_store,
+                )
+            )
             for target_parameter, payload in follow_ups:
+                persisted_payload = _redacted_follow_up_payload(payload)
                 existing = await db.execute(
                     select(AttackTask.id).where(
                         AttackTask.scan_id == scan_uuid,
@@ -304,22 +318,29 @@ async def _create_autonomous_follow_up_tasks(*, scan_uuid: object, logger: objec
                     endpoint_id=endpoint.id,
                     attack_class="sensitive_exposure",
                     target_parameter=target_parameter,
-                    hypothesis=json.dumps(payload, sort_keys=True),
+                    hypothesis=json.dumps(persisted_payload, sort_keys=True),
                     priority_score=99.0,
                     status=AttackTaskStatus.pending,
                 )
                 db.add(task)
                 await db.flush()
-                created_task_ids.append(task.id)
+                created_follow_ups.append(
+                    {
+                        "task_id": str(task.id),
+                        "hypothesis_override": json.dumps(payload, sort_keys=True)
+                        if payload.get("probe_type") == "impact_secret_replay"
+                        else None,
+                    }
+                )
 
         await db.commit()
 
     logger.info(
         "autonomous_attack_followups_created",
         scan_id=str(scan_uuid),
-        task_count=len(created_task_ids),
+        task_count=len(created_follow_ups),
     )
-    return created_task_ids
+    return created_follow_ups
 
 
 def _sensitive_exposure_follow_up_payloads(
@@ -366,6 +387,86 @@ def _sensitive_exposure_follow_up_payloads(
             )
         )
     return payloads
+
+
+def _redacted_follow_up_payload(payload: dict[str, object]) -> dict[str, object]:
+    redacted = dict(payload)
+    if "secret_value" in redacted:
+        redacted["secret_value"] = "[REDACTED]"
+    return redacted
+
+
+def _safe_secret_replay_follow_up_payloads(
+    *,
+    scan_id: str,
+    finding_id: str,
+    proof_artifacts: list[object],
+    evidence_store: object,
+) -> list[tuple[str, dict[str, object]]]:
+    for artifact in proof_artifacts:
+        notes = str(getattr(artifact, "evidence_notes", "") or "").lower()
+        if "credential" not in notes and "token" not in notes:
+            continue
+
+        attack_probe_id = getattr(artifact, "attack_probe_id", None)
+        if attack_probe_id is None:
+            continue
+        try:
+            probe_payload = evidence_store.read_probe(scan_id=scan_id, finding_id=finding_id, probe_id=str(attack_probe_id))
+        except Exception:
+            continue
+
+        secret = _extract_replayable_secret(probe_payload)
+        if secret is None:
+            continue
+
+        secret_kind, secret_value = secret
+        return [
+            (
+                f"impact.secret_replay.{secret_kind}.{finding_id}",
+                {
+                    "probe_type": "impact_secret_replay",
+                    "parent_finding_id": finding_id,
+                    "secret_kind": secret_kind,
+                    "secret_value": secret_value,
+                    "safe_mode": True,
+                    "goal": "replay an exposed secret once against the same read-only endpoint to confirm it is active",
+                },
+            )
+        ]
+    return []
+
+
+def _extract_replayable_secret(probe_payload: dict[str, object]) -> tuple[str, str] | None:
+    import json
+    import re
+
+    response = probe_payload.get("response")
+    if not isinstance(response, dict):
+        return None
+    body = response.get("body")
+    if not isinstance(body, str):
+        body = json.dumps(body, default=str)
+
+    bearer_match = re.search(r"(?i)\b(?:bearer\s+)?(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b", body)
+    if bearer_match:
+        return ("bearer", bearer_match.group(1))
+
+    token_match = re.search(
+        r"(?i)(?:access[_-]?token|refresh[_-]?token|session[_-]?token|jwt)\s*[\"']?\s*[:=]\s*[\"']?([a-z0-9\-\._~\+/=]{16,})",
+        body,
+    )
+    if token_match:
+        return ("bearer", token_match.group(1))
+
+    api_key_match = re.search(
+        r"(?i)(?:api[_-]?key|client[_-]?secret|secret)\s*[\"']?\s*[:=]\s*[\"']?([a-z0-9_\-\.=]{16,})",
+        body,
+    )
+    if api_key_match:
+        return ("api_key", api_key_match.group(1))
+
+    return None
 
 
 async def _validate_and_score_evidence(*, scan_uuid: object, redis_connection: object, logger: object) -> None:

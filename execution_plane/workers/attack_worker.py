@@ -50,6 +50,7 @@ class AttackWorker:
         task: AttackTask,
         session: SessionSnapshot,
         identity_role: IdentityRole | str | None = None,
+        hypothesis_override: str | None = None,
     ) -> RawProbe:
         self._save_state_snapshot(task=task, status="pre")
         endpoint = task.endpoint
@@ -66,7 +67,7 @@ class AttackWorker:
             execution_session = identity_context.to_session_snapshot()
         raw_probe: RawProbe | None = None
         try:
-            hypothesis_config = self._parse_hypothesis(task.hypothesis)
+            hypothesis_config = self._parse_hypothesis(hypothesis_override if hypothesis_override is not None else task.hypothesis)
             chain_steps = hypothesis_config.get("chain_steps")
             if isinstance(chain_steps, list) and chain_steps:
                 raw_probe = await self._execute_chain_steps(
@@ -79,8 +80,11 @@ class AttackWorker:
                 method = endpoint.method.upper()
                 url = endpoint.url_pattern
                 probe_type = hypothesis_config.get("probe_type")
+                if probe_type == "impact_secret_replay":
+                    self._enforce_safe_secret_replay_method(method=method, task_id=task.id)
                 request_headers = self._build_probe_headers(session=execution_session, probe_type=probe_type)
-                request_body = self._build_request_body(task)
+                self._apply_secret_replay_headers(headers=request_headers, hypothesis_config=hypothesis_config)
+                request_body = self._build_request_body(task=task, probe_type=probe_type)
                 worker_id = self._worker_id()
 
                 domain = self._extract_request_domain(url)
@@ -239,7 +243,7 @@ class AttackWorker:
         return headers
 
     def _build_probe_headers(self, session: SessionSnapshot, probe_type: Any) -> dict[str, str]:
-        if probe_type == "impact_unauthenticated_repeat":
+        if probe_type in {"impact_unauthenticated_repeat", "impact_secret_replay"}:
             return {}
 
         if probe_type == "replay":
@@ -258,11 +262,30 @@ class AttackWorker:
         return headers
 
     def _build_probe_cookies(self, session: SessionSnapshot, probe_type: Any) -> httpx.Cookies:
-        if probe_type == "impact_unauthenticated_repeat":
+        if probe_type in {"impact_unauthenticated_repeat", "impact_secret_replay"}:
             return httpx.Cookies()
         return self._to_httpx_cookies(session.cookies)
 
-    def _build_request_body(self, task: AttackTask) -> bytes | None:
+    def _apply_secret_replay_headers(self, headers: dict[str, str], hypothesis_config: dict[str, Any]) -> None:
+        if hypothesis_config.get("probe_type") != "impact_secret_replay":
+            return
+        secret_value = hypothesis_config.get("secret_value")
+        secret_kind = str(hypothesis_config.get("secret_kind") or "bearer").lower()
+        if not isinstance(secret_value, str) or not secret_value.strip():
+            raise GuardrailViolation("impact_secret_replay requires an in-memory secret_value")
+
+        if secret_kind in {"api_key", "x_api_key"}:
+            headers["X-API-Key"] = secret_value
+            return
+        headers["Authorization"] = secret_value if secret_value.lower().startswith("bearer ") else f"Bearer {secret_value}"
+
+    def _enforce_safe_secret_replay_method(self, *, method: str, task_id: object) -> None:
+        if method not in {"GET", "HEAD", "OPTIONS"}:
+            raise GuardrailViolation(f"Safe secret replay only supports read-only methods for task {task_id}: {method}")
+
+    def _build_request_body(self, task: AttackTask, probe_type: Any = None) -> bytes | None:
+        if probe_type in {"impact_unauthenticated_repeat", "impact_secret_replay"}:
+            return None
         if not task.hypothesis:
             return None
         return task.hypothesis.encode("utf-8")

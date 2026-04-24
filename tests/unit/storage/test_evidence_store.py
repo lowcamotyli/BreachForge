@@ -73,6 +73,24 @@ def test_write_artifact_uses_expected_key_pattern() -> None:
     assert put_kwargs["Key"] == key
 
 
+def test_read_probe_uses_expected_key_and_decompresses_payload() -> None:
+    scan_id = uuid4()
+    finding_id = uuid4()
+    probe_id = uuid4()
+    payload = {"probe_id": str(probe_id), "response": {"body": "ok"}}
+    s3_client = MagicMock()
+    s3_client.get_object.return_value = {"Body": MagicMock(read=lambda: gzip.compress(json.dumps(payload).encode("utf-8")))}
+    store = EvidenceStore(s3_client=s3_client, bucket_name="evidence-bucket")
+
+    loaded = store.read_probe(scan_id=scan_id, finding_id=finding_id, probe_id=probe_id)
+
+    assert loaded == payload
+    s3_client.get_object.assert_called_once_with(
+        Bucket="evidence-bucket",
+        Key=f"{scan_id}/{finding_id}/{probe_id}.json.gz",
+    )
+
+
 def test_write_payloads_are_gzip_compressed() -> None:
     s3_client = MagicMock()
     store = EvidenceStore(s3_client=s3_client, bucket_name="evidence-bucket")

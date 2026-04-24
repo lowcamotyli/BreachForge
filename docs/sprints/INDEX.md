@@ -24,6 +24,14 @@ S1 (Infra+Schema) -> S2 (AuthManager) -> S3 (Crawler) ----->
                                                             S15 (Security Attack Coverage Matrix)
                                                                                          |
                                                             S16 (Attacker Intelligence System)
+                                                                                         |
+                                                            S17 (Secret Intelligence Core)
+                                                                                         |
+                                                            S18 (Safe Blast Radius Mapper) -> S19 (Privilege Fingerprint)
+                                                                                         |
+                                                            S20 (Secret Leak Source) -> S21 (Secret Lifecycle)
+                                                                                         |
+                                                            S22 (Secret Correlation) -> S23 (Secret Reporting Pack)
 ```
 
 ## Sprinty
@@ -46,4 +54,11 @@ S1 (Infra+Schema) -> S2 (AuthManager) -> S3 (Crawler) ----->
 | Sprint 14 | Domkniecie v1: `/auth/verify`, refresh/TOTP input, storage contract cleanup, testy integration + corpus. | [sprint-14-auth-storage-tests.md](./sprint-14-auth-storage-tests.md) |
 | Sprint 15 | Pelna matryca wdrozeniowa 10 typow atakow (task-by-task): rules, worker path, validator, scorer, testy integration i corpus. | [sprint-15-security-attack-coverage.md](./sprint-15-security-attack-coverage.md) |
 | Sprint 16 | Pelny plan 10 capability "top attacker system" + integracja Codex CLI jako advisory analyst podczas wykonywania atakow. | [sprint-16-attacker-intelligence-system.md](./sprint-16-attacker-intelligence-system.md) |
+| Sprint 17 | Secret Intelligence Core: klasyfikacja sekretow, JWT metadata, TTL hints i redaction guarantees. | [sprint-17-secret-intelligence-core.md](./sprint-17-secret-intelligence-core.md) |
+| Sprint 18 | Safe Blast Radius Mapper: bounded read-only replay na wybranych endpointach i status matrix. | [sprint-18-safe-blast-radius-mapper.md](./sprint-18-safe-blast-radius-mapper.md) |
+| Sprint 19 | Privilege Fingerprint: observed vs inferred access level dla aktywnego sekretu. | [sprint-19-privilege-fingerprint.md](./sprint-19-privilege-fingerprint.md) |
+| Sprint 20 | Secret Leak Source Diagnosis: klasyfikacja zrodla wycieku i remediation per source type. | [sprint-20-secret-leak-source-diagnosis.md](./sprint-20-secret-leak-source-diagnosis.md) |
+| Sprint 21 | Secret Lifecycle Assessment: expiration, revocation posture, active-during-scan i TTL guidance. | [sprint-21-secret-lifecycle-assessment.md](./sprint-21-secret-lifecycle-assessment.md) |
+| Sprint 22 | Secret Correlation & Severity Upgrade: korelacja active replay, blast radius, CORS/cache i severity factors. | [sprint-22-secret-correlation-severity.md](./sprint-22-secret-correlation-severity.md) |
+| Sprint 23 | Secret Exposure Reporting & Evidence Pack: finalny Markdown/JSON raport i corpus secret exposure. | [sprint-23-secret-exposure-reporting-pack.md](./sprint-23-secret-exposure-reporting-pack.md) |
 

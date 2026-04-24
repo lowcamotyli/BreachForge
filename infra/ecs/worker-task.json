@@ -1,0 +1,34 @@
+{
+  "family": "proofscan-worker",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::<account-id>:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::<account-id>:role/proofscanWorkerTaskRole",
+  "runtimePlatform": {
+    "operatingSystemFamily": "LINUX",
+    "cpuArchitecture": "X86_64"
+  },
+  "containerDefinitions": [
+    {
+      "name": "worker",
+      "image": "<account-id>.dkr.ecr.<region>.amazonaws.com/proofscan-worker:latest",
+      "essential": true,
+      "environment": [
+        { "name": "DATABASE_URL", "value": "" },
+        { "name": "REDIS_URL", "value": "" },
+        { "name": "AWS_DEFAULT_REGION", "value": "" },
+        { "name": "KMS_MASTER_KEY_ID", "value": "" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/proofscan-worker",
+          "awslogs-region": "<region>",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

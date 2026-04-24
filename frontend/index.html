@@ -1,0 +1,1469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ProofScan</title>
+  <style>
+    :root {
+      --bg: #0b1117;
+      --panel: #121a23;
+      --panel-2: #182330;
+      --text: #dce6f0;
+      --muted: #9ba8b6;
+      --border: #263241;
+      --accent: #3aa0ff;
+      --danger: #e05252;
+      --success: #2ac174;
+      --warning: #f6c453;
+      --radius: 10px;
+      --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+      --font: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: var(--font);
+      background: radial-gradient(circle at 20% -10%, #1a2633 0%, var(--bg) 55%);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.4;
+    }
+
+    .container {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 24px 16px 40px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 18px;
+      background: rgba(18, 26, 35, 0.85);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      margin-bottom: 18px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 1.35rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .health {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: #8a8f96;
+      box-shadow: 0 0 0 4px rgba(138, 143, 150, 0.15);
+    }
+
+    .dot.ok {
+      background: var(--success);
+      box-shadow: 0 0 0 4px rgba(42, 193, 116, 0.2);
+    }
+
+    .dot.bad {
+      background: var(--danger);
+      box-shadow: 0 0 0 4px rgba(224, 82, 82, 0.2);
+    }
+
+    .stack {
+      display: grid;
+      gap: 16px;
+    }
+
+    .card {
+      background: rgba(18, 26, 35, 0.92);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      box-shadow: var(--shadow);
+    }
+
+    .card h2 {
+      margin: 0 0 12px;
+      font-size: 1rem;
+      letter-spacing: 0.02em;
+      color: #eef5fb;
+    }
+
+    .error-box {
+      background: rgba(224, 82, 82, 0.15);
+      border: 1px solid rgba(224, 82, 82, 0.6);
+      color: #ffd6d6;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 14px;
+      font-size: 0.92rem;
+      display: none;
+      white-space: pre-wrap;
+    }
+
+    .grid {
+      display: grid;
+      gap: 12px;
+    }
+
+    .grid.two {
+      grid-template-columns: 1fr;
+    }
+
+    label {
+      display: block;
+      font-size: 0.84rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    input,
+    select,
+    button,
+    textarea {
+      font: inherit;
+    }
+
+    input,
+    select,
+    textarea {
+      width: 100%;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 10px 11px;
+      outline: none;
+      transition: border-color 0.15s ease;
+    }
+
+    input:focus,
+    select:focus,
+    textarea:focus {
+      border-color: var(--accent);
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 0.78rem;
+      margin-top: 6px;
+    }
+
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    button {
+      border: 1px solid #2f455c;
+      border-radius: 8px;
+      color: #e6f2ff;
+      background: linear-gradient(180deg, #24435e, #1b3348);
+      padding: 9px 13px;
+      cursor: pointer;
+      transition: transform 0.06s ease, filter 0.12s ease;
+      white-space: nowrap;
+    }
+
+    button:hover:not(:disabled) {
+      filter: brightness(1.08);
+    }
+
+    button:active:not(:disabled) {
+      transform: translateY(1px);
+    }
+
+    button.secondary {
+      background: linear-gradient(180deg, #25303d, #1b242f);
+      border-color: #34475d;
+    }
+
+    button.warning {
+      background: linear-gradient(180deg, #6e5d2b, #54461f);
+      border-color: #866f2f;
+      color: #ffefc7;
+    }
+
+    button:disabled {
+      opacity: 0.65;
+      cursor: not-allowed;
+    }
+
+    .hidden { display: none !important; }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      padding: 3px 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      border: 1px solid transparent;
+      min-width: 90px;
+    }
+
+    .status-created { background: rgba(138, 143, 150, 0.2); color: #d2d6db; border-color: rgba(170,175,183,0.4); }
+    .status-running { background: rgba(58, 160, 255, 0.2); color: #cbe6ff; border-color: rgba(58,160,255,0.45); }
+    .status-paused { background: rgba(246, 196, 83, 0.2); color: #ffe5a3; border-color: rgba(246,196,83,0.45); }
+    .status-completed { background: rgba(42, 193, 116, 0.18); color: #c8f4dd; border-color: rgba(42,193,116,0.45); }
+    .status-failed { background: rgba(224, 82, 82, 0.2); color: #ffd0d0; border-color: rgba(224,82,82,0.5); }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-top: 10px;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 740px;
+      background: rgba(16, 23, 32, 0.9);
+    }
+
+    th,
+    td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid #223040;
+      vertical-align: top;
+      font-size: 0.88rem;
+    }
+
+    th {
+      color: #b8c6d5;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      background: #13202d;
+    }
+
+    tbody tr:hover {
+      background: rgba(41, 62, 84, 0.25);
+    }
+
+    .severity {
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      border: 1px solid transparent;
+      display: inline-block;
+    }
+
+    .sev-critical { background: rgba(224,82,82,0.2); color: #ffd4d4; border-color: rgba(224,82,82,0.55); }
+    .sev-high { background: rgba(255,148,79,0.2); color: #ffdcbf; border-color: rgba(255,148,79,0.55); }
+    .sev-medium { background: rgba(246,196,83,0.2); color: #ffe9b1; border-color: rgba(246,196,83,0.5); }
+    .sev-low { background: rgba(58,160,255,0.2); color: #cce7ff; border-color: rgba(58,160,255,0.5); }
+    .sev-info { background: rgba(138,143,150,0.2); color: #d7dbe0; border-color: rgba(138,143,150,0.45); }
+
+    .empty {
+      color: var(--muted);
+      font-size: 0.9rem;
+      padding: 12px 2px 4px;
+    }
+
+    .report {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: rgba(13, 19, 26, 0.9);
+      max-height: 340px;
+      overflow: auto;
+      padding: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.85rem;
+      color: #d5e2ef;
+    }
+
+    .console-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin: 14px 0 10px;
+    }
+
+    .console-toolbar h3 {
+      margin: 0;
+      font-size: 0.94rem;
+      letter-spacing: 0.02em;
+      color: #eef5fb;
+    }
+
+    .console {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #070c11;
+      min-height: 220px;
+      max-height: 360px;
+      overflow: auto;
+      padding: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.78rem;
+      color: #d5e2ef;
+    }
+
+    .console-line {
+      display: grid;
+      grid-template-columns: 92px 58px 96px minmax(0, 1fr);
+      gap: 8px;
+      padding: 3px 0;
+      border-bottom: 1px solid rgba(38, 50, 65, 0.45);
+      align-items: start;
+    }
+
+    .console-line:last-child {
+      border-bottom: 0;
+    }
+
+    .console-time,
+    .console-source,
+    .console-detail {
+      color: #8797a8;
+    }
+
+    .console-level {
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+
+    .console-level.info { color: #8bc8ff; }
+    .console-level.warn { color: #ffd276; }
+    .console-level.error { color: #ff9a9a; }
+    .console-message {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .console-detail {
+      display: block;
+      margin-top: 2px;
+      white-space: pre-wrap;
+    }
+
+    .monitor-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .scan-progress {
+      margin-top: 12px;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: rgba(16, 24, 34, 0.92);
+    }
+
+    .phase-stepper {
+      display: grid;
+      grid-template-columns: repeat(9, minmax(0, 1fr));
+      gap: 6px;
+      margin-bottom: 14px;
+    }
+
+    .phase-step {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      gap: 6px;
+      color: #7f8c9a;
+    }
+
+    .phase-dot {
+      width: 20px;
+      height: 20px;
+      border-radius: 999px;
+      border: 2px solid #415164;
+      background: #1a2431;
+      color: transparent;
+      font-size: 0.72rem;
+      line-height: 1;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.2s ease;
+    }
+
+    .phase-label {
+      font-size: 0.72rem;
+      line-height: 1.15;
+      color: inherit;
+      word-break: break-word;
+    }
+
+    .phase-step.completed {
+      color: #b8d9c8;
+    }
+
+    .phase-step.completed .phase-dot {
+      background: rgba(42, 193, 116, 0.85);
+      border-color: rgba(42, 193, 116, 0.85);
+      color: #0f1b14;
+    }
+
+    .phase-step.current {
+      color: #d2e9ff;
+    }
+
+    .phase-step.current .phase-dot {
+      background: rgba(58, 160, 255, 0.32);
+      border-color: var(--accent);
+      color: #eaf5ff;
+      transform: scale(1.05);
+      box-shadow: 0 0 0 4px rgba(58, 160, 255, 0.18);
+    }
+
+    .progress-track {
+      width: 100%;
+      height: 12px;
+      border-radius: 6px;
+      overflow: hidden;
+      background: #1f2d3b;
+      border: 1px solid #2c3d50;
+      position: relative;
+    }
+
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      border-radius: 6px;
+      position: relative;
+      transition: width 0.3s ease, background-color 0.25s ease;
+    }
+
+    .progress-fill.running {
+      background: linear-gradient(90deg, #2d8de5 0%, #3aa0ff 100%);
+    }
+
+    .progress-fill.completed {
+      background: linear-gradient(90deg, #22a962 0%, #2ac174 100%);
+    }
+
+    .progress-fill.failed {
+      background: linear-gradient(90deg, #c63f3f 0%, #e05252 100%);
+    }
+
+    .progress-fill.paused {
+      background: linear-gradient(90deg, #c29a36 0%, #f6c453 100%);
+    }
+
+    .progress-fill.idle {
+      background: linear-gradient(90deg, #4d5d70 0%, #64758a 100%);
+    }
+
+    .progress-fill.running::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(110deg, transparent 20%, rgba(255, 255, 255, 0.24) 45%, transparent 70%);
+      animation: progressShimmer 1.4s linear infinite;
+      pointer-events: none;
+    }
+
+    .progress-meta {
+      margin-top: 8px;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .progress-percent {
+      color: #d9eaf9;
+      font-variant-numeric: tabular-nums;
+      font-weight: 600;
+    }
+
+    .status-detail-row {
+      margin-top: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      color: #c2d2e2;
+      font-size: 0.84rem;
+    }
+
+    .status-detail-row span:last-child {
+      color: #d8e6f5;
+      font-variant-numeric: tabular-nums;
+    }
+
+    @keyframes progressShimmer {
+      0% { transform: translateX(-120%); }
+      100% { transform: translateX(120%); }
+    }
+
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-left: auto;
+    }
+
+    .toggle input {
+      width: 16px;
+      height: 16px;
+      margin: 0;
+      accent-color: var(--accent);
+    }
+
+    .copy-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+      align-items: center;
+    }
+
+    .copy-row .value {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.86rem;
+      color: #bfd4e8;
+      word-break: break-all;
+      background: rgba(18, 35, 51, 0.7);
+      border: 1px solid #2c425a;
+      border-radius: 7px;
+      padding: 6px 8px;
+      flex: 1;
+      min-width: 220px;
+    }
+
+    @media (min-width: 800px) {
+      .grid.two {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .grid.three {
+        grid-template-columns: 1fr 1fr 1fr;
+      }
+    }
+
+    @media (max-width: 760px) {
+      .phase-stepper {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px 8px;
+      }
+
+      .console-line {
+        grid-template-columns: 1fr;
+        gap: 2px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>ProofScan</h1>
+      <div class="health" id="healthText">
+        <span class="dot" id="healthDot"></span>
+        <span id="healthLabel">Checking health...</span>
+      </div>
+    </header>
+
+    <div class="error-box" id="errorBox"></div>
+
+    <main class="stack">
+      <section class="card">
+        <h2>New Scan</h2>
+        <form id="newScanForm" class="grid">
+          <div>
+            <label for="targetUrl">Target URL</label>
+            <input id="targetUrl" name="targetUrl" type="url" required placeholder="https://example.com" />
+          </div>
+
+          <div>
+            <label for="allowedDomains">Allowed Domains (optional)</label>
+            <input id="allowedDomains" name="allowedDomains" type="text" placeholder="app.example.com, api.example.com" />
+            <div class="hint">Auto-detected if empty</div>
+          </div>
+
+          <div class="grid two">
+            <div>
+              <label for="authType">Auth Type</label>
+              <select id="authType" name="authType">
+                <option value="none">none</option>
+                <option value="token">token</option>
+                <option value="credential">credential</option>
+              </select>
+            </div>
+            <div id="tokenWrap" class="hidden">
+              <label for="bearerToken">Bearer Token</label>
+              <input id="bearerToken" name="bearerToken" type="text" autocomplete="off" />
+            </div>
+          </div>
+
+          <div id="credentialWrap" class="grid two hidden">
+            <div>
+              <label for="authUsername">Username</label>
+              <input id="authUsername" name="authUsername" type="text" autocomplete="username" />
+            </div>
+            <div>
+              <label for="authPassword">Password</label>
+              <input id="authPassword" name="authPassword" type="password" autocomplete="current-password" />
+            </div>
+          </div>
+
+          <div class="row">
+            <button id="startScanBtn" type="submit">Start Scan</button>
+          </div>
+        </form>
+
+        <div id="createdScanBox" class="hidden">
+          <div class="copy-row">
+            <div class="value" id="createdScanId"></div>
+            <button class="secondary" id="copyScanIdBtn" type="button">Copy ID</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Open Existing Scan</h2>
+        <div class="grid two">
+          <div>
+            <label for="manualScanId">Scan ID</label>
+            <input id="manualScanId" type="text" placeholder="Paste scan ID" />
+          </div>
+          <div class="row" style="align-items: end;">
+            <button class="secondary" id="openMonitorBtn" type="button">Open Monitor</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card hidden" id="monitorSection">
+        <h2>Scan Monitor</h2>
+        <div class="grid two">
+          <div>
+            <label for="scanIdInput">Scan ID</label>
+            <input id="scanIdInput" type="text" placeholder="Scan ID" />
+          </div>
+          <div>
+            <label>Status</label>
+            <div>
+              <span id="statusBadge" class="status-badge status-created">created</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="meta">
+          <div>Phase: <span id="phaseText">-</span></div>
+          <div>Created: <span id="createdAtText">-</span></div>
+        </div>
+
+        <div class="scan-progress" id="scanProgressBlock">
+          <div class="phase-stepper" id="phaseStepper"></div>
+          <div class="progress-track">
+            <div class="progress-fill idle" id="progressFill"></div>
+          </div>
+          <div class="progress-meta">
+            <span>Progress</span>
+            <span class="progress-percent" id="progressPercent">0%</span>
+          </div>
+          <div class="status-detail-row">
+            <span id="phaseDetailText">Initializing scan</span>
+            <span id="elapsedTimeText">Elapsed: 00:00:00</span>
+          </div>
+        </div>
+
+        <div id="consoleSection">
+          <div class="console-toolbar">
+            <h3>Scan Console</h3>
+            <button class="secondary" id="refreshConsoleBtn" type="button">Refresh Console</button>
+          </div>
+          <div class="console" id="scanConsole" aria-live="polite">
+            <div class="empty">No scan events loaded</div>
+          </div>
+        </div>
+
+        <div class="monitor-controls">
+          <button class="secondary" id="refreshStatusBtn" type="button">Refresh Status</button>
+          <button class="warning" id="pauseScanBtn" type="button">Pause Scan</button>
+          <button class="secondary" id="loadFindingsBtn" type="button">Load Findings</button>
+          <button class="secondary" id="downloadReportBtn" type="button">Download Report (MD)</button>
+          <label class="toggle" for="autoRefreshCheckbox">
+            <input id="autoRefreshCheckbox" type="checkbox" />
+            Auto-refresh (5s)
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Findings</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Severity</th>
+                <th>Title</th>
+                <th>Attack Class</th>
+                <th>Affected Endpoint</th>
+              </tr>
+            </thead>
+            <tbody id="findingsBody"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="findingsEmpty">No findings yet</div>
+      </section>
+
+      <section class="card">
+        <h2>Report</h2>
+        <div class="row" style="margin-bottom: 10px;">
+          <button class="secondary" id="copyReportBtn" type="button">Copy report</button>
+        </div>
+        <div class="report" id="reportPanel">No report loaded</div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const API_BASE = "";
+
+    const errorBox = document.getElementById("errorBox");
+    const healthDot = document.getElementById("healthDot");
+    const healthLabel = document.getElementById("healthLabel");
+
+    const newScanForm = document.getElementById("newScanForm");
+    const targetUrlInput = document.getElementById("targetUrl");
+    const allowedDomainsInput = document.getElementById("allowedDomains");
+    const authTypeSelect = document.getElementById("authType");
+    const tokenWrap = document.getElementById("tokenWrap");
+    const credentialWrap = document.getElementById("credentialWrap");
+    const bearerTokenInput = document.getElementById("bearerToken");
+    const authUsernameInput = document.getElementById("authUsername");
+    const authPasswordInput = document.getElementById("authPassword");
+    const startScanBtn = document.getElementById("startScanBtn");
+    const createdScanBox = document.getElementById("createdScanBox");
+    const createdScanId = document.getElementById("createdScanId");
+    const copyScanIdBtn = document.getElementById("copyScanIdBtn");
+
+    const manualScanIdInput = document.getElementById("manualScanId");
+    const openMonitorBtn = document.getElementById("openMonitorBtn");
+
+    const monitorSection = document.getElementById("monitorSection");
+    const scanIdInput = document.getElementById("scanIdInput");
+    const statusBadge = document.getElementById("statusBadge");
+    const phaseText = document.getElementById("phaseText");
+    const createdAtText = document.getElementById("createdAtText");
+    const phaseStepper = document.getElementById("phaseStepper");
+    const progressFill = document.getElementById("progressFill");
+    const progressPercent = document.getElementById("progressPercent");
+    const phaseDetailText = document.getElementById("phaseDetailText");
+    const elapsedTimeText = document.getElementById("elapsedTimeText");
+
+    const refreshStatusBtn = document.getElementById("refreshStatusBtn");
+    const pauseScanBtn = document.getElementById("pauseScanBtn");
+    const loadFindingsBtn = document.getElementById("loadFindingsBtn");
+    const downloadReportBtn = document.getElementById("downloadReportBtn");
+    const autoRefreshCheckbox = document.getElementById("autoRefreshCheckbox");
+    const consoleSection = document.getElementById("consoleSection");
+    const refreshConsoleBtn = document.getElementById("refreshConsoleBtn");
+    const scanConsole = document.getElementById("scanConsole");
+
+    const findingsBody = document.getElementById("findingsBody");
+    const findingsEmpty = document.getElementById("findingsEmpty");
+
+    const reportPanel = document.getElementById("reportPanel");
+    const copyReportBtn = document.getElementById("copyReportBtn");
+
+    let currentScan = null;
+    let autoRefreshTimer = null;
+    let elapsedTimer = null;
+    let backendConsoleEvents = [];
+    let localConsoleEvents = [];
+
+    const orderedPhases = [
+      "created",
+      "auth_bootstrap",
+      "crawl",
+      "plan",
+      "attack",
+      "validate",
+      "score",
+      "report",
+      "completed"
+    ];
+
+    const phaseDetailMap = {
+      created: "Initializing scan",
+      auth_bootstrap: "Authenticating...",
+      crawl: "Crawling target",
+      plan: "Planning attacks",
+      attack: "Running attacks",
+      validate: "Validating findings",
+      score: "Scoring & dedup",
+      report: "Generating report",
+      complete: "Scan complete",
+      completed: "Scan complete",
+      paused: "Paused",
+      failed: "Failed"
+    };
+
+    const statusClassMap = {
+      created: "status-created",
+      running: "status-running",
+      paused: "status-paused",
+      complete: "status-completed",
+      completed: "status-completed",
+      failed: "status-failed"
+    };
+
+    const severityClassMap = {
+      critical: "sev-critical",
+      high: "sev-high",
+      medium: "sev-medium",
+      low: "sev-low",
+      info: "sev-info"
+    };
+
+    function showError(message) {
+      errorBox.textContent = message;
+      errorBox.style.display = "block";
+    }
+
+    function clearError() {
+      errorBox.textContent = "";
+      errorBox.style.display = "none";
+    }
+
+    function formatConsoleTime(timestamp) {
+      const date = timestamp ? new Date(timestamp) : new Date();
+      if (Number.isNaN(date.getTime())) {
+        return "--:--:--";
+      }
+      return date.toLocaleTimeString([], { hour12: false });
+    }
+
+    function stringifyDetails(details) {
+      if (!details || typeof details !== "object" || Object.keys(details).length === 0) {
+        return "";
+      }
+      return JSON.stringify(details);
+    }
+
+    function renderConsole() {
+      const events = [...backendConsoleEvents, ...localConsoleEvents]
+        .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime())
+        .slice(-160);
+
+      scanConsole.innerHTML = "";
+      if (events.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No scan events loaded";
+        scanConsole.appendChild(empty);
+        return;
+      }
+
+      for (const event of events) {
+        const line = document.createElement("div");
+        line.className = "console-line";
+
+        const time = document.createElement("span");
+        time.className = "console-time";
+        time.textContent = formatConsoleTime(event.timestamp);
+
+        const level = document.createElement("span");
+        const normalizedLevel = String(event.level || "info").toLowerCase();
+        level.className = `console-level ${normalizedLevel}`;
+        level.textContent = normalizedLevel;
+
+        const source = document.createElement("span");
+        source.className = "console-source";
+        source.textContent = event.source || "scan";
+
+        const message = document.createElement("span");
+        message.className = "console-message";
+        message.textContent = event.message || "-";
+
+        const details = stringifyDetails(event.details);
+        if (details) {
+          const detail = document.createElement("span");
+          detail.className = "console-detail";
+          detail.textContent = details;
+          message.appendChild(detail);
+        }
+
+        line.append(time, level, source, message);
+        scanConsole.appendChild(line);
+      }
+
+      scanConsole.scrollTop = scanConsole.scrollHeight;
+    }
+
+    function logConsole(level, source, message, details = {}) {
+      const event = {
+        timestamp: new Date().toISOString(),
+        level,
+        source,
+        message,
+        details
+      };
+      localConsoleEvents.push(event);
+      localConsoleEvents = localConsoleEvents.slice(-80);
+      const consoleMethod = level === "error" ? "error" : level === "warn" ? "warn" : "info";
+      window.console[consoleMethod](`[ProofScan:${source}] ${message}`, details);
+      renderConsole();
+    }
+
+    async function parseErrorResponse(response) {
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await response.json().catch(() => null);
+        if (data && typeof data === "object") {
+          if (typeof data.detail === "string") return data.detail;
+          if (typeof data.message === "string") return data.message;
+        }
+      }
+      const text = await response.text().catch(() => "");
+      return text || `Request failed with status ${response.status}`;
+    }
+
+    async function apiRequest(path, options = {}) {
+      const method = options.method || "GET";
+      const shouldLog = path !== "/health" && consoleSection && !consoleSection.classList.contains("hidden");
+      const startedAt = performance.now();
+      if (shouldLog) {
+        logConsole("info", "ui", `${method} ${path}`);
+      }
+
+      const response = await fetch(`${API_BASE}${path}`, {
+        headers: {
+          ...(options.body ? { "Content-Type": "application/json" } : {}),
+          ...(options.headers || {})
+        },
+        ...options
+      });
+
+      if (!response.ok) {
+        const message = await parseErrorResponse(response);
+        if (shouldLog) {
+          logConsole("error", "ui", `${method} ${path} failed`, { status: response.status, error: message });
+        }
+        throw new Error(message);
+      }
+
+      if (shouldLog) {
+        logConsole("info", "ui", `${method} ${path} completed`, {
+          status: response.status,
+          ms: Math.round(performance.now() - startedAt)
+        });
+      }
+      return response;
+    }
+
+    function setButtonLoading(button, loadingText, isLoading) {
+      if (!button.dataset.originalText) {
+        button.dataset.originalText = button.textContent;
+      }
+      button.disabled = isLoading;
+      button.textContent = isLoading ? loadingText : button.dataset.originalText;
+    }
+
+    function updateAuthFields() {
+      const authType = authTypeSelect.value;
+      tokenWrap.classList.toggle("hidden", authType !== "token");
+      credentialWrap.classList.toggle("hidden", authType !== "credential");
+    }
+
+    function parseAllowedDomains(raw) {
+      const items = raw
+        .split(",")
+        .map((v) => v.trim())
+        .filter(Boolean);
+      return items.length > 0 ? items : null;
+    }
+
+    function updateMonitorVisibility(scanId) {
+      if (scanId && scanId.trim()) {
+        monitorSection.classList.remove("hidden");
+        consoleSection.classList.remove("hidden");
+      }
+    }
+
+    function getProgressTone(status) {
+      if (status === "complete" || status === "completed") return "completed";
+      if (status === "failed") return "failed";
+      if (status === "paused") return "paused";
+      if (status === "running") return "running";
+      return "idle";
+    }
+
+    function formatPhaseLabel(phase) {
+      return String(phase || "")
+        .split("_")
+        .filter(Boolean)
+        .map((part) => part[0].toUpperCase() + part.slice(1))
+        .join(" ");
+    }
+
+    function formatElapsed(totalSeconds) {
+      const seconds = Math.max(0, Math.floor(totalSeconds));
+      const hh = Math.floor(seconds / 3600).toString().padStart(2, "0");
+      const mm = Math.floor((seconds % 3600) / 60).toString().padStart(2, "0");
+      const ss = Math.floor(seconds % 60).toString().padStart(2, "0");
+      return `${hh}:${mm}:${ss}`;
+    }
+
+    function getCurrentPhaseIndex(scan) {
+      const status = String(scan.status || "").toLowerCase();
+      const phase = String(scan.phase || "").toLowerCase();
+      if (status === "complete" || status === "completed") {
+        return orderedPhases.length - 1;
+      }
+      const phaseIndex = orderedPhases.indexOf(phase);
+      if (phaseIndex >= 0) {
+        return phaseIndex;
+      }
+      return 0;
+    }
+
+    function renderPhaseStepper(scan) {
+      const status = String(scan.status || "").toLowerCase();
+      const phase = String(scan.phase || "").toLowerCase();
+      const currentIndex = getCurrentPhaseIndex(scan);
+
+      phaseStepper.innerHTML = "";
+      for (const [index, phaseKey] of orderedPhases.entries()) {
+        const step = document.createElement("div");
+        step.className = "phase-step";
+
+        const isCurrent = phaseKey === phase || ((status === "complete" || status === "completed") && phaseKey === "completed");
+        const isCompleted = status === "complete" || status === "completed" ? index <= currentIndex : index < currentIndex;
+
+        if (isCompleted) {
+          step.classList.add("completed");
+        }
+        if (isCurrent) {
+          step.classList.add("current");
+        }
+
+        const dot = document.createElement("span");
+        dot.className = "phase-dot";
+        dot.textContent = isCompleted ? "✓" : "•";
+
+        const label = document.createElement("span");
+        label.className = "phase-label";
+        label.textContent = formatPhaseLabel(phaseKey);
+
+        step.append(dot, label);
+        phaseStepper.appendChild(step);
+      }
+    }
+
+    function updateElapsedText() {
+      if (!currentScan) {
+        elapsedTimeText.textContent = "Elapsed: 00:00:00";
+        return;
+      }
+      const createdAt = currentScan.created_at ? Date.parse(currentScan.created_at) : NaN;
+      if (!Number.isFinite(createdAt)) {
+        elapsedTimeText.textContent = "Elapsed: -";
+        return;
+      }
+      const elapsedSeconds = (Date.now() - createdAt) / 1000;
+      elapsedTimeText.textContent = `Elapsed: ${formatElapsed(elapsedSeconds)}`;
+    }
+
+    function handleElapsedTimerState() {
+      if (elapsedTimer) {
+        clearInterval(elapsedTimer);
+        elapsedTimer = null;
+      }
+      const isRunning = currentScan && String(currentScan.status || "").toLowerCase() === "running";
+      updateElapsedText();
+      if (isRunning) {
+        elapsedTimer = setInterval(updateElapsedText, 1000);
+      }
+    }
+
+    function renderProgress(scan) {
+      const normalizedStatus = String(scan.status || "created").toLowerCase();
+      const rawPhase = scan.phase == null ? "" : String(scan.phase);
+      const phase = rawPhase.toLowerCase();
+      const currentIndex = getCurrentPhaseIndex(scan);
+      const maxIndex = orderedPhases.length - 1;
+      const percent = Math.round((currentIndex / maxIndex) * 100);
+      const tone = getProgressTone(normalizedStatus);
+
+      renderPhaseStepper(scan);
+      progressFill.className = "progress-fill";
+      progressFill.classList.add(tone);
+      progressFill.style.width = `${percent}%`;
+      progressPercent.textContent = `${percent}%`;
+
+      if (normalizedStatus === "failed" && rawPhase.startsWith("failed:")) {
+        phaseDetailText.textContent = rawPhase.slice("failed:".length) || "Unknown error";
+      } else if (phaseDetailMap[phase]) {
+        phaseDetailText.textContent = phaseDetailMap[phase];
+      } else if (phaseDetailMap[normalizedStatus]) {
+        phaseDetailText.textContent = phaseDetailMap[normalizedStatus];
+      } else {
+        phaseDetailText.textContent = rawPhase || normalizedStatus || "-";
+      }
+    }
+
+    function renderStatus(scan) {
+      const normalizedStatus = String(scan.status || "created").toLowerCase();
+      statusBadge.textContent = normalizedStatus;
+      statusBadge.className = "status-badge";
+      statusBadge.classList.add(statusClassMap[normalizedStatus] || "status-created");
+      phaseText.textContent = scan.phase || "-";
+      createdAtText.textContent = scan.created_at || "-";
+      renderProgress(scan);
+    }
+
+    function setCurrentScan(scan) {
+      currentScan = scan;
+      scanIdInput.value = scan.id || scanIdInput.value;
+      renderStatus(scan);
+      updateMonitorVisibility(scan.id || "");
+      if (scan.id) {
+        createdScanId.textContent = scan.id;
+      }
+      handleAutoRefreshState();
+      handleElapsedTimerState();
+      if (scan.id) {
+        loadScanEvents(scan.id);
+      }
+    }
+
+    function getActiveScanId() {
+      const scanId = scanIdInput.value.trim();
+      if (!scanId) {
+        throw new Error("Scan ID is required");
+      }
+      return scanId;
+    }
+
+    function clearFindings() {
+      findingsBody.innerHTML = "";
+      findingsEmpty.textContent = "No findings yet";
+      findingsEmpty.style.display = "block";
+    }
+
+    function renderFindings(findings) {
+      findingsBody.innerHTML = "";
+
+      if (!Array.isArray(findings) || findings.length === 0) {
+        findingsEmpty.textContent = "No findings yet";
+        findingsEmpty.style.display = "block";
+        return;
+      }
+
+      findingsEmpty.style.display = "none";
+
+      for (const finding of findings) {
+        const tr = document.createElement("tr");
+        const severity = String(finding.severity || "info").toLowerCase();
+
+        const severityTd = document.createElement("td");
+        const sevBadge = document.createElement("span");
+        sevBadge.className = `severity ${severityClassMap[severity] || "sev-info"}`;
+        sevBadge.textContent = severity;
+        severityTd.appendChild(sevBadge);
+
+        const titleTd = document.createElement("td");
+        titleTd.textContent = finding.title || "-";
+
+        const attackClassTd = document.createElement("td");
+        attackClassTd.textContent = finding.attack_class || "-";
+
+        const endpointTd = document.createElement("td");
+        endpointTd.textContent = finding.affected_endpoint || "-";
+
+        tr.append(severityTd, titleTd, attackClassTd, endpointTd);
+        findingsBody.appendChild(tr);
+      }
+    }
+
+    function handleAutoRefreshState() {
+      if (autoRefreshTimer) {
+        clearInterval(autoRefreshTimer);
+        autoRefreshTimer = null;
+      }
+
+      const isRunning = currentScan && String(currentScan.status).toLowerCase() === "running";
+      if (autoRefreshCheckbox.checked && isRunning) {
+        autoRefreshTimer = setInterval(() => {
+          refreshStatus();
+        }, 5000);
+      }
+    }
+
+    async function checkHealth() {
+      try {
+        const response = await apiRequest("/health", { method: "GET" });
+        const data = await response.text().catch(() => "ok");
+        healthDot.classList.remove("bad");
+        healthDot.classList.add("ok");
+        healthLabel.textContent = data ? `Health: ${String(data).trim()}` : "Health: OK";
+      } catch (error) {
+        healthDot.classList.remove("ok");
+        healthDot.classList.add("bad");
+        healthLabel.textContent = "Health: Unavailable";
+      }
+    }
+
+    async function startScan(event) {
+      event.preventDefault();
+      clearError();
+
+      const targetUrl = targetUrlInput.value.trim();
+      if (!targetUrl) {
+        showError("Target URL is required");
+        return;
+      }
+
+      const authType = authTypeSelect.value;
+      const payload = {
+        target_url: targetUrl,
+        auth_context: {
+          type: authType
+        }
+      };
+
+      const allowedDomains = parseAllowedDomains(allowedDomainsInput.value);
+      if (allowedDomains) {
+        payload.allowed_domains = allowedDomains;
+      }
+
+      if (authType === "token") {
+        const bearerToken = bearerTokenInput.value.trim();
+        if (!bearerToken) {
+          showError("Bearer token is required for auth type token");
+          return;
+        }
+        payload.auth_context.bearer_token = bearerToken;
+      }
+
+      if (authType === "credential") {
+        const username = authUsernameInput.value.trim();
+        const password = authPasswordInput.value;
+        if (!username || !password) {
+          showError("Username and password are required for auth type credential");
+          return;
+        }
+        payload.auth_context.credentials = { username, password };
+      }
+
+      setButtonLoading(startScanBtn, "Starting...", true);
+
+      try {
+        const response = await apiRequest("/scans", {
+          method: "POST",
+          body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+
+        createdScanBox.classList.remove("hidden");
+        createdScanId.textContent = data.id;
+
+        scanIdInput.value = data.id;
+        manualScanIdInput.value = "";
+        setCurrentScan(data);
+      } catch (error) {
+        showError(error instanceof Error ? error.message : "Failed to start scan");
+      } finally {
+        setButtonLoading(startScanBtn, "Starting...", false);
+      }
+    }
+
+    async function refreshStatus() {
+      clearError();
+      setButtonLoading(refreshStatusBtn, "Refreshing...", true);
+
+      try {
+        const scanId = getActiveScanId();
+        const response = await apiRequest(`/scans/${encodeURIComponent(scanId)}`, {
+          method: "GET"
+        });
+        const data = await response.json();
+        setCurrentScan(data);
+      } catch (error) {
+        showError(error instanceof Error ? error.message : "Failed to refresh status");
+      } finally {
+        setButtonLoading(refreshStatusBtn, "Refreshing...", false);
+      }
+    }
+
+    async function pauseScan() {
+      clearError();
+      setButtonLoading(pauseScanBtn, "Pausing...", true);
+
+      try {
+        const scanId = getActiveScanId();
+        await apiRequest(`/scans/${encodeURIComponent(scanId)}/pause`, {
+          method: "PATCH"
+        });
+        await refreshStatus();
+      } catch (error) {
+        showError(error instanceof Error ? error.message : "Failed to pause scan");
+      } finally {
+        setButtonLoading(pauseScanBtn, "Pausing...", false);
+      }
+    }
+
+    async function loadFindings() {
+      clearError();
+      setButtonLoading(loadFindingsBtn, "Loading...", true);
+
+      try {
+        const scanId = getActiveScanId();
+        const response = await apiRequest(`/scans/${encodeURIComponent(scanId)}/findings`, {
+          method: "GET"
+        });
+        const data = await response.json();
+        renderFindings(data);
+      } catch (error) {
+        showError(error instanceof Error ? error.message : "Failed to load findings");
+      } finally {
+        setButtonLoading(loadFindingsBtn, "Loading...", false);
+      }
+    }
+
+    async function loadScanEvents(scanIdOverride) {
+      clearError();
+      const scanId = scanIdOverride || getActiveScanId();
+
+      try {
+        const response = await apiRequest(`/scans/${encodeURIComponent(scanId)}/events`, {
+          method: "GET"
+        });
+        backendConsoleEvents = await response.json();
+        renderConsole();
+      } catch (error) {
+        showError(error instanceof Error ? error.message : "Failed to load scan events");
+      }
+    }
+
+    async function downloadReport() {
+      clearError();
+      setButtonLoading(downloadReportBtn, "Downloading...", true);
+
+      try {
+        const scanId = getActiveScanId();
+        const response = await apiRequest(`/scans/${encodeURIComponent(scanId)}/report?format=markdown`, {
+          method: "GET"
+        });
+        const markdown = await response.text();
+        reportPanel.textContent = markdown || "No report content";
+      } catch (error) {
+        showError(error instanceof Error ? error.message : "Failed to download report");
+      } finally {
+        setButtonLoading(downloadReportBtn, "Downloading...", false);
+      }
+    }
+
+    async function copyText(text, successMessage, failMessage) {
+      try {
+        await navigator.clipboard.writeText(text);
+        clearError();
+        if (successMessage) {
+          errorBox.textContent = successMessage;
+          errorBox.style.display = "block";
+          errorBox.style.borderColor = "rgba(42,193,116,0.6)";
+          errorBox.style.background = "rgba(42,193,116,0.12)";
+          errorBox.style.color = "#cbf4dd";
+          setTimeout(() => {
+            errorBox.style.borderColor = "rgba(224, 82, 82, 0.6)";
+            errorBox.style.background = "rgba(224, 82, 82, 0.15)";
+            errorBox.style.color = "#ffd6d6";
+            clearError();
+          }, 1500);
+        }
+      } catch (error) {
+        showError(failMessage);
+      }
+    }
+
+    function openMonitorFromManual() {
+      clearError();
+      const scanId = manualScanIdInput.value.trim();
+      if (!scanId) {
+        showError("Enter a scan ID to open monitor");
+        return;
+      }
+      scanIdInput.value = scanId;
+      updateMonitorVisibility(scanId);
+      refreshStatus();
+    }
+
+    authTypeSelect.addEventListener("change", updateAuthFields);
+    newScanForm.addEventListener("submit", startScan);
+
+    openMonitorBtn.addEventListener("click", openMonitorFromManual);
+
+    refreshStatusBtn.addEventListener("click", refreshStatus);
+    pauseScanBtn.addEventListener("click", pauseScan);
+    loadFindingsBtn.addEventListener("click", loadFindings);
+    downloadReportBtn.addEventListener("click", downloadReport);
+    refreshConsoleBtn.addEventListener("click", () => loadScanEvents());
+
+    autoRefreshCheckbox.addEventListener("change", handleAutoRefreshState);
+    scanIdInput.addEventListener("input", () => {
+      if (scanIdInput.value.trim()) {
+        updateMonitorVisibility(scanIdInput.value.trim());
+      }
+    });
+
+    copyScanIdBtn.addEventListener("click", () => {
+      const id = createdScanId.textContent.trim();
+      if (!id) {
+        showError("No scan ID to copy");
+        return;
+      }
+      copyText(id, "Scan ID copied", "Failed to copy scan ID");
+    });
+
+    copyReportBtn.addEventListener("click", () => {
+      const text = reportPanel.textContent || "";
+      if (!text || text === "No report loaded") {
+        showError("No report content to copy");
+        return;
+      }
+      copyText(text, "Report copied", "Failed to copy report");
+    });
+
+    clearFindings();
+    updateAuthFields();
+    checkHealth();
+  </script>
+</body>
+</html>

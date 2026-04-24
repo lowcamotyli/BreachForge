@@ -1,0 +1,18 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY pyproject.toml /app/pyproject.toml
+COPY api /app/api
+COPY control_plane /app/control_plane
+COPY storage /app/storage
+COPY execution_plane /app/execution_plane
+
+RUN pip install --upgrade pip && pip install .
+RUN python -m playwright install --with-deps chromium
+
+CMD ["sh", "-c", "python -m playwright install chromium >/dev/null 2>&1 || true; rq worker auth_bootstrap recon attack_planning attack_tasks finding_scorer"]

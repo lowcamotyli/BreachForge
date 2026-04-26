@@ -1,0 +1,51 @@
+{
+  "id": "privilege_drift",
+  "attack_class": "privilege_escalation",
+  "preconditions": {
+    "auth_required": true,
+    "parameter_name_contains_any": ["role", "scope", "permission", "user_id", "account_id", "org_id"],
+    "path_contains_any": ["/admin", "/role", "/users", "/accounts", "/orgs", "/permissions"]
+  },
+  "steps": [
+    {
+      "id": "baseline",
+      "action": "low_privilege_baseline",
+      "identity_selector": "low_privilege_user",
+      "probe_template": {
+        "mode": "observe",
+        "template": "record_status_and_role_hints",
+        "allowed_methods": ["GET", "POST"]
+      },
+      "expected_signal": "baseline distinguishes 401, 403, 200, and 404 outcomes",
+      "validator": "status_boundary_validator",
+      "max_attempts": 1
+    },
+    {
+      "id": "drift_probe",
+      "action": "role_sensitive_endpoint_probe",
+      "identity_selector": "low_privilege_user",
+      "probe_template": {
+        "mode": "bounded_probe",
+        "template": "substitute_role_like_parameter",
+        "allowed_methods": ["GET", "POST"],
+        "variables": {
+          "parameter_family": "role_scope_org"
+        }
+      },
+      "expected_signal": "low privilege identity receives elevated response or admin hint",
+      "validator": "privilege_hint_validator",
+      "max_attempts": 1
+    }
+  ],
+  "validators": {
+    "privilege_hint_validator": {"signal": "role_or_scope_boundary_changed"},
+    "status_boundary_validator": {"signal": "status_code_boundary"}
+  },
+  "safety_budget": {
+    "max_requests": 2,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default"
+  }
+}

@@ -80,8 +80,8 @@ def test_plan_returns_tasks_sorted_by_priority_desc_and_scores_bola_at_least_exp
     assert tasks == sorted(tasks, key=lambda task: task.priority_score, reverse=True)
 
     bola_tasks = [task for task in tasks if task.endpoint_id == bola_endpoint.id and task.attack_class == "bola"]
-    assert len(bola_tasks) == 1
-    assert bola_tasks[0].priority_score >= 0.60
+    assert bola_tasks
+    assert max(task.priority_score for task in bola_tasks) >= 0.60
 
 
 def test_plan_returns_empty_list_when_no_rules_match() -> None:

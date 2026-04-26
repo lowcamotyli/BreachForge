@@ -20,12 +20,18 @@ from execution_plane.planner.attack_graph import AttackGraph
 from execution_plane.planner.decision_log import DecisionLog, DecisionLogger
 from execution_plane.planner.path_ranker import PathRanker
 from execution_plane.planner.payload_registry import PayloadRegistry
+from execution_plane.planner.playbook_loader import load_builtin_playbooks
+from execution_plane.planner.playbooks import AttackPlaybook, PlaybookStep, assert_no_secret_like_data
 from storage.db.models import AttackTask, Endpoint, Scan
 
 MAX_TASKS_PER_ENDPOINT = 50
 _IDOR_CLASSES: set[str] = {"bola", "tenant_isolation"}
 _STATE_CHANGING_METHODS: set[str] = {"POST", "PUT", "DELETE"}
+_STRUCTURED_CONTENT_MARKERS: tuple[str, ...] = ("application/json", "+json", "application/problem+json")
 _OWNERSHIP_IDENTIFIERS: set[str] = {"owner_id", "user_id", "account_id", "org_id"}
+_PRIVILEGE_IDENTIFIERS: set[str] = {"role", "scope", "permission", "user_id", "account_id", "org_id"}
+_WORKFLOW_START_MARKERS: tuple[str, ...] = ("create", "start", "begin", "init", "draft", "cart")
+_WORKFLOW_FINAL_MARKERS: tuple[str, ...] = ("finalize", "approve", "submit", "confirm", "activate", "pay", "complete")
 _ATTACK_CLASS_SEQUENCE_PRIORITY: dict[str, int] = {
     "session_misuse": 0,
     "bola": 1,
@@ -58,6 +64,7 @@ class AttackPlanner:
         self.rules: list[AttackRule] = [rule_class() for rule_class in self._discover_rule_classes()]
         self.path_ranker = PathRanker()
         self.payload_registry = PayloadRegistry()
+        self.playbooks = load_builtin_playbooks()
         self.decision_logger = DecisionLogger()
         self.codex_analyst = CodexAnalyst()
         self._last_ranked_paths: list[Any] = []
@@ -139,6 +146,7 @@ class AttackPlanner:
                     self._enrich_task_with_payloads(task=task, endpoint=endpoint)
                     task.priority_score = self._score_task(task, endpoint)
                 endpoint_tasks.extend(generated_tasks)
+            endpoint_tasks.extend(self._generate_playbook_tasks(endpoint=endpoint, context=context))
             endpoint_tasks.sort(key=lambda task: task.priority_score, reverse=True)
             all_tasks.extend(endpoint_tasks[: self.max_tasks_per_endpoint])
         all_tasks.sort(key=lambda task: task.priority_score, reverse=True)
@@ -283,6 +291,286 @@ class AttackPlanner:
             sort_keys=True,
         )
 
+    def _generate_playbook_tasks(self, *, endpoint: Endpoint, context: ScanContext) -> list[AttackTask]:
+        tasks: list[AttackTask] = []
+        for playbook in self.playbooks:
+            matched, reason = self._playbook_matches_endpoint(playbook=playbook, endpoint=endpoint, context=context)
+            if not matched:
+                continue
+            self._log_playbook_selection(context=context, playbook=playbook, endpoint=endpoint, reason=reason)
+            tasks.extend(
+                self._tasks_from_playbook(
+                    playbook=playbook,
+                    endpoint=endpoint,
+                    context=context,
+                    selection_reason=reason,
+                )
+            )
+        return tasks
+
+    def _tasks_from_playbook(
+        self,
+        *,
+        playbook: AttackPlaybook,
+        endpoint: Endpoint,
+        context: ScanContext,
+        selection_reason: str,
+    ) -> list[AttackTask]:
+        target_parameter = self._target_parameter_for_playbook(endpoint=endpoint, playbook=playbook)
+        tasks: list[AttackTask] = []
+        prerequisites: list[str] = []
+        for step_index, step in enumerate(playbook.steps, start=1):
+            step_name = step.id if isinstance(step.id, str) and step.id else step.action
+            step_id = f"{playbook.id}:{step_index}:{step_name}"
+            hypothesis_payload = {
+                "action": step.action,
+                "expected_signal": step.expected_signal,
+                "identity_selector": step.identity_selector,
+                "observe_only": step.observe_only,
+                "playbook_id": playbook.id,
+                "probe_template": step.probe_template,
+                "safety_budget": playbook.safety_budget,
+                "selection_reason": selection_reason,
+                "step_id": step_id,
+                "validator": step.validator,
+            }
+            assert_no_secret_like_data(hypothesis_payload, path="decision_payload")
+            hypothesis = json.dumps(hypothesis_payload, sort_keys=True)
+            tasks.append(
+                AttackTask(
+                    scan_id=context.scan_id,
+                    endpoint_id=endpoint.id,
+                    attack_class=playbook.attack_class,
+                    target_parameter=target_parameter,
+                    hypothesis=hypothesis,
+                    priority_score=self._score_playbook_step(playbook=playbook, step=step, endpoint=endpoint),
+                    prerequisites=prerequisites[:] or None,
+                    step_order=step_index,
+                )
+            )
+            self._log_playbook_step(context=context, playbook=playbook, step_id=step_id, step=step)
+            prerequisites.append(step_id)
+        return tasks
+
+    def _playbook_matches_endpoint(
+        self,
+        *,
+        playbook: AttackPlaybook,
+        endpoint: Endpoint,
+        context: ScanContext,
+    ) -> tuple[bool, str]:
+        reasons = self._playbook_candidate_reasons(playbook=playbook, endpoint=endpoint, context=context)
+        if not reasons:
+            return False, "no explainable signal or heuristic matched this playbook"
+
+        preconditions = playbook.preconditions
+        method = endpoint.method.upper()
+        methods = preconditions.get("methods")
+        if isinstance(methods, list) and method not in {str(value).upper() for value in methods}:
+            return False, f"method {method} not in playbook methods"
+
+        auth_required = preconditions.get("auth_required")
+        if isinstance(auth_required, bool) and endpoint.auth_required is not auth_required:
+            return False, "auth_required precondition did not match"
+
+        path_contains_any = _string_list(preconditions.get("path_contains_any"))
+        if path_contains_any and not _contains_any(endpoint.url_pattern, path_contains_any):
+            return False, "path markers did not match"
+
+        parameter_contains_any = _string_list(preconditions.get("parameter_name_contains_any"))
+        if parameter_contains_any and not self._endpoint_has_parameter_marker(endpoint, parameter_contains_any):
+            return False, "parameter markers did not match"
+
+        if preconditions.get("structured_response") is True and not self._endpoint_returns_structured_data(endpoint):
+            return False, "structured response precondition did not match"
+
+        if preconditions.get("requires_related_start_step") is True and not self._has_related_workflow_start_step(
+            endpoint=endpoint,
+            asset_map=context.asset_map,
+        ):
+            return False, "related workflow start step was not found"
+
+        return True, self._playbook_match_reason(playbook=playbook, endpoint=endpoint, reasons=reasons)
+
+    def _playbook_candidate_reasons(
+        self,
+        *,
+        playbook: AttackPlaybook,
+        endpoint: Endpoint,
+        context: ScanContext,
+    ) -> list[str]:
+        reasons: list[str] = []
+        playbook_signals = self._asset_map_playbook_signals(context.asset_map)
+        if playbook.id in playbook_signals or playbook.attack_class in playbook_signals:
+            reasons.append("asset_map_signal")
+
+        method = endpoint.method.upper()
+        has_id_path = "{id" in endpoint.url_pattern.lower() or "{user_id" in endpoint.url_pattern.lower()
+        if playbook.id == "bola_idor" and endpoint.auth_required and method == "GET" and (
+            has_id_path or self._endpoint_has_parameter_marker(endpoint, ["id", "user_id", "account_id"])
+        ):
+            reasons.append("heuristic:auth_get_with_identifier")
+
+        if playbook.id == "privilege_drift" and self._endpoint_has_parameter_marker(
+            endpoint, list(_PRIVILEGE_IDENTIFIERS)
+        ):
+            reasons.append("heuristic:privilege_parameter_marker")
+
+        if playbook.id == "workflow_abuse" and method in {"POST", "PUT", "PATCH"} and (
+            _contains_any(endpoint.url_pattern, list(_WORKFLOW_FINAL_MARKERS))
+            or self._has_related_workflow_start_step(endpoint=endpoint, asset_map=context.asset_map)
+        ):
+            reasons.append("heuristic:workflow_transition")
+
+        if playbook.id == "secret_to_impact" and (
+            self._endpoint_returns_structured_data(endpoint) or self._asset_map_has_secret_modules(context.asset_map)
+        ):
+            reasons.append("heuristic:structured_or_secret_signal")
+        return reasons
+
+    def _asset_map_playbook_signals(self, asset_map: AssetMap) -> set[str]:
+        raw_signals = getattr(asset_map, "signals", None)
+        if raw_signals is None:
+            raw_signals = getattr(asset_map, "planning_signals", None)
+        if raw_signals is None:
+            return set()
+
+        if isinstance(raw_signals, dict):
+            values: list[Any] = []
+            for key in ("attack_playbooks", "playbook_candidates", "attack_classes"):
+                raw_value = raw_signals.get(key)
+                if isinstance(raw_value, list):
+                    values.extend(raw_value)
+                elif isinstance(raw_value, str):
+                    values.append(raw_value)
+            return {str(value).strip() for value in values if str(value).strip()}
+
+        if isinstance(raw_signals, list):
+            return {str(value).strip() for value in raw_signals if str(value).strip()}
+        return set()
+
+    def _playbook_match_reason(self, *, playbook: AttackPlaybook, endpoint: Endpoint, reasons: list[str]) -> str:
+        return (
+            f"playbook={playbook.id}; attack_class={playbook.attack_class}; "
+            f"method={endpoint.method.upper()}; path={endpoint.url_pattern}; reasons={','.join(sorted(reasons))}"
+        )
+
+    def _endpoint_has_parameter_marker(self, endpoint: Endpoint, markers: list[str]) -> bool:
+        names: list[str] = []
+        for parameter in endpoint.parameters:
+            raw_name = parameter.get("name") if isinstance(parameter, dict) else None
+            if isinstance(raw_name, str):
+                names.append(raw_name)
+        names.append(endpoint.url_pattern)
+        return any(marker.lower() in name.lower() for marker in markers for name in names)
+
+    def _endpoint_returns_structured_data(self, endpoint: Endpoint) -> bool:
+        content_type = (endpoint.observed_content_type or "").lower()
+        if any(marker in content_type for marker in _STRUCTURED_CONTENT_MARKERS):
+            return True
+        if endpoint.url_pattern.lower().endswith(".json"):
+            return True
+        for parameter in endpoint.parameters:
+            if isinstance(parameter, dict) and str(parameter.get("type") or "").lower() in {"object", "array"}:
+                return True
+        return False
+
+    def _has_related_workflow_start_step(self, *, endpoint: Endpoint, asset_map: AssetMap) -> bool:
+        endpoint_resource = self._workflow_resource_key(endpoint.url_pattern)
+        for candidate in asset_map.endpoints:
+            if candidate.id == endpoint.id:
+                continue
+            if self._workflow_resource_key(candidate.url_pattern) != endpoint_resource:
+                continue
+            if _contains_any(candidate.url_pattern, list(_WORKFLOW_START_MARKERS)):
+                return True
+        return False
+
+    def _asset_map_has_secret_modules(self, asset_map: AssetMap) -> bool:
+        raw_signals = getattr(asset_map, "signals", None)
+        if isinstance(raw_signals, dict):
+            for key in ("secret_modules", "structured_responses", "secret_signals", "modules"):
+                value = raw_signals.get(key)
+                if isinstance(value, list) and value:
+                    return True
+                if isinstance(value, bool) and value:
+                    return True
+        return False
+
+    def _workflow_resource_key(self, url_pattern: str) -> str:
+        parts = [segment for segment in url_pattern.strip("/").split("/") if segment and not segment.startswith("{")]
+        if not parts:
+            return "root"
+        return "/".join(parts[:2]) if len(parts) > 1 else parts[0]
+
+    def _target_parameter_for_playbook(self, *, endpoint: Endpoint, playbook: AttackPlaybook) -> str | None:
+        markers = _string_list(playbook.preconditions.get("parameter_name_contains_any"))
+        for parameter in endpoint.parameters:
+            if not isinstance(parameter, dict):
+                continue
+            raw_name = parameter.get("name")
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                continue
+            if not markers or any(marker.lower() in raw_name.lower() for marker in markers):
+                return raw_name.strip()
+        return "response" if playbook.attack_class == "sensitive_exposure" else None
+
+    def _score_playbook_step(self, *, playbook: AttackPlaybook, step: PlaybookStep, endpoint: Endpoint) -> float:
+        task = AttackTask(
+            scan_id=endpoint.asset_map_id,
+            endpoint_id=endpoint.id,
+            attack_class=playbook.attack_class,
+            target_parameter=None,
+            hypothesis=step.expected_signal,
+        )
+        score = self._score_task(task, endpoint)
+        if step.observe_only:
+            score -= 0.05
+        return max(0.01, score)
+
+    def _log_playbook_selection(
+        self,
+        *,
+        context: ScanContext,
+        playbook: AttackPlaybook,
+        endpoint: Endpoint,
+        reason: str,
+    ) -> None:
+        alternatives = [candidate.id for candidate in self.playbooks if candidate.id != playbook.id]
+        self.decision_logger.log(
+            DecisionLog(
+                scan_id=str(context.scan_id),
+                timestamp=datetime.now(timezone.utc),
+                step_id=f"playbook:{playbook.id}:selected",
+                chosen_action=playbook.attack_class,
+                rationale=reason,
+                alternatives=alternatives[:3],
+                status="selected",
+                reason=f"endpoint {endpoint.method.upper()} {endpoint.url_pattern} satisfied playbook preconditions",
+            )
+        )
+
+    def _log_playbook_step(
+        self,
+        *,
+        context: ScanContext,
+        playbook: AttackPlaybook,
+        step_id: str,
+        step: PlaybookStep,
+    ) -> None:
+        self.decision_logger.log(
+            DecisionLog(
+                scan_id=str(context.scan_id),
+                timestamp=datetime.now(timezone.utc),
+                step_id=step_id,
+                chosen_action=step.action,
+                rationale=f"validator={step.validator}; observe_only={step.observe_only}; max_attempts={step.max_attempts}",
+                alternatives=[],
+                status="planned",
+                reason=f"planned from playbook {playbook.id}",
+            )
+        )
+
     def _log_top_ranked_decision(self, *, context: ScanContext, graph: AttackGraph) -> None:
         if not self._last_ranked_paths:
             return
@@ -357,6 +645,17 @@ def _walk_subclasses(base_class: type[AttackRule]) -> list[type[AttackRule]]:
         discovered.append(subclass)
         discovered.extend(_walk_subclasses(subclass))
     return discovered
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _contains_any(value: str, needles: list[str]) -> bool:
+    lowered = value.lower()
+    return any(needle.lower() in lowered for needle in needles)
 
 
 def plan_attack(scan_id: str, asset_map: dict[str, Any]) -> None:

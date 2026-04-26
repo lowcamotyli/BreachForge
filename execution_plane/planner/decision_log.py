@@ -13,6 +13,8 @@ class DecisionLog:
     chosen_action: str
     rationale: str
     alternatives: list[str] = field(default_factory=list)
+    status: str | None = None
+    reason: str | None = None
 
 
 class DecisionLogger:

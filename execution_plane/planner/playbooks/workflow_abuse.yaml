@@ -1,0 +1,61 @@
+{
+  "id": "workflow_abuse",
+  "attack_class": "workflow_abuse",
+  "preconditions": {
+    "methods": ["POST", "PUT", "PATCH"],
+    "path_contains_any": ["approve", "confirm", "complete", "checkout", "submit", "pay", "activate", "finalize"],
+    "requires_related_start_step": true
+  },
+  "steps": [
+    {
+      "id": "draft_observe",
+      "action": "create_draft_observation",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "observe",
+        "template": "map_prerequisite_step",
+        "allowed_methods": ["GET", "POST"]
+      },
+      "expected_signal": "draft or prerequisite step is present for the resource family",
+      "observe_only": true,
+      "max_attempts": 1
+    },
+    {
+      "id": "approval_skip_observe",
+      "action": "skip_approval_observation",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "observe",
+        "template": "model_terminal_step_without_execution",
+        "allowed_methods": ["GET"]
+      },
+      "expected_signal": "terminal step can be reasoned about without changing server state",
+      "observe_only": true,
+      "max_attempts": 1
+    },
+    {
+      "id": "final_replay_observe",
+      "action": "replay_final_step_observation",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "observe",
+        "template": "compare_workflow_transitions",
+        "allowed_methods": ["GET"]
+      },
+      "expected_signal": "workflow transition appears replayable under safe observation",
+      "observe_only": true,
+      "max_attempts": 1
+    }
+  ],
+  "validators": {
+    "workflow_transition_validator": {"signal": "skipped_prerequisite_model"}
+  },
+  "safety_budget": {
+    "max_requests": 3,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default",
+    "safe_fixture_required": false
+  }
+}

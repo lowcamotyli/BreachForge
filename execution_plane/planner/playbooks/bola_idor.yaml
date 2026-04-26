@@ -1,0 +1,68 @@
+{
+  "id": "bola_idor",
+  "attack_class": "bola",
+  "preconditions": {
+    "methods": ["GET"],
+    "auth_required": true,
+    "parameter_name_contains_any": ["id", "user_id", "account_id"],
+    "path_contains_any": ["/api/", "/users", "/accounts", "/tenants"]
+  },
+  "steps": [
+    {
+      "id": "discover_ids",
+      "action": "discover_resource_identifiers",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "observe",
+        "template": "collect_resource_ids",
+        "allowed_methods": ["GET"],
+        "variables": {
+          "ownership_hint": "path_id"
+        }
+      },
+      "expected_signal": "baseline response exposes stable resource identifiers",
+      "validator": "baseline_identifier_validator",
+      "max_attempts": 1
+    },
+    {
+      "id": "cross_read",
+      "action": "cross_identity_read_candidate",
+      "identity_selector": "alternate_user",
+      "probe_template": {
+        "mode": "bounded_probe",
+        "template": "swap_identifier",
+        "allowed_methods": ["GET"],
+        "variables": {
+          "swap_strategy": "neighbor_identifier"
+        }
+      },
+      "expected_signal": "alternate identity can read resource outside ownership boundary",
+      "validator": "ownership_boundary_validator",
+      "max_attempts": 1
+    },
+    {
+      "id": "write_surface_observe",
+      "action": "cross_identity_write_candidate_observation",
+      "identity_selector": "alternate_user",
+      "probe_template": {
+        "mode": "observe",
+        "template": "detect_write_surface",
+        "allowed_methods": ["GET"]
+      },
+      "expected_signal": "write-capable surface exists for same resource family",
+      "observe_only": true,
+      "max_attempts": 1
+    }
+  ],
+  "validators": {
+    "baseline_identifier_validator": {"signal": "resource_id_seen"},
+    "ownership_boundary_validator": {"signal": "foreign_resource_read"}
+  },
+  "safety_budget": {
+    "max_requests": 3,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default"
+  }
+}

@@ -1,0 +1,51 @@
+id: security_headers_audit
+attack_class: security_headers
+requires_auth: false
+preconditions:
+  methods: ["GET"]
+steps:
+  - id: observe_homepage
+    action: observe_response_headers
+    identity_selector: none
+    probe_template:
+      mode: observe
+      template: get_request_observe_headers
+      allowed_methods: ["GET"]
+      variables:
+        path: /
+    expected_signal: response headers present for analysis
+    observe_only: true
+    max_attempts: 1
+  - id: observe_api_root
+    action: observe_response_headers
+    identity_selector: none
+    probe_template:
+      mode: observe
+      template: get_request_observe_headers
+      allowed_methods: ["GET"]
+      variables:
+        path: /api
+    expected_signal: response headers present for analysis
+    observe_only: true
+    max_attempts: 1
+  - id: observe_login
+    action: observe_response_headers
+    identity_selector: none
+    probe_template:
+      mode: observe
+      template: get_request_observe_headers
+      allowed_methods: ["GET"]
+      variables:
+        path: /login
+    expected_signal: response headers present for analysis
+    observe_only: true
+    max_attempts: 1
+validators:
+  header_audit_validator:
+    signal: security_header_missing
+safety_budget:
+  max_requests: 3
+  max_attempts_per_step: 1
+  rate_limit_rps: 1.0
+  scope: current_endpoint
+  proof_gate: default

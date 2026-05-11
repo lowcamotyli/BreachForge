@@ -1,0 +1,54 @@
+{
+  "id": "price_manipulation",
+  "attack_class": "price_manipulation",
+  "preconditions": {
+    "methods": ["POST", "PUT", "PATCH"],
+    "path_contains_any": ["checkout", "order", "cart", "purchase", "payment", "pay"]
+  },
+  "steps": [
+    {
+      "id": "observe_price_param",
+      "action": "observe_price_structure",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "observe",
+        "template": "map_price_params",
+        "allowed_methods": ["GET"]
+      },
+      "expected_signal": "price or amount parameter found",
+      "observe_only": true,
+      "max_attempts": 1
+    },
+    {
+      "id": "probe_unit_confusion",
+      "action": "probe_with_unit_confusion",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "safe_fixture",
+        "template": "price_unit_confusion_probe",
+        "manipulation_type": "unit_confusion",
+        "probe_values": [
+          {"original_price": 1.00, "manipulated_price": 0.01},
+          {"manipulation_type": "currency_swap", "from": "USD", "to": "JPY"}
+        ],
+        "safe_fixture": true,
+        "allowed_methods": ["POST", "PUT", "PATCH"]
+      },
+      "expected_signal": "server accepts manipulated price",
+      "observe_only": false,
+      "validator": "price_manipulation_validator",
+      "max_attempts": 1
+    }
+  ],
+  "validators": {
+    "price_manipulation_validator": {"signal": "price_accepted_at_wrong_unit"}
+  },
+  "safety_budget": {
+    "max_requests": 3,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default",
+    "safe_fixture_required": true
+  }
+}

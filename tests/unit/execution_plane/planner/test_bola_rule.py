@@ -83,7 +83,8 @@ def test_matches_false_for_post_endpoint() -> None:
     assert rule.matches(endpoint, AssetMap(scan_id=uuid4())) is False
 
 
-def test_matches_false_for_get_without_auth_required() -> None:
+def test_matches_true_for_get_without_auth_required() -> None:
+    # unauth mode: BOLA now matches public endpoints with ID params (C1)
     rule = BolaBidirectional()
     endpoint = _build_endpoint(
         method="GET",
@@ -92,7 +93,7 @@ def test_matches_false_for_get_without_auth_required() -> None:
         parameters=[{"name": "id", "in": "path"}],
     )
 
-    assert rule.matches(endpoint, AssetMap(scan_id=uuid4())) is False
+    assert rule.matches(endpoint, AssetMap(scan_id=uuid4())) is True
 
 
 def test_matches_false_for_get_without_path_params() -> None:

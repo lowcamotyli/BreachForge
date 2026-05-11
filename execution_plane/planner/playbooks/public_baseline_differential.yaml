@@ -1,0 +1,43 @@
+id: public_baseline_differential
+attack_class: auth_bypass
+preconditions:
+  source:
+    - asset_map
+  in_scope_only: true
+steps:
+  - id: probe_unauth_baseline
+    action: probe_unauth_baseline
+    identity_selector: anonymous_user
+    probe_template:
+      mode: observe
+      template: probe_endpoint_without_auth_headers
+    expected_signal: unauth response collected for differential analysis
+    max_attempts: 1
+    observe_only: true
+  - id: probe_auth_baseline
+    action: probe_auth_baseline
+    identity_selector: current_user
+    probe_template:
+      mode: observe
+      template: probe_endpoint_with_auth_headers
+    expected_signal: auth response collected for differential comparison
+    max_attempts: 1
+    observe_only: true
+  - id: compute_differential
+    action: compute_auth_differential
+    identity_selector: current_user
+    probe_template:
+      mode: observe
+      template: compare_unauth_vs_auth_response_structural
+    expected_signal: differential indicates auth_bypass or data leakage candidate
+    max_attempts: 1
+    observe_only: true
+validators:
+  signal_validator:
+    signal: auth_differential_detected
+safety_budget:
+  max_requests: 3
+  scope: target_only
+  rate_limit_rps: 0.5
+  proof_gate: default
+  bounded_path_budget: true

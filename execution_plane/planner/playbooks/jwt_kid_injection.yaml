@@ -1,0 +1,69 @@
+{
+  "id": "jwt_kid_injection",
+  "attack_class": "jwt_attack",
+  "preconditions": {
+    "methods": ["GET"],
+    "auth_required": true,
+    "auth_scheme": "bearer",
+    "endpoint_type": "read_only"
+  },
+  "steps": [
+    {
+      "id": "baseline_authenticated",
+      "action": "capture_authenticated_baseline",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "observe",
+        "template": "send_with_valid_token",
+        "allowed_methods": ["GET"]
+      },
+      "expected_signal": "authenticated baseline response captured",
+      "observe_only": true,
+      "max_attempts": 1
+    },
+    {
+      "id": "kid_path_traversal_probe",
+      "action": "send_kid_path_traversal_token",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "bounded_probe",
+        "template": "jwt_mutate_header",
+        "allowed_methods": ["GET"],
+        "variables": {
+          "header_overrides": {"kid": "../../etc/passwd"},
+          "payload_safe": true
+        }
+      },
+      "expected_signal": "server processes path traversal kid value without error",
+      "validator": "kid_injection_validator",
+      "max_attempts": 1
+    },
+    {
+      "id": "kid_sql_injection_probe",
+      "action": "send_kid_sql_injection_token",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "bounded_probe",
+        "template": "jwt_mutate_header",
+        "allowed_methods": ["GET"],
+        "variables": {
+          "header_overrides": {"kid": "' OR 1=1--"},
+          "payload_safe": true
+        }
+      },
+      "expected_signal": "server leaks SQL error or accepts SQL-injected kid value",
+      "validator": "kid_injection_validator",
+      "max_attempts": 1
+    }
+  ],
+  "validators": {
+    "kid_injection_validator": {"signal": "kid_injection_accepted_or_leaked"}
+  },
+  "safety_budget": {
+    "max_requests": 3,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default"
+  }
+}

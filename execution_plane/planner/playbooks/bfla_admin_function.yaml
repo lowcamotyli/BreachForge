@@ -1,0 +1,40 @@
+id: bfla_admin_function
+attack_class: bfla
+preconditions:
+  auth_required: true
+  methods: ["GET", "POST"]
+  path_contains_any: ["/admin", "/internal", "/management", "/superuser", "/ops", "/system"]
+steps:
+  - id: baseline_elevated_access
+    action: observe_elevated_function_access
+    identity_selector: elevated_admin
+    observe_only: true
+    probe_template:
+      mode: observe
+      template: same_request_with_elevated_identity
+      variables:
+        capture: elevated_status_and_body_shape
+    expected_signal: elevated identity establishes the admin function baseline
+    max_attempts: 1
+  - id: low_privilege_function_probe
+    action: probe_admin_function_with_low_privilege_identity
+    identity_selector: low_privilege_user
+    probe_template:
+      mode: bounded_probe
+      template: same_request_with_low_privilege_identity
+      allowed_methods: ["GET", "POST"]
+      variables:
+        expected_low_priv_status: [403, 404]
+        required_roles: ["user", "viewer", "guest", "admin", "manager"]
+    expected_signal: low privilege identity receives admin function content instead of a denial
+    validator: bfla_differential_validator
+    max_attempts: 1
+validators:
+  bfla_differential_validator:
+    signal: low_privilege_admin_function_access
+safety_budget:
+  max_requests: 2
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

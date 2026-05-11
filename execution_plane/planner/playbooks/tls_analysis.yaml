@@ -1,0 +1,27 @@
+id: tls_analysis
+attack_class: tls_analysis
+requires_auth: false
+preconditions:
+  methods: ["GET", "HEAD"]
+steps:
+  - id: probe_tls_handshake
+    action: probe_tls_version
+    identity_selector: none
+    probe_template:
+      mode: observe
+      template: tls_version_probe
+      allowed_methods: ["HEAD"]
+      variables:
+        timeout: 10
+    expected_signal: TLS handshake reveals protocol version
+    observe_only: true
+    max_attempts: 1
+validators:
+  tls_version_validator:
+    signal: tls_weak_version
+safety_budget:
+  max_requests: 1
+  max_attempts_per_step: 1
+  rate_limit_rps: 1.0
+  scope: current_endpoint
+  proof_gate: default

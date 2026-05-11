@@ -1,0 +1,59 @@
+id: oauth_token_reuse
+attack_class: oauth_token_reuse
+preconditions:
+  methods: ["GET", "POST"]
+  path_contains_any: ["/oauth", "/token", "/logout", "/revoke"]
+  parameter_name_contains_any: ["access_token", "refresh_token", "authorization"]
+steps:
+  - id: safe_fixture_baseline
+    action: capture_oauth_safe_fixture_baseline
+    identity_selector: safe_fixture
+    safe_fixture_required: true
+    probe_template:
+      mode: observe
+      template: oauth_safe_fixture_resource_check
+      allowed_methods: ["GET"]
+      variables:
+        fixture_credential_kind: temporary_access_bearer
+    expected_signal: safe fixture credential can access resource before logout
+    observe_only: true
+    max_attempts: 1
+  - id: fixture_logout
+    action: invoke_logout_on_safe_fixture
+    identity_selector: safe_fixture
+    safe_fixture_required: true
+    probe_template:
+      mode: bounded_probe
+      template: oauth_safe_fixture_logout
+      allowed_methods: ["POST"]
+      variables:
+        fixture_credential_kind: temporary_access_bearer
+        code_exchange_allowed: false
+    expected_signal: logout endpoint invoked only for temporary safe fixture credential
+    observe_only: true
+    max_attempts: 1
+  - id: post_logout_resource_check
+    action: check_safe_fixture_access_after_logout
+    identity_selector: safe_fixture
+    safe_fixture_required: true
+    probe_template:
+      mode: bounded_probe
+      template: oauth_safe_fixture_resource_check_after_logout
+      allowed_methods: ["GET"]
+      variables:
+        after_logout: true
+        fixture_credential_kind: temporary_access_bearer
+    expected_signal: safe fixture credential still accesses protected resource after logout
+    validator: reuse_after_logout_validator
+    max_attempts: 1
+validators:
+  reuse_after_logout_validator:
+    signal: credential_valid_after_logout
+safety_budget:
+  max_requests: 3
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default
+  safe_fixture_required: true
+  allow_session_manipulation: true

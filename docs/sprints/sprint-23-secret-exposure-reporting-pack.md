@@ -7,7 +7,7 @@ Ten sprint laczy wyniki Sprintow 17-22 w finalny, customer-grade raport: discove
 ### Architektura - dokumenty referencyjne
 
 ```bash
-DAD_PROMPT="Read /mnt/d/SimpliAppSec/docs/architecture/security-constraints.md and data-model.md. Extract reporting constraints for redaction, EvidenceStore, JSON/Markdown export, and auditability. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
+DAD_PROMPT="Read /mnt/d/BreachForge/docs/architecture/security-constraints.md and data-model.md. Extract reporting constraints for redaction, EvidenceStore, JSON/Markdown export, and auditability. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
 ```
 
 ### Workstream A - Narrative Model

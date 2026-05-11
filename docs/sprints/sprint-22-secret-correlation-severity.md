@@ -7,7 +7,7 @@ Ten sprint nie dodaje nowych atakow. Dodaje warstwe decyzyjna: kiedy sensitive e
 ### Architektura - dokumenty referencyjne
 
 ```bash
-DAD_PROMPT="Read /mnt/d/SimpliAppSec/docs/architecture/validation-model.md and noise-reduction.md. Extract constraints for severity, dedup, correlation, and false-positive control. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
+DAD_PROMPT="Read /mnt/d/BreachForge/docs/architecture/validation-model.md and noise-reduction.md. Extract constraints for severity, dedup, correlation, and false-positive control. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
 ```
 
 ### Workstream A - Correlation Engine

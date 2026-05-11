@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 
 import control_plane.orchestrator as orchestrator_module
-from control_plane.orchestrator import ScanOrchestrator
+from control_plane.orchestrator import ScanConfig, ScanOrchestrator
 from storage.db.models import ScanStatus
 
 
@@ -48,6 +48,9 @@ async def test_runtime_fsm_uses_running_and_complete_with_explicit_phase_transit
     scan_id = uuid4()
     orchestrator, auth_queue, attack_queue = _build_orchestrator(monkeypatch)
     orchestrator._update_scan = AsyncMock()
+    orchestrator._resolve_scan_runtime = AsyncMock(
+        return_value=(ScanConfig(unauth_mode=False), False, False, None)
+    )
     monkeypatch.setattr(orchestrator_module, "purge_scan_credentials", AsyncMock())
 
     await orchestrator.on_scan_created(scan_id)

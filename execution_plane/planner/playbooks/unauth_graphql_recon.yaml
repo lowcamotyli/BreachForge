@@ -1,0 +1,85 @@
+{
+  "id": "unauth_graphql_recon",
+  "attack_class": "graphql",
+  "preconditions": {
+    "auth_required": false,
+    "methods": ["GET", "POST"],
+    "path_contains_any": ["graphql", "gql"],
+    "in_scope_only": true,
+    "unauth_compatible": true
+  },
+  "steps": [
+    {
+      "id": "introspection_query",
+      "action": "observe_public_graphql_introspection",
+      "identity_selector": "anonymous",
+      "probe_template": {
+        "mode": "observe",
+        "template": "graphql_introspection_query_read_only",
+        "allowed_methods": ["GET", "POST"],
+        "variables": {
+          "allowed_operations": ["query"],
+          "no_mutations_allowed": true,
+          "read_only": true
+        }
+      },
+      "expected_signal": "unauthenticated GraphQL introspection returns schema metadata",
+      "validator": "graphql_recon_signal_validator",
+      "max_attempts": 1,
+      "observe_only": true
+    },
+    {
+      "id": "field_suggestion_probe",
+      "action": "observe_public_graphql_field_suggestions",
+      "identity_selector": "anonymous",
+      "probe_template": {
+        "mode": "observe",
+        "template": "graphql_typo_field_suggestion_read_only",
+        "allowed_methods": ["GET", "POST"],
+        "variables": {
+          "typo_based": true,
+          "allowed_operations": ["query"],
+          "no_mutations_allowed": true,
+          "read_only": true
+        }
+      },
+      "expected_signal": "GraphQL error response suggests valid field names to anonymous caller",
+      "validator": "graphql_recon_signal_validator",
+      "max_attempts": 1,
+      "observe_only": true
+    },
+    {
+      "id": "schema_type_enumeration",
+      "action": "observe_public_graphql_schema_types",
+      "identity_selector": "anonymous",
+      "probe_template": {
+        "mode": "observe",
+        "template": "graphql_schema_type_enumeration_read_only",
+        "allowed_methods": ["GET", "POST"],
+        "variables": {
+          "allowed_operations": ["query"],
+          "no_mutations_allowed": true,
+          "read_only": true
+        }
+      },
+      "expected_signal": "anonymous GraphQL endpoint reveals schema type names",
+      "validator": "graphql_recon_signal_validator",
+      "max_attempts": 1,
+      "observe_only": true
+    }
+  ],
+  "validators": {
+    "graphql_recon_signal_validator": {
+      "signal": "unauthenticated_graphql_recon_signal"
+    }
+  },
+  "safety_budget": {
+    "max_requests": 3,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default",
+    "no_mutations_allowed": true,
+    "read_only": true
+  }
+}

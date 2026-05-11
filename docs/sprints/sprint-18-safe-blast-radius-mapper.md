@@ -7,7 +7,7 @@ Ten sprint rozszerza `impact_secret_replay` w kontrolowana mape zasiegu: kilka r
 ### Architektura - dokumenty referencyjne
 
 ```bash
-DAD_PROMPT="Read /mnt/d/SimpliAppSec/docs/architecture/attack-engine.md and security-constraints.md. Extract constraints for scoped read-only replay, rate limits, and worker isolation. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
+DAD_PROMPT="Read /mnt/d/BreachForge/docs/architecture/attack-engine.md and security-constraints.md. Extract constraints for scoped read-only replay, rate limits, and worker isolation. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
 ```
 
 ### Workstream A - Endpoint Selection

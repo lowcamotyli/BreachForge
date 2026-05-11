@@ -5,6 +5,7 @@ from typing import Any
 
 from storage.db.models import ProofArtifact, RawProbe
 
+from execution_plane.validator.differential import DifferentialProbeResult
 from execution_plane.validator.strategies.base import ValidationStrategy
 
 
@@ -13,7 +14,12 @@ class TenantIsolationStrategy(ValidationStrategy):
     _STATUS_ONLY_CONFIDENCE = 0.70
     _DIFFERENTIAL_BODY_CONFIDENCE = 0.90
 
-    def validate(self, attack_probe: RawProbe, control_probe: RawProbe | None) -> ProofArtifact | None:
+    def validate(
+        self,
+        attack_probe: RawProbe,
+        control_probe: RawProbe | None,
+        differential_result: DifferentialProbeResult | None = None,
+    ) -> ProofArtifact | None:
         if control_probe is None:
             return None
 
@@ -27,24 +33,44 @@ class TenantIsolationStrategy(ValidationStrategy):
 
         confidence: float | None = None
         summary: str | None = None
-        evidence_notes: str | None = None
+        evidence_parts: list[str] = []
 
         if attack_body != control_body:
             confidence = self._DIFFERENTIAL_BODY_CONFIDENCE
             summary = "Tenant isolation differential proof: attack and control response bodies are semantically different."
-            evidence_notes = (
-                f"attack_status={attack_status}, control_status={control_status}, "
-                "difference_type=semantic_body"
+            evidence_parts.append(
+                f"attack_status={attack_status}, control_status={control_status}, difference_type=semantic_body"
             )
         elif attack_status != control_status:
             confidence = self._STATUS_ONLY_CONFIDENCE
             summary = "Tenant isolation differential signal: status differs but response body semantics match."
-            evidence_notes = (
-                f"attack_status={attack_status}, control_status={control_status}, "
-                "difference_type=status_only"
+            evidence_parts.append(
+                f"attack_status={attack_status}, control_status={control_status}, difference_type=status_only"
             )
 
+        supporting_evidence = True
+        if differential_result is not None:
+            tenant_mismatch = (
+                (not differential_result.status_differs)
+                and differential_result.challenger_status in (200, 201, 204)
+                and differential_result.ownership_markers_differ
+            )
+            supporting_evidence = (not differential_result.status_differs) and differential_result.ownership_markers_differ
+            evidence_parts.append(
+                "differential_status_differs="
+                f"{differential_result.status_differs}, "
+                "differential_ownership_markers_differ="
+                f"{differential_result.ownership_markers_differ}, "
+                "differential_challenger_status="
+                f"{differential_result.challenger_status}"
+            )
+            if tenant_mismatch:
+                evidence_parts.append("cross-tenant data accessible")
+                confidence = min(1.0, (confidence or 0.0) + 0.2)
+
         if confidence is None or confidence < self._MIN_PROOF_CONFIDENCE_THRESHOLD:
+            return None
+        if confidence >= self._MIN_PROOF_CONFIDENCE_THRESHOLD and not supporting_evidence:
             return None
 
         return ProofArtifact(
@@ -54,7 +80,7 @@ class TenantIsolationStrategy(ValidationStrategy):
             attack_probe_id=attack_probe.id,
             control_probe_id=control_probe.id,
             summary=summary or "Tenant isolation validation proof",
-            evidence_notes=evidence_notes or "",
+            evidence_notes=", ".join(evidence_parts),
         )
 
     def expected_proof_type(self) -> str:

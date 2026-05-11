@@ -1,762 +1,513 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ProofScan</title>
-  <style>
-    :root {
-      --bg: #0b1117;
-      --panel: #121a23;
-      --panel-2: #182330;
-      --text: #dce6f0;
-      --muted: #9ba8b6;
-      --border: #263241;
-      --accent: #3aa0ff;
-      --danger: #e05252;
-      --success: #2ac174;
-      --warning: #f6c453;
-      --radius: 10px;
-      --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
-      --font: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-
-    * { box-sizing: border-box; }
-
-    body {
-      margin: 0;
-      font-family: var(--font);
-      background: radial-gradient(circle at 20% -10%, #1a2633 0%, var(--bg) 55%);
-      color: var(--text);
-      min-height: 100vh;
-      line-height: 1.4;
-    }
-
-    .container {
-      max-width: 1040px;
-      margin: 0 auto;
-      padding: 24px 16px 40px;
-    }
-
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 16px 18px;
-      background: rgba(18, 26, 35, 0.85);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      margin-bottom: 18px;
-    }
-
-    h1 {
-      margin: 0;
-      font-size: 1.35rem;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
-
-    .health {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 0.9rem;
-      color: var(--muted);
-    }
-
-    .dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 999px;
-      background: #8a8f96;
-      box-shadow: 0 0 0 4px rgba(138, 143, 150, 0.15);
-    }
-
-    .dot.ok {
-      background: var(--success);
-      box-shadow: 0 0 0 4px rgba(42, 193, 116, 0.2);
-    }
-
-    .dot.bad {
-      background: var(--danger);
-      box-shadow: 0 0 0 4px rgba(224, 82, 82, 0.2);
-    }
-
-    .stack {
-      display: grid;
-      gap: 16px;
-    }
-
-    .card {
-      background: rgba(18, 26, 35, 0.92);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 16px;
-      box-shadow: var(--shadow);
-    }
-
-    .card h2 {
-      margin: 0 0 12px;
-      font-size: 1rem;
-      letter-spacing: 0.02em;
-      color: #eef5fb;
-    }
-
-    .error-box {
-      background: rgba(224, 82, 82, 0.15);
-      border: 1px solid rgba(224, 82, 82, 0.6);
-      color: #ffd6d6;
-      border-radius: 8px;
-      padding: 10px 12px;
-      margin-bottom: 14px;
-      font-size: 0.92rem;
-      display: none;
-      white-space: pre-wrap;
-    }
-
-    .grid {
-      display: grid;
-      gap: 12px;
-    }
-
-    .grid.two {
-      grid-template-columns: 1fr;
-    }
-
-    label {
-      display: block;
-      font-size: 0.84rem;
-      color: var(--muted);
-      margin-bottom: 6px;
-    }
-
-    input,
-    select,
-    button,
-    textarea {
-      font: inherit;
-    }
-
-    input,
-    select,
-    textarea {
-      width: 100%;
-      border: 1px solid var(--border);
-      background: var(--panel-2);
-      color: var(--text);
-      border-radius: 8px;
-      padding: 10px 11px;
-      outline: none;
-      transition: border-color 0.15s ease;
-    }
-
-    input:focus,
-    select:focus,
-    textarea:focus {
-      border-color: var(--accent);
-    }
-
-    .hint {
-      color: var(--muted);
-      font-size: 0.78rem;
-      margin-top: 6px;
-    }
-
-    .row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      align-items: center;
-    }
-
-    button {
-      border: 1px solid #2f455c;
-      border-radius: 8px;
-      color: #e6f2ff;
-      background: linear-gradient(180deg, #24435e, #1b3348);
-      padding: 9px 13px;
-      cursor: pointer;
-      transition: transform 0.06s ease, filter 0.12s ease;
-      white-space: nowrap;
-    }
-
-    button:hover:not(:disabled) {
-      filter: brightness(1.08);
-    }
-
-    button:active:not(:disabled) {
-      transform: translateY(1px);
-    }
-
-    button.secondary {
-      background: linear-gradient(180deg, #25303d, #1b242f);
-      border-color: #34475d;
-    }
-
-    button.warning {
-      background: linear-gradient(180deg, #6e5d2b, #54461f);
-      border-color: #866f2f;
-      color: #ffefc7;
-    }
-
-    button:disabled {
-      opacity: 0.65;
-      cursor: not-allowed;
-    }
-
-    .hidden { display: none !important; }
-
-    .status-badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      border-radius: 999px;
-      font-size: 0.78rem;
-      padding: 3px 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      border: 1px solid transparent;
-      min-width: 90px;
-    }
-
-    .status-created { background: rgba(138, 143, 150, 0.2); color: #d2d6db; border-color: rgba(170,175,183,0.4); }
-    .status-running { background: rgba(58, 160, 255, 0.2); color: #cbe6ff; border-color: rgba(58,160,255,0.45); }
-    .status-paused { background: rgba(246, 196, 83, 0.2); color: #ffe5a3; border-color: rgba(246,196,83,0.45); }
-    .status-completed { background: rgba(42, 193, 116, 0.18); color: #c8f4dd; border-color: rgba(42,193,116,0.45); }
-    .status-failed { background: rgba(224, 82, 82, 0.2); color: #ffd0d0; border-color: rgba(224,82,82,0.5); }
-
-    .meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      color: var(--muted);
-      font-size: 0.9rem;
-      margin-top: 10px;
-    }
-
-    .table-wrap {
-      overflow-x: auto;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      min-width: 740px;
-      background: rgba(16, 23, 32, 0.9);
-    }
-
-    th,
-    td {
-      text-align: left;
-      padding: 10px 12px;
-      border-bottom: 1px solid #223040;
-      vertical-align: top;
-      font-size: 0.88rem;
-    }
-
-    th {
-      color: #b8c6d5;
-      font-weight: 600;
-      letter-spacing: 0.02em;
-      background: #13202d;
-    }
-
-    tbody tr:hover {
-      background: rgba(41, 62, 84, 0.25);
-    }
-
-    .severity {
-      border-radius: 999px;
-      padding: 2px 8px;
-      font-size: 0.76rem;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      border: 1px solid transparent;
-      display: inline-block;
-    }
-
-    .sev-critical { background: rgba(224,82,82,0.2); color: #ffd4d4; border-color: rgba(224,82,82,0.55); }
-    .sev-high { background: rgba(255,148,79,0.2); color: #ffdcbf; border-color: rgba(255,148,79,0.55); }
-    .sev-medium { background: rgba(246,196,83,0.2); color: #ffe9b1; border-color: rgba(246,196,83,0.5); }
-    .sev-low { background: rgba(58,160,255,0.2); color: #cce7ff; border-color: rgba(58,160,255,0.5); }
-    .sev-info { background: rgba(138,143,150,0.2); color: #d7dbe0; border-color: rgba(138,143,150,0.45); }
-
-    .empty {
-      color: var(--muted);
-      font-size: 0.9rem;
-      padding: 12px 2px 4px;
-    }
-
-    .report {
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: rgba(13, 19, 26, 0.9);
-      max-height: 340px;
-      overflow: auto;
-      padding: 12px;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.85rem;
-      color: #d5e2ef;
-    }
-
-    .console-toolbar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 10px;
-      margin: 14px 0 10px;
-    }
-
-    .console-toolbar h3 {
-      margin: 0;
-      font-size: 0.94rem;
-      letter-spacing: 0.02em;
-      color: #eef5fb;
-    }
-
-    .console {
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: #070c11;
-      min-height: 220px;
-      max-height: 360px;
-      overflow: auto;
-      padding: 10px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.78rem;
-      color: #d5e2ef;
-    }
-
-    .console-line {
-      display: grid;
-      grid-template-columns: 92px 58px 96px minmax(0, 1fr);
-      gap: 8px;
-      padding: 3px 0;
-      border-bottom: 1px solid rgba(38, 50, 65, 0.45);
-      align-items: start;
-    }
-
-    .console-line:last-child {
-      border-bottom: 0;
-    }
-
-    .console-time,
-    .console-source,
-    .console-detail {
-      color: #8797a8;
-    }
-
-    .console-level {
-      text-transform: uppercase;
-      font-weight: 700;
-    }
-
-    .console-level.info { color: #8bc8ff; }
-    .console-level.warn { color: #ffd276; }
-    .console-level.error { color: #ff9a9a; }
-    .console-message {
-      min-width: 0;
-      overflow-wrap: anywhere;
-    }
-
-    .console-detail {
-      display: block;
-      margin-top: 2px;
-      white-space: pre-wrap;
-    }
-
-    .monitor-controls {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-top: 12px;
-    }
-
-    .scan-progress {
-      margin-top: 12px;
-      padding: 12px;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      background: rgba(16, 24, 34, 0.92);
-    }
-
-    .phase-stepper {
-      display: grid;
-      grid-template-columns: repeat(9, minmax(0, 1fr));
-      gap: 6px;
-      margin-bottom: 14px;
-    }
-
-    .phase-step {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      text-align: center;
-      gap: 6px;
-      color: #7f8c9a;
-    }
-
-    .phase-dot {
-      width: 20px;
-      height: 20px;
-      border-radius: 999px;
-      border: 2px solid #415164;
-      background: #1a2431;
-      color: transparent;
-      font-size: 0.72rem;
-      line-height: 1;
-      font-weight: 700;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease, transform 0.2s ease;
-    }
-
-    .phase-label {
-      font-size: 0.72rem;
-      line-height: 1.15;
-      color: inherit;
-      word-break: break-word;
-    }
-
-    .phase-step.completed {
-      color: #b8d9c8;
-    }
-
-    .phase-step.completed .phase-dot {
-      background: rgba(42, 193, 116, 0.85);
-      border-color: rgba(42, 193, 116, 0.85);
-      color: #0f1b14;
-    }
-
-    .phase-step.current {
-      color: #d2e9ff;
-    }
-
-    .phase-step.current .phase-dot {
-      background: rgba(58, 160, 255, 0.32);
-      border-color: var(--accent);
-      color: #eaf5ff;
-      transform: scale(1.05);
-      box-shadow: 0 0 0 4px rgba(58, 160, 255, 0.18);
-    }
-
-    .progress-track {
-      width: 100%;
-      height: 12px;
-      border-radius: 6px;
-      overflow: hidden;
-      background: #1f2d3b;
-      border: 1px solid #2c3d50;
-      position: relative;
-    }
-
-    .progress-fill {
-      height: 100%;
-      width: 0%;
-      border-radius: 6px;
-      position: relative;
-      transition: width 0.3s ease, background-color 0.25s ease;
-    }
-
-    .progress-fill.running {
-      background: linear-gradient(90deg, #2d8de5 0%, #3aa0ff 100%);
-    }
-
-    .progress-fill.completed {
-      background: linear-gradient(90deg, #22a962 0%, #2ac174 100%);
-    }
-
-    .progress-fill.failed {
-      background: linear-gradient(90deg, #c63f3f 0%, #e05252 100%);
-    }
-
-    .progress-fill.paused {
-      background: linear-gradient(90deg, #c29a36 0%, #f6c453 100%);
-    }
-
-    .progress-fill.idle {
-      background: linear-gradient(90deg, #4d5d70 0%, #64758a 100%);
-    }
-
-    .progress-fill.running::after {
-      content: "";
-      position: absolute;
-      inset: 0;
-      background: linear-gradient(110deg, transparent 20%, rgba(255, 255, 255, 0.24) 45%, transparent 70%);
-      animation: progressShimmer 1.4s linear infinite;
-      pointer-events: none;
-    }
-
-    .progress-meta {
-      margin-top: 8px;
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      color: var(--muted);
-      font-size: 0.82rem;
-    }
-
-    .progress-percent {
-      color: #d9eaf9;
-      font-variant-numeric: tabular-nums;
-      font-weight: 600;
-    }
-
-    .status-detail-row {
-      margin-top: 8px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      color: #c2d2e2;
-      font-size: 0.84rem;
-    }
-
-    .status-detail-row span:last-child {
-      color: #d8e6f5;
-      font-variant-numeric: tabular-nums;
-    }
-
-    @keyframes progressShimmer {
-      0% { transform: translateX(-120%); }
-      100% { transform: translateX(120%); }
-    }
-
-    .toggle {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 0.85rem;
-      color: var(--muted);
-      margin-left: auto;
-    }
-
-    .toggle input {
-      width: 16px;
-      height: 16px;
-      margin: 0;
-      accent-color: var(--accent);
-    }
-
-    .copy-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-top: 8px;
-      align-items: center;
-    }
-
-    .copy-row .value {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.86rem;
-      color: #bfd4e8;
-      word-break: break-all;
-      background: rgba(18, 35, 51, 0.7);
-      border: 1px solid #2c425a;
-      border-radius: 7px;
-      padding: 6px 8px;
-      flex: 1;
-      min-width: 220px;
-    }
-
-    @media (min-width: 800px) {
-      .grid.two {
-        grid-template-columns: 1fr 1fr;
-      }
-
-      .grid.three {
-        grid-template-columns: 1fr 1fr 1fr;
+  <title>ProofScan Command Center</title>
+  
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  
+  <!-- FontAwesome -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            cyber: {
+              900: '#03070d', 
+              800: '#0a1120',
+              700: '#131f37',
+              600: '#1d3152',
+              accent: '#00f0ff',
+              success: '#00ff9d',
+              danger: '#ff3b6b',
+              warning: '#ffb800'
+            }
+          },
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            mono: ['Fira Code', 'monospace']
+          },
+          animation: {
+            'glow-pulse': 'glow 3s ease-in-out infinite alternate',
+            'shimmer-fast': 'shimmer 1.5s linear infinite',
+            'float': 'float 6s ease-in-out infinite',
+            'radar': 'radar 4s linear infinite',
+            'fadeIn': 'fadeIn 0.3s ease-out forwards',
+          },
+          keyframes: {
+            glow: {
+              '0%': { boxShadow: '0 0 10px rgba(0, 240, 255, 0.2)' },
+              '100%': { boxShadow: '0 0 25px rgba(0, 240, 255, 0.6)' }
+            },
+            shimmer: {
+              '0%': { backgroundPosition: '-200% 0' },
+              '100%': { backgroundPosition: '200% 0' }
+            },
+            float: {
+              '0%, 100%': { transform: 'translateY(0)' },
+              '50%': { transform: 'translateY(-10px)' }
+            },
+            radar: {
+              '0%': { transform: 'rotate(0deg)' },
+              '100%': { transform: 'rotate(360deg)' }
+            },
+            fadeIn: {
+              '0%': { opacity: '0', transform: 'translateY(10px)' },
+              '100%': { opacity: '1', transform: 'translateY(0)' }
+            }
+          }
+        }
       }
     }
+  </script>
 
-    @media (max-width: 760px) {
-      .phase-stepper {
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 10px 8px;
+  <style type="text/tailwindcss">
+    @layer base {
+      body {
+        @apply bg-cyber-900 text-gray-300 font-sans min-h-screen selection:bg-cyber-accent selection:text-black;
+        background-image: 
+          linear-gradient(rgba(0, 240, 255, 0.02) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(0, 240, 255, 0.02) 1px, transparent 1px);
+        background-size: 40px 40px;
+        background-position: center center;
+        background-attachment: fixed;
       }
+      
+      /* Overlay glowing orb */
+      body::before {
+        content: '';
+        position: fixed;
+        top: -20vh;
+        left: 20vw;
+        width: 60vw;
+        height: 60vh;
+        background: radial-gradient(circle, rgba(0,240,255,0.05) 0%, transparent 70%);
+        z-index: -1;
+        pointer-events: none;
+      }
+      
+      /* Scrollbar */
+      ::-webkit-scrollbar { width: 8px; height: 8px; }
+      ::-webkit-scrollbar-track { @apply bg-cyber-900/50; }
+      ::-webkit-scrollbar-thumb { @apply bg-cyber-700 border border-cyber-600 rounded-full; }
+      ::-webkit-scrollbar-thumb:hover { @apply bg-cyber-600 border-cyber-accent/50; }
+    }
 
-      .console-line {
-        grid-template-columns: 1fr;
-        gap: 2px;
+    @layer components {
+      .glass {
+        @apply bg-cyber-800/60 backdrop-blur-xl border border-cyber-700/60 shadow-[0_8px_32px_rgba(0,0,0,0.5)];
       }
+      .glass-panel {
+        @apply bg-cyber-900/80 backdrop-blur-md border border-cyber-700/40 rounded-lg overflow-hidden;
+      }
+      
+      .btn {
+        @apply relative inline-flex items-center justify-center gap-2 overflow-hidden bg-cyber-700/80 hover:bg-cyber-600 border border-cyber-accent/30 hover:border-cyber-accent text-cyber-accent font-medium py-2.5 px-5 rounded-lg transition-all duration-300 shadow-[0_0_15px_rgba(0,240,255,0.1)] hover:shadow-[0_0_20px_rgba(0,240,255,0.3)] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:border-cyber-accent/30 disabled:hover:shadow-none whitespace-nowrap;
+      }
+      .btn::before {
+        content: ''; position: absolute; top: 0; left: -100%; width: 100%; height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(0,240,255,0.2), transparent);
+        transition: left 0.5s ease;
+      }
+      .btn:hover:not(:disabled)::before { left: 100%; }
+      
+      .btn.secondary {
+        @apply bg-cyber-800 border-cyber-700 hover:border-cyber-600 text-gray-300 hover:text-white shadow-none;
+      }
+      .btn.warning {
+        @apply bg-cyber-800/80 border-cyber-warning/30 hover:border-cyber-warning text-cyber-warning hover:bg-cyber-warning/10 shadow-[0_0_15px_rgba(255,184,0,0.05)] hover:shadow-[0_0_20px_rgba(255,184,0,0.2)];
+      }
+      
+      .input-field {
+        @apply w-full bg-cyber-900 border border-cyber-700 focus:border-cyber-accent text-gray-200 rounded-lg px-4 py-2.5 outline-none transition-all duration-300 focus:ring-1 focus:ring-cyber-accent/50 focus:shadow-[0_0_15px_rgba(0,240,255,0.15)] placeholder:text-gray-600;
+      }
+      
+      /* Health Dot */
+      #healthDot { @apply border border-transparent; }
+      #healthDot.ok { @apply bg-cyber-success border-cyber-success/50 shadow-[0_0_10px_rgba(0,255,157,0.5)]; }
+      #healthDot.bad { @apply bg-cyber-danger border-cyber-danger/50 shadow-[0_0_10px_rgba(255,59,107,0.5)]; }
+
+      /* Status Badges */
+      .status-badge {
+        @apply px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider border backdrop-blur-md inline-flex items-center justify-center min-w-[90px];
+      }
+      .status-created { @apply bg-gray-500/10 border-gray-500/30 text-gray-400; }
+      .status-running { @apply bg-cyber-accent/10 border-cyber-accent/50 text-cyber-accent animate-pulse shadow-[0_0_15px_rgba(0,240,255,0.2)]; }
+      .status-paused { @apply bg-cyber-warning/10 border-cyber-warning/50 text-cyber-warning shadow-[0_0_10px_rgba(255,184,0,0.2)]; }
+      .status-completed { @apply bg-cyber-success/10 border-cyber-success/50 text-cyber-success shadow-[0_0_10px_rgba(0,255,157,0.2)]; }
+      .status-failed { @apply bg-cyber-danger/10 border-cyber-danger/50 text-cyber-danger shadow-[0_0_10px_rgba(255,59,107,0.2)]; }
+      
+      /* Phase Stepper */
+      .phase-stepper { @apply flex w-full justify-between relative overflow-hidden pb-4; }
+      .phase-step { @apply flex flex-col items-center text-center gap-2 relative z-10 flex-1; }
+      .phase-step:not(:last-child)::after {
+        content: ''; position: absolute; top: 12px; left: 50%; width: 100%; height: 2px;
+        @apply bg-cyber-700 transition-colors duration-500; z-index: -1;
+      }
+      .phase-step.completed:not(:last-child)::after { @apply bg-cyber-success shadow-[0_0_10px_rgba(0,255,157,0.4)]; }
+      
+      .phase-dot { 
+        @apply w-6 h-6 rounded-full border-2 border-cyber-600 bg-cyber-900 text-transparent text-[10px] font-bold flex items-center justify-center transition-all duration-300; 
+      }
+      .phase-label { @apply text-[10px] uppercase font-semibold tracking-wider text-gray-500 transition-colors duration-300 mt-1 absolute top-8 whitespace-nowrap; }
+      
+      .phase-step.completed .phase-dot { @apply bg-cyber-success/10 border-cyber-success text-cyber-success shadow-[0_0_10px_rgba(0,255,157,0.4)]; }
+      .phase-step.completed .phase-label { @apply text-cyber-success; }
+      
+      .phase-step.current .phase-dot { @apply bg-cyber-accent/10 border-cyber-accent text-cyber-accent scale-125 shadow-[0_0_15px_rgba(0,240,255,0.6)]; }
+      .phase-step.current .phase-label { @apply text-cyber-accent; }
+
+      /* Progress Bar */
+      .progress-track { @apply w-full h-1.5 bg-cyber-900 rounded-full overflow-hidden border border-cyber-700/50 mt-8 relative; }
+      .progress-fill { @apply h-full transition-all duration-500 ease-out relative; }
+      .progress-fill.running { 
+        background: linear-gradient(90deg, #0055ff, #00f0ff); 
+        box-shadow: 0 0 10px #00f0ff;
+      }
+      .progress-fill.running::after {
+        content: ''; position: absolute; inset: 0;
+        background: linear-gradient(90deg, transparent, rgba(255,255,255,0.4), transparent);
+        animation: shimmer 1.5s infinite linear;
+      }
+      .progress-fill.completed { background: linear-gradient(90deg, #00a859, #00ff9d); box-shadow: 0 0 10px #00ff9d; }
+      .progress-fill.failed { background: linear-gradient(90deg, #aa0022, #ff3b6b); box-shadow: 0 0 10px #ff3b6b; }
+      .progress-fill.paused { background: linear-gradient(90deg, #a87900, #ffb800); }
+      .progress-fill.idle { @apply bg-cyber-700; }
+
+      /* Console */
+      .console {
+        @apply font-mono text-[11px] leading-relaxed overflow-y-auto bg-[#02050a] border-none p-4 rounded-b-lg;
+      }
+      .console-line { @apply grid grid-cols-1 sm:grid-cols-[85px_50px_90px_1fr] gap-1 sm:gap-3 py-1.5 border-b border-cyber-800/50 items-start hover:bg-cyber-800/30 transition-colors; }
+      .console-line:last-child { @apply border-none; }
+      .console-time { @apply text-gray-500 opacity-70; }
+      .console-level { @apply font-bold uppercase tracking-widest text-[9px] px-1.5 py-0.5 rounded flex items-center justify-center border w-fit sm:w-auto; }
+      .console-level.info { @apply bg-blue-500/10 text-blue-400 border-blue-500/20; }
+      .console-level.warn { @apply bg-yellow-500/10 text-yellow-400 border-yellow-500/20; }
+      .console-level.error { @apply bg-red-500/10 text-red-400 border-red-500/20 shadow-[0_0_5px_rgba(239,68,68,0.2)]; }
+      .console-source { @apply text-purple-400/80; }
+      .console-message { @apply text-gray-300 break-words; }
+      .console-detail { @apply block mt-1 text-gray-500 whitespace-pre-wrap pl-4 border-l border-cyber-700/50; }
+
+      /* Severities */
+      .severity { @apply px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider border inline-flex items-center justify-center; }
+      .sev-critical { @apply bg-red-500/20 border-red-500/50 text-red-400 shadow-[0_0_10px_rgba(239,68,68,0.3)]; }
+      .sev-high { @apply bg-orange-500/20 border-orange-500/50 text-orange-400; }
+      .sev-medium { @apply bg-yellow-500/20 border-yellow-500/50 text-yellow-400; }
+      .sev-low { @apply bg-blue-500/20 border-blue-500/50 text-blue-400; }
+      .sev-info { @apply bg-gray-500/20 border-gray-500/50 text-gray-400; }
+
+      /* Table */
+      th { @apply bg-cyber-900/80 text-gray-400 text-xs uppercase tracking-wider px-4 py-3 text-left border-b border-cyber-700 font-semibold; }
+      td { @apply px-4 py-3 border-b border-cyber-800/50 text-sm align-top; }
+      tr:hover td { @apply bg-cyber-800/30; }
+      
+      .empty { @apply text-gray-500 text-sm py-8 text-center italic; }
+      
+      .hidden { display: none !important; }
     }
   </style>
 </head>
-<body>
-  <div class="container">
-    <header>
-      <h1>ProofScan</h1>
-      <div class="health" id="healthText">
-        <span class="dot" id="healthDot"></span>
-        <span id="healthLabel">Checking health...</span>
+<body class="p-4 md:p-8">
+
+  <div class="max-w-7xl mx-auto">
+    <!-- HEADER -->
+    <header class="glass rounded-2xl p-4 md:p-6 flex flex-col md:flex-row justify-between items-center mb-8 relative overflow-hidden">
+      <!-- Decor -->
+      <div class="absolute inset-0 bg-gradient-to-r from-cyber-accent/5 to-transparent pointer-events-none"></div>
+      <div class="absolute right-0 top-0 w-64 h-full bg-gradient-to-l from-cyber-700/20 to-transparent pointer-events-none transform skew-x-12 translate-x-10"></div>
+      
+      <div class="flex items-center gap-4 relative z-10">
+        <div class="relative flex items-center justify-center w-12 h-12 rounded-xl bg-cyber-900 border border-cyber-600 shadow-[0_0_20px_rgba(0,240,255,0.2)]">
+          <i class="fa-solid fa-radar text-cyber-accent text-xl animate-radar"></i>
+        </div>
+        <div>
+          <h1 class="text-3xl font-bold tracking-[0.2em] text-white uppercase" style="text-shadow: 0 0 15px rgba(0,240,255,0.4);">ProofScan</h1>
+          <p class="text-xs text-cyber-accent/70 tracking-widest font-mono uppercase mt-1">Vulnerability Engine v2</p>
+        </div>
+      </div>
+      
+      <div class="flex items-center gap-3 mt-4 md:mt-0 text-sm font-mono text-gray-400 bg-cyber-900/80 backdrop-blur-md px-4 py-2 rounded-xl border border-cyber-700 relative z-10 shadow-[inset_0_0_10px_rgba(0,0,0,0.5)]">
+        <div class="flex relative items-center justify-center">
+          <span class="absolute w-4 h-4 rounded-full opacity-50 animate-ping" id="healthPing"></span>
+          <span class="w-2.5 h-2.5 rounded-full transition-all duration-300 relative z-10" id="healthDot"></span>
+        </div>
+        <span id="healthLabel">SYS_CHK...</span>
       </div>
     </header>
 
-    <div class="error-box" id="errorBox"></div>
+    <!-- Error Box -->
+    <div class="hidden bg-cyber-danger/10 border border-cyber-danger text-red-200 rounded-xl p-4 mb-6 shadow-[0_0_15px_rgba(255,59,107,0.2)] backdrop-blur-sm relative overflow-hidden animate-[fadeIn_0.3s_ease-out]" id="errorBox">
+      <div class="absolute left-0 top-0 bottom-0 w-1 bg-cyber-danger" id="errorDeco"></div>
+      <div class="flex items-center gap-3">
+        <i class="fa-solid fa-triangle-exclamation text-cyber-danger text-lg" id="errorIcon"></i>
+        <div class="font-mono text-sm" id="errorText"></div>
+      </div>
+    </div>
 
-    <main class="stack">
-      <section class="card">
-        <h2>New Scan</h2>
-        <form id="newScanForm" class="grid">
-          <div>
-            <label for="targetUrl">Target URL</label>
-            <input id="targetUrl" name="targetUrl" type="url" required placeholder="https://example.com" />
-          </div>
+    <!-- MAIN GRID -->
+    <div class="grid grid-cols-1 xl:grid-cols-12 gap-8 items-start">
+      
+      <!-- LEFT COL: CONTROLS -->
+      <div class="xl:col-span-4 space-y-6">
+        
+        <!-- New Scan Card -->
+        <section class="glass rounded-2xl relative group overflow-hidden animate-[fadeIn_0.4s_ease-out]">
+          <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-cyber-accent/50 to-transparent opacity-50 group-hover:opacity-100 transition-opacity"></div>
+          
+          <div class="p-6">
+            <h2 class="text-lg font-bold text-white mb-6 flex items-center gap-3 uppercase tracking-wider">
+              <i class="fa-solid fa-crosshairs text-cyber-accent"></i> 
+              Initialize Scan
+            </h2>
+            
+            <form id="newScanForm" class="space-y-5">
+              <div>
+                <label for="targetUrl" class="block text-xs font-mono text-cyber-accent mb-2 uppercase tracking-wide">Target Vector <span class="text-cyber-danger">*</span></label>
+                <div class="relative">
+                  <i class="fa-solid fa-globe absolute left-4 top-1/2 -translate-y-1/2 text-gray-500"></i>
+                  <input id="targetUrl" name="targetUrl" type="url" required placeholder="https://target.net" class="input-field pl-11 font-mono text-sm" />
+                </div>
+              </div>
 
-          <div>
-            <label for="allowedDomains">Allowed Domains (optional)</label>
-            <input id="allowedDomains" name="allowedDomains" type="text" placeholder="app.example.com, api.example.com" />
-            <div class="hint">Auto-detected if empty</div>
-          </div>
+              <div>
+                <label for="allowedDomains" class="block text-xs font-mono text-gray-400 mb-2 uppercase tracking-wide">Scope Limits (optional)</label>
+                <input id="allowedDomains" name="allowedDomains" type="text" placeholder="api.target.net, auth.target.net" class="input-field font-mono text-sm" />
+                <p class="text-[10px] text-gray-500 mt-1.5 flex items-center gap-1"><i class="fa-solid fa-circle-info"></i> Auto-detected if empty</p>
+              </div>
 
-          <div class="grid two">
-            <div>
-              <label for="authType">Auth Type</label>
-              <select id="authType" name="authType">
-                <option value="none">none</option>
-                <option value="token">token</option>
-                <option value="credential">credential</option>
-              </select>
+              <div class="grid grid-cols-2 gap-4">
+                <div class="col-span-2 sm:col-span-1">
+                  <label for="authType" class="block text-xs font-mono text-gray-400 mb-2 uppercase tracking-wide">Auth Protocol</label>
+                  <select id="authType" name="authType" class="input-field font-mono text-sm appearance-none bg-[url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20width%3D%2224%22%20height%3D%2224%22%20fill%3D%22none%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cpath%20d%3D%22M7%2010L12%2015L17%2010%22%20stroke%3D%22%23475569%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%3C%2Fsvg%3E')] bg-[position:right_8px_center] bg-no-repeat pr-10">
+                    <option value="none">Ghost (None)</option>
+                    <option value="token">Bearer Token</option>
+                    <option value="credential">Credentials</option>
+                  </select>
+                </div>
+                
+                <div id="tokenWrap" class="col-span-2 hidden animate-[fadeIn_0.3s_ease-out]">
+                  <label for="bearerToken" class="block text-xs font-mono text-cyber-warning mb-2 uppercase tracking-wide">Bearer JWT</label>
+                  <div class="relative">
+                    <i class="fa-solid fa-key absolute left-4 top-1/2 -translate-y-1/2 text-cyber-warning/50"></i>
+                    <input id="bearerToken" name="bearerToken" type="text" autocomplete="off" class="input-field pl-11 font-mono text-sm focus:border-cyber-warning focus:ring-cyber-warning/50 border-cyber-700 bg-cyber-900" placeholder="eyJhb..." />
+                  </div>
+                </div>
+              </div>
+
+              <div id="credentialWrap" class="grid grid-cols-2 gap-4 hidden animate-[fadeIn_0.3s_ease-out]">
+                <div>
+                  <label for="authUsername" class="block text-xs font-mono text-cyber-warning mb-2 uppercase tracking-wide">User ID</label>
+                  <input id="authUsername" name="authUsername" type="text" autocomplete="username" class="input-field font-mono text-sm focus:border-cyber-warning focus:ring-cyber-warning/50 border-cyber-700 bg-cyber-900" />
+                </div>
+                <div>
+                  <label for="authPassword" class="block text-xs font-mono text-cyber-warning mb-2 uppercase tracking-wide">Passkey</label>
+                  <input id="authPassword" name="authPassword" type="password" autocomplete="current-password" class="input-field font-mono text-sm focus:border-cyber-warning focus:ring-cyber-warning/50 border-cyber-700 bg-cyber-900" />
+                </div>
+              </div>
+
+              <div class="pt-4 border-t border-cyber-700/50">
+                <button id="startScanBtn" type="submit" class="btn w-full">
+                  <i class="fa-solid fa-bolt"></i> ENGAGE SCAN
+                </button>
+              </div>
+            </form>
+
+            <div id="createdScanBox" class="hidden mt-4 p-4 bg-cyber-900/60 border border-cyber-success/30 rounded-lg animate-[fadeIn_0.4s_ease-out]">
+              <p class="text-xs text-cyber-success font-mono mb-2"><i class="fa-solid fa-check-circle mr-1"></i> SCAN_ID_GENERATED:</p>
+              <div class="flex items-center gap-2">
+                <div class="font-mono text-xs text-white bg-cyber-800 border border-cyber-700 p-2.5 rounded flex-1 truncate select-all" id="createdScanId"></div>
+                <button class="btn secondary px-3 py-2.5" id="copyScanIdBtn" type="button" title="Copy ID">
+                  <i class="fa-regular fa-copy"></i>
+                </button>
+              </div>
             </div>
-            <div id="tokenWrap" class="hidden">
-              <label for="bearerToken">Bearer Token</label>
-              <input id="bearerToken" name="bearerToken" type="text" autocomplete="off" />
+          </div>
+        </section>
+
+        <!-- Open Existing Scan -->
+        <section class="glass rounded-2xl relative overflow-hidden animate-[fadeIn_0.5s_ease-out]">
+          <div class="p-6">
+            <h2 class="text-sm font-bold text-gray-400 mb-4 flex items-center gap-3 uppercase tracking-wider">
+              <i class="fa-solid fa-folder-open text-gray-500"></i> Restore Session
+            </h2>
+            <div class="flex flex-col sm:flex-row gap-3">
+              <input id="manualScanId" type="text" placeholder="Paste Scan ID..." class="input-field font-mono text-sm flex-1" />
+              <button class="btn secondary" id="openMonitorBtn" type="button">
+                <i class="fa-solid fa-satellite-dish"></i> CONNECT
+              </button>
+            </div>
+          </div>
+        </section>
+
+      </div>
+
+      <!-- RIGHT COL: MONITOR & DATA -->
+      <div class="xl:col-span-8 space-y-6">
+        
+        <!-- Monitor Section -->
+        <section class="glass rounded-2xl hidden flex-col overflow-hidden relative animate-[fadeIn_0.6s_ease-out]" id="monitorSection">
+          <!-- decorative scanline -->
+          <div class="absolute inset-0 pointer-events-none overflow-hidden z-20">
+            <div class="w-full h-1 bg-cyber-accent/20 absolute top-0 left-0 shadow-[0_0_20px_rgba(0,240,255,0.4)] animate-[float_3s_linear_infinite]" style="animation-direction: alternate;"></div>
+          </div>
+
+          <div class="p-6 pb-0">
+            <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6">
+              <div>
+                <h2 class="text-xl font-bold text-white flex items-center gap-2">
+                  <i class="fa-solid fa-terminal text-cyber-accent"></i> ACTIVE MONITOR
+                </h2>
+                <div class="flex items-center gap-3 mt-2 text-xs font-mono">
+                  <span class="text-gray-500">ID:</span>
+                  <input id="scanIdInput" type="text" readonly class="bg-transparent border-none text-cyber-accent outline-none w-48 sm:w-64 truncate select-all" placeholder="-" />
+                </div>
+              </div>
+              <div class="flex flex-col items-end gap-2">
+                <div id="statusBadgeWrap" class="relative">
+                  <span id="statusBadge" class="status-badge status-created shadow-lg">created</span>
+                </div>
+                <div class="text-[10px] font-mono text-gray-500 uppercase">
+                  T0: <span id="createdAtText">-</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Progress Block -->
+            <div class="glass-panel p-6 mb-6 relative overflow-hidden bg-cyber-900/90">
+              <div class="absolute right-0 bottom-0 opacity-5 w-32 h-32 pointer-events-none transform translate-x-4 translate-y-4">
+                <i class="fa-solid fa-fingerprint text-[120px]"></i>
+              </div>
+              
+              <div class="phase-stepper overflow-x-auto" id="phaseStepper">
+                <!-- Dynamically populated -->
+              </div>
+              
+              <div class="progress-track">
+                <div class="progress-fill idle" id="progressFill"></div>
+              </div>
+              
+              <div class="flex justify-between items-center mt-4">
+                <div class="flex items-center gap-3">
+                  <span class="text-cyber-accent font-bold font-mono text-lg" id="progressPercent">0%</span>
+                  <span class="text-gray-300 font-mono text-xs uppercase bg-cyber-800 px-2 py-1 rounded" id="phaseDetailText">INIT_SEQ</span>
+                </div>
+                <div class="font-mono text-xs text-cyber-accent/70 bg-cyber-accent/10 px-2 py-1 rounded border border-cyber-accent/20" id="elapsedTimeText">
+                  T+ 00:00:00
+                </div>
+              </div>
             </div>
           </div>
 
-          <div id="credentialWrap" class="grid two hidden">
-            <div>
-              <label for="authUsername">Username</label>
-              <input id="authUsername" name="authUsername" type="text" autocomplete="username" />
+          <!-- Console Component -->
+          <div class="px-6 flex flex-col h-[380px]" id="consoleSection">
+            <div class="flex justify-between items-center bg-cyber-800 border-t border-l border-r border-cyber-700/60 rounded-t-lg px-4 py-2 mt-2">
+              <h3 class="text-xs font-bold text-gray-300 font-mono uppercase flex items-center gap-2">
+                <i class="fa-solid fa-microchip text-cyber-accent"></i> stdout_log
+              </h3>
+              <button class="text-gray-500 hover:text-white transition-colors" id="refreshConsoleBtn" type="button" title="Refresh Log">
+                <i class="fa-solid fa-rotate-right text-xs"></i>
+              </button>
             </div>
-            <div>
-              <label for="authPassword">Password</label>
-              <input id="authPassword" name="authPassword" type="password" autocomplete="current-password" />
-            </div>
-          </div>
-
-          <div class="row">
-            <button id="startScanBtn" type="submit">Start Scan</button>
-          </div>
-        </form>
-
-        <div id="createdScanBox" class="hidden">
-          <div class="copy-row">
-            <div class="value" id="createdScanId"></div>
-            <button class="secondary" id="copyScanIdBtn" type="button">Copy ID</button>
-          </div>
-        </div>
-      </section>
-
-      <section class="card">
-        <h2>Open Existing Scan</h2>
-        <div class="grid two">
-          <div>
-            <label for="manualScanId">Scan ID</label>
-            <input id="manualScanId" type="text" placeholder="Paste scan ID" />
-          </div>
-          <div class="row" style="align-items: end;">
-            <button class="secondary" id="openMonitorBtn" type="button">Open Monitor</button>
-          </div>
-        </div>
-      </section>
-
-      <section class="card hidden" id="monitorSection">
-        <h2>Scan Monitor</h2>
-        <div class="grid two">
-          <div>
-            <label for="scanIdInput">Scan ID</label>
-            <input id="scanIdInput" type="text" placeholder="Scan ID" />
-          </div>
-          <div>
-            <label>Status</label>
-            <div>
-              <span id="statusBadge" class="status-badge status-created">created</span>
+            <div class="console flex-1 border border-cyber-700/60 relative overflow-hidden" id="scanConsoleWrap">
+              <div class="absolute inset-0 pointer-events-none z-10 shadow-[inset_0_0_20px_rgba(0,0,0,0.8)]"></div>
+              <div id="scanConsole" class="h-full overflow-y-auto relative z-0 pr-2" aria-live="polite">
+                <div class="empty text-[10px] uppercase tracking-widest text-cyber-700 pt-10">
+                  &gt; AWAITING_TELEMETRY...
+                </div>
+              </div>
             </div>
           </div>
-        </div>
 
-        <div class="meta">
-          <div>Phase: <span id="phaseText">-</span></div>
-          <div>Created: <span id="createdAtText">-</span></div>
-        </div>
-
-        <div class="scan-progress" id="scanProgressBlock">
-          <div class="phase-stepper" id="phaseStepper"></div>
-          <div class="progress-track">
-            <div class="progress-fill idle" id="progressFill"></div>
+          <!-- Controls -->
+          <div class="p-4 md:p-6 bg-cyber-900/50 border-t border-cyber-800 mt-6 flex flex-wrap items-center gap-3">
+            <button class="btn secondary text-sm py-2" id="refreshStatusBtn" type="button">
+              <i class="fa-solid fa-arrows-rotate"></i> SYNC
+            </button>
+            <button class="btn warning text-sm py-2" id="pauseScanBtn" type="button">
+              <i class="fa-solid fa-pause"></i> HALT
+            </button>
+            <button class="btn secondary text-sm py-2" id="loadFindingsBtn" type="button">
+              <i class="fa-solid fa-bug"></i> FETCH VULNS
+            </button>
+            <button class="btn secondary text-sm py-2" id="downloadReportBtn" type="button">
+              <i class="fa-solid fa-file-arrow-down"></i> EXPORT .MD
+            </button>
+            
+            <label class="ml-auto flex items-center gap-2 cursor-pointer group mt-2 sm:mt-0">
+              <div class="relative w-10 h-5 bg-cyber-700 rounded-full transition-colors group-hover:bg-cyber-600 border border-cyber-600">
+                <input id="autoRefreshCheckbox" type="checkbox" class="sr-only peer" />
+                <div class="absolute left-1 top-1 w-3 h-3 bg-gray-400 rounded-full transition-all peer-checked:translate-x-5 peer-checked:bg-cyber-accent peer-checked:shadow-[0_0_8px_rgba(0,240,255,0.8)]"></div>
+              </div>
+              <span class="text-xs font-mono text-gray-400 uppercase tracking-wider">Auto-Sync</span>
+            </label>
           </div>
-          <div class="progress-meta">
-            <span>Progress</span>
-            <span class="progress-percent" id="progressPercent">0%</span>
-          </div>
-          <div class="status-detail-row">
-            <span id="phaseDetailText">Initializing scan</span>
-            <span id="elapsedTimeText">Elapsed: 00:00:00</span>
-          </div>
+        </section>
+
+        <!-- Findings & Report (Toggled by JS or always visible once scan runs) -->
+        <div class="grid grid-cols-1 gap-6">
+          <section class="glass rounded-2xl p-6 animate-[fadeIn_0.7s_ease-out]">
+            <h2 class="text-lg font-bold text-white mb-4 flex items-center gap-2 border-b border-cyber-700 pb-3">
+              <i class="fa-solid fa-biohazard text-cyber-danger"></i> THREAT INTELLIGENCE
+            </h2>
+            <div class="glass-panel overflow-x-auto">
+              <table class="w-full min-w-[700px]">
+                <thead>
+                  <tr>
+                    <th class="w-24">Threat Lvl</th>
+                    <th>Vulnerability Signature</th>
+                    <th class="w-40">Class</th>
+                    <th>Target Vector</th>
+                  </tr>
+                </thead>
+                <tbody id="findingsBody" class="font-mono text-xs">
+                  <!-- Populated by JS -->
+                </tbody>
+              </table>
+              <div class="empty py-12 flex flex-col items-center justify-center gap-3" id="findingsEmpty">
+                <i class="fa-solid fa-shield-check text-4xl text-cyber-700"></i>
+                <span class="text-cyber-700 tracking-widest text-xs">NO VULNERABILITIES DETECTED</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="glass rounded-2xl p-6 mb-12 animate-[fadeIn_0.8s_ease-out]">
+            <div class="flex justify-between items-center mb-4 border-b border-cyber-700 pb-3">
+              <h2 class="text-lg font-bold text-white flex items-center gap-2">
+                <i class="fa-solid fa-file-lines text-cyber-accent"></i> FINAL DOSSIER
+              </h2>
+              <button class="btn secondary text-xs py-1.5 px-3" id="copyReportBtn" type="button">
+                <i class="fa-regular fa-copy"></i> COPY TO CLIPBOARD
+              </button>
+            </div>
+            <div class="glass-panel p-4 max-h-[400px] overflow-y-auto font-mono text-xs text-gray-300 whitespace-pre-wrap selection:bg-cyber-accent/30 selection:text-white" id="reportPanel">AWAITING_REPORT_GENERATION...</div>
+          </section>
         </div>
 
-        <div id="consoleSection">
-          <div class="console-toolbar">
-            <h3>Scan Console</h3>
-            <button class="secondary" id="refreshConsoleBtn" type="button">Refresh Console</button>
-          </div>
-          <div class="console" id="scanConsole" aria-live="polite">
-            <div class="empty">No scan events loaded</div>
-          </div>
-        </div>
-
-        <div class="monitor-controls">
-          <button class="secondary" id="refreshStatusBtn" type="button">Refresh Status</button>
-          <button class="warning" id="pauseScanBtn" type="button">Pause Scan</button>
-          <button class="secondary" id="loadFindingsBtn" type="button">Load Findings</button>
-          <button class="secondary" id="downloadReportBtn" type="button">Download Report (MD)</button>
-          <label class="toggle" for="autoRefreshCheckbox">
-            <input id="autoRefreshCheckbox" type="checkbox" />
-            Auto-refresh (5s)
-          </label>
-        </div>
-      </section>
-
-      <section class="card">
-        <h2>Findings</h2>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Severity</th>
-                <th>Title</th>
-                <th>Attack Class</th>
-                <th>Affected Endpoint</th>
-              </tr>
-            </thead>
-            <tbody id="findingsBody"></tbody>
-          </table>
-        </div>
-        <div class="empty" id="findingsEmpty">No findings yet</div>
-      </section>
-
-      <section class="card">
-        <h2>Report</h2>
-        <div class="row" style="margin-bottom: 10px;">
-          <button class="secondary" id="copyReportBtn" type="button">Copy report</button>
-        </div>
-        <div class="report" id="reportPanel">No report loaded</div>
-      </section>
-    </main>
+      </div>
+    </div>
   </div>
 
   <script>
     const API_BASE = "";
 
     const errorBox = document.getElementById("errorBox");
+    const errorText = document.getElementById("errorText");
+    const errorIcon = document.getElementById("errorIcon");
+    const errorDeco = document.getElementById("errorDeco");
+    
     const healthDot = document.getElementById("healthDot");
+    const healthPing = document.getElementById("healthPing");
     const healthLabel = document.getElementById("healthLabel");
 
     const newScanForm = document.getElementById("newScanForm");
@@ -779,7 +530,6 @@
     const monitorSection = document.getElementById("monitorSection");
     const scanIdInput = document.getElementById("scanIdInput");
     const statusBadge = document.getElementById("statusBadge");
-    const phaseText = document.getElementById("phaseText");
     const createdAtText = document.getElementById("createdAtText");
     const phaseStepper = document.getElementById("phaseStepper");
     const progressFill = document.getElementById("progressFill");
@@ -821,18 +571,18 @@
     ];
 
     const phaseDetailMap = {
-      created: "Initializing scan",
-      auth_bootstrap: "Authenticating...",
-      crawl: "Crawling target",
-      plan: "Planning attacks",
-      attack: "Running attacks",
-      validate: "Validating findings",
-      score: "Scoring & dedup",
-      report: "Generating report",
-      complete: "Scan complete",
-      completed: "Scan complete",
-      paused: "Paused",
-      failed: "Failed"
+      created: "INIT_SEQ",
+      auth_bootstrap: "AUTH_HANDSHAKE",
+      crawl: "MAPPING_VECTORS",
+      plan: "TACTIC_CALC",
+      attack: "PAYLOAD_DELIVERY",
+      validate: "VERIFYING_HITS",
+      score: "THREAT_ANALYSIS",
+      report: "COMPILING_DATA",
+      complete: "MISSION_ACCOMPLISHED",
+      completed: "MISSION_ACCOMPLISHED",
+      paused: "SYS_HALTED",
+      failed: "CRITICAL_FAILURE"
     };
 
     const statusClassMap = {
@@ -853,13 +603,13 @@
     };
 
     function showError(message) {
-      errorBox.textContent = message;
-      errorBox.style.display = "block";
+      errorText.textContent = message;
+      errorBox.classList.remove("hidden");
     }
 
     function clearError() {
-      errorBox.textContent = "";
-      errorBox.style.display = "none";
+      errorText.textContent = "";
+      errorBox.classList.add("hidden");
     }
 
     function formatConsoleTime(timestamp) {
@@ -874,7 +624,7 @@
       if (!details || typeof details !== "object" || Object.keys(details).length === 0) {
         return "";
       }
-      return JSON.stringify(details);
+      return JSON.stringify(details, null, 2);
     }
 
     function renderConsole() {
@@ -885,15 +635,15 @@
       scanConsole.innerHTML = "";
       if (events.length === 0) {
         const empty = document.createElement("div");
-        empty.className = "empty";
-        empty.textContent = "No scan events loaded";
+        empty.className = "empty text-[10px] uppercase tracking-widest text-cyber-700 pt-10 text-center";
+        empty.innerHTML = "&gt; AWAITING_TELEMETRY...";
         scanConsole.appendChild(empty);
         return;
       }
 
       for (const event of events) {
         const line = document.createElement("div");
-        line.className = "console-line";
+        line.className = "console-line animate-[fadeIn_0.2s_ease-out]";
 
         const time = document.createElement("span");
         time.className = "console-time";
@@ -906,21 +656,24 @@
 
         const source = document.createElement("span");
         source.className = "console-source";
-        source.textContent = event.source || "scan";
+        source.textContent = `[${event.source || "sys"}]`;
 
+        const messageContainer = document.createElement("div");
+        
         const message = document.createElement("span");
         message.className = "console-message";
         message.textContent = event.message || "-";
+        messageContainer.appendChild(message);
 
-        const details = stringifyDetails(event.details);
-        if (details) {
+        const detailsStr = stringifyDetails(event.details);
+        if (detailsStr) {
           const detail = document.createElement("span");
           detail.className = "console-detail";
-          detail.textContent = details;
-          message.appendChild(detail);
+          detail.textContent = detailsStr;
+          messageContainer.appendChild(detail);
         }
 
-        line.append(time, level, source, message);
+        line.append(time, level, source, messageContainer);
         scanConsole.appendChild(line);
       }
 
@@ -952,15 +705,15 @@
         }
       }
       const text = await response.text().catch(() => "");
-      return text || `Request failed with status ${response.status}`;
+      return text || `REQ_ERR_${response.status}`;
     }
 
     async function apiRequest(path, options = {}) {
       const method = options.method || "GET";
-      const shouldLog = path !== "/health" && consoleSection && !consoleSection.classList.contains("hidden");
+      const shouldLog = path !== "/health" && !monitorSection.classList.contains("hidden");
       const startedAt = performance.now();
       if (shouldLog) {
-        logConsole("info", "ui", `${method} ${path}`);
+        logConsole("info", "net", `${method} ${path}`);
       }
 
       const response = await fetch(`${API_BASE}${path}`, {
@@ -974,14 +727,13 @@
       if (!response.ok) {
         const message = await parseErrorResponse(response);
         if (shouldLog) {
-          logConsole("error", "ui", `${method} ${path} failed`, { status: response.status, error: message });
+          logConsole("error", "net", `FAIL ${method} ${path}`, { status: response.status, err: message });
         }
         throw new Error(message);
       }
 
       if (shouldLog) {
-        logConsole("info", "ui", `${method} ${path} completed`, {
-          status: response.status,
+        logConsole("info", "net", `OK ${method} ${path}`, {
           ms: Math.round(performance.now() - startedAt)
         });
       }
@@ -989,17 +741,29 @@
     }
 
     function setButtonLoading(button, loadingText, isLoading) {
-      if (!button.dataset.originalText) {
-        button.dataset.originalText = button.textContent;
+      if (!button.dataset.originalHtml) {
+        button.dataset.originalHtml = button.innerHTML;
       }
       button.disabled = isLoading;
-      button.textContent = isLoading ? loadingText : button.dataset.originalText;
+      if (isLoading) {
+        button.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${loadingText}`;
+      } else {
+        button.innerHTML = button.dataset.originalHtml;
+      }
     }
 
     function updateAuthFields() {
       const authType = authTypeSelect.value;
-      tokenWrap.classList.toggle("hidden", authType !== "token");
-      credentialWrap.classList.toggle("hidden", authType !== "credential");
+      if (authType === "token") {
+        tokenWrap.classList.remove("hidden");
+        credentialWrap.classList.add("hidden");
+      } else if (authType === "credential") {
+        tokenWrap.classList.add("hidden");
+        credentialWrap.classList.remove("hidden");
+      } else {
+        tokenWrap.classList.add("hidden");
+        credentialWrap.classList.add("hidden");
+      }
     }
 
     function parseAllowedDomains(raw) {
@@ -1013,7 +777,8 @@
     function updateMonitorVisibility(scanId) {
       if (scanId && scanId.trim()) {
         monitorSection.classList.remove("hidden");
-        consoleSection.classList.remove("hidden");
+        monitorSection.classList.add("flex");
+        monitorSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }
     }
 
@@ -1026,11 +791,18 @@
     }
 
     function formatPhaseLabel(phase) {
-      return String(phase || "")
-        .split("_")
-        .filter(Boolean)
-        .map((part) => part[0].toUpperCase() + part.slice(1))
-        .join(" ");
+      const map = {
+        created: "INIT",
+        auth_bootstrap: "AUTH",
+        crawl: "CRAWL",
+        plan: "PLAN",
+        attack: "ATTACK",
+        validate: "VALID",
+        score: "SCORE",
+        report: "REPORT",
+        completed: "DONE"
+      };
+      return map[phase] || String(phase || "").substring(0,6).toUpperCase();
     }
 
     function formatElapsed(totalSeconds) {
@@ -1062,7 +834,7 @@
       phaseStepper.innerHTML = "";
       for (const [index, phaseKey] of orderedPhases.entries()) {
         const step = document.createElement("div");
-        step.className = "phase-step";
+        step.className = "phase-step min-w-[50px]";
 
         const isCurrent = phaseKey === phase || ((status === "complete" || status === "completed") && phaseKey === "completed");
         const isCompleted = status === "complete" || status === "completed" ? index <= currentIndex : index < currentIndex;
@@ -1076,7 +848,7 @@
 
         const dot = document.createElement("span");
         dot.className = "phase-dot";
-        dot.textContent = isCompleted ? "✓" : "•";
+        dot.innerHTML = isCompleted ? `<i class="fa-solid fa-check"></i>` : (index + 1);
 
         const label = document.createElement("span");
         label.className = "phase-label";
@@ -1089,16 +861,16 @@
 
     function updateElapsedText() {
       if (!currentScan) {
-        elapsedTimeText.textContent = "Elapsed: 00:00:00";
+        elapsedTimeText.textContent = "T+ 00:00:00";
         return;
       }
       const createdAt = currentScan.created_at ? Date.parse(currentScan.created_at) : NaN;
       if (!Number.isFinite(createdAt)) {
-        elapsedTimeText.textContent = "Elapsed: -";
+        elapsedTimeText.textContent = "T+ --:--:--";
         return;
       }
       const elapsedSeconds = (Date.now() - createdAt) / 1000;
-      elapsedTimeText.textContent = `Elapsed: ${formatElapsed(elapsedSeconds)}`;
+      elapsedTimeText.textContent = `T+ ${formatElapsed(elapsedSeconds)}`;
     }
 
     function handleElapsedTimerState() {
@@ -1126,16 +898,22 @@
       progressFill.className = "progress-fill";
       progressFill.classList.add(tone);
       progressFill.style.width = `${percent}%`;
-      progressPercent.textContent = `${percent}%`;
+      
+      let startPercent = parseInt(progressPercent.textContent) || 0;
+      if(startPercent !== percent) {
+        progressPercent.textContent = `${percent}%`;
+        progressPercent.classList.add('animate-pulse');
+        setTimeout(() => progressPercent.classList.remove('animate-pulse'), 500);
+      }
 
       if (normalizedStatus === "failed" && rawPhase.startsWith("failed:")) {
-        phaseDetailText.textContent = rawPhase.slice("failed:".length) || "Unknown error";
+        phaseDetailText.textContent = rawPhase.slice("failed:".length) || "UNKNOWN_ERR";
       } else if (phaseDetailMap[phase]) {
         phaseDetailText.textContent = phaseDetailMap[phase];
       } else if (phaseDetailMap[normalizedStatus]) {
         phaseDetailText.textContent = phaseDetailMap[normalizedStatus];
       } else {
-        phaseDetailText.textContent = rawPhase || normalizedStatus || "-";
+        phaseDetailText.textContent = rawPhase || normalizedStatus || "STANDBY";
       }
     }
 
@@ -1144,8 +922,14 @@
       statusBadge.textContent = normalizedStatus;
       statusBadge.className = "status-badge";
       statusBadge.classList.add(statusClassMap[normalizedStatus] || "status-created");
-      phaseText.textContent = scan.phase || "-";
-      createdAtText.textContent = scan.created_at || "-";
+      
+      if(scan.created_at) {
+        const d = new Date(scan.created_at);
+        createdAtText.textContent = !isNaN(d) ? d.toISOString().split('T')[1].split('.')[0] : "-";
+      } else {
+        createdAtText.textContent = "-";
+      }
+      
       renderProgress(scan);
     }
 
@@ -1167,23 +951,21 @@
     function getActiveScanId() {
       const scanId = scanIdInput.value.trim();
       if (!scanId) {
-        throw new Error("Scan ID is required");
+        throw new Error("Target ID is required");
       }
       return scanId;
     }
 
     function clearFindings() {
       findingsBody.innerHTML = "";
-      findingsEmpty.textContent = "No findings yet";
-      findingsEmpty.style.display = "block";
+      findingsEmpty.style.display = "flex";
     }
 
     function renderFindings(findings) {
       findingsBody.innerHTML = "";
 
       if (!Array.isArray(findings) || findings.length === 0) {
-        findingsEmpty.textContent = "No findings yet";
-        findingsEmpty.style.display = "block";
+        findingsEmpty.style.display = "flex";
         return;
       }
 
@@ -1191,6 +973,7 @@
 
       for (const finding of findings) {
         const tr = document.createElement("tr");
+        tr.className = "animate-[fadeIn_0.3s_ease-out]";
         const severity = String(finding.severity || "info").toLowerCase();
 
         const severityTd = document.createElement("td");
@@ -1204,9 +987,11 @@
 
         const attackClassTd = document.createElement("td");
         attackClassTd.textContent = finding.attack_class || "-";
+        attackClassTd.className = "text-cyber-accent/80";
 
         const endpointTd = document.createElement("td");
         endpointTd.textContent = finding.affected_endpoint || "-";
+        endpointTd.className = "text-gray-400";
 
         tr.append(severityTd, titleTd, attackClassTd, endpointTd);
         findingsBody.appendChild(tr);
@@ -1233,11 +1018,17 @@
         const data = await response.text().catch(() => "ok");
         healthDot.classList.remove("bad");
         healthDot.classList.add("ok");
-        healthLabel.textContent = data ? `Health: ${String(data).trim()}` : "Health: OK";
+        healthPing.classList.add("bg-cyber-success");
+        healthPing.classList.remove("bg-cyber-danger");
+        healthLabel.textContent = data ? `SYS_${String(data).trim().toUpperCase()}` : "SYS_ONLINE";
+        healthLabel.classList.add("text-cyber-success");
       } catch (error) {
         healthDot.classList.remove("ok");
         healthDot.classList.add("bad");
-        healthLabel.textContent = "Health: Unavailable";
+        healthPing.classList.remove("bg-cyber-success");
+        healthPing.classList.add("bg-cyber-danger");
+        healthLabel.textContent = "SYS_OFFLINE";
+        healthLabel.classList.add("text-cyber-danger");
       }
     }
 
@@ -1247,7 +1038,7 @@
 
       const targetUrl = targetUrlInput.value.trim();
       if (!targetUrl) {
-        showError("Target URL is required");
+        showError("Target Vector is required");
         return;
       }
 
@@ -1267,7 +1058,7 @@
       if (authType === "token") {
         const bearerToken = bearerTokenInput.value.trim();
         if (!bearerToken) {
-          showError("Bearer token is required for auth type token");
+          showError("Bearer JWT is required");
           return;
         }
         payload.auth_context.bearer_token = bearerToken;
@@ -1277,13 +1068,13 @@
         const username = authUsernameInput.value.trim();
         const password = authPasswordInput.value;
         if (!username || !password) {
-          showError("Username and password are required for auth type credential");
+          showError("User ID and Passkey required");
           return;
         }
         payload.auth_context.credentials = { username, password };
       }
 
-      setButtonLoading(startScanBtn, "Starting...", true);
+      setButtonLoading(startScanBtn, "ENGAGING...", true);
 
       try {
         const response = await apiRequest("/scans", {
@@ -1299,15 +1090,17 @@
         manualScanIdInput.value = "";
         setCurrentScan(data);
       } catch (error) {
-        showError(error instanceof Error ? error.message : "Failed to start scan");
+        showError(error instanceof Error ? error.message : "SYS_ERR: START_FAIL");
       } finally {
-        setButtonLoading(startScanBtn, "Starting...", false);
+        setButtonLoading(startScanBtn, "ENGAGING...", false);
       }
     }
 
     async function refreshStatus() {
       clearError();
-      setButtonLoading(refreshStatusBtn, "Refreshing...", true);
+      setButtonLoading(refreshStatusBtn, "SYNCING...", true);
+      const icon = refreshStatusBtn.querySelector('i');
+      if(icon) icon.classList.add('fa-spin');
 
       try {
         const scanId = getActiveScanId();
@@ -1317,15 +1110,16 @@
         const data = await response.json();
         setCurrentScan(data);
       } catch (error) {
-        showError(error instanceof Error ? error.message : "Failed to refresh status");
+        showError(error instanceof Error ? error.message : "SYS_ERR: SYNC_FAIL");
       } finally {
-        setButtonLoading(refreshStatusBtn, "Refreshing...", false);
+        setButtonLoading(refreshStatusBtn, "SYNCING...", false);
+        if(icon) icon.classList.remove('fa-spin');
       }
     }
 
     async function pauseScan() {
       clearError();
-      setButtonLoading(pauseScanBtn, "Pausing...", true);
+      setButtonLoading(pauseScanBtn, "HALTING...", true);
 
       try {
         const scanId = getActiveScanId();
@@ -1334,15 +1128,15 @@
         });
         await refreshStatus();
       } catch (error) {
-        showError(error instanceof Error ? error.message : "Failed to pause scan");
+        showError(error instanceof Error ? error.message : "SYS_ERR: HALT_FAIL");
       } finally {
-        setButtonLoading(pauseScanBtn, "Pausing...", false);
+        setButtonLoading(pauseScanBtn, "HALTING...", false);
       }
     }
 
     async function loadFindings() {
       clearError();
-      setButtonLoading(loadFindingsBtn, "Loading...", true);
+      setButtonLoading(loadFindingsBtn, "FETCHING...", true);
 
       try {
         const scanId = getActiveScanId();
@@ -1352,15 +1146,17 @@
         const data = await response.json();
         renderFindings(data);
       } catch (error) {
-        showError(error instanceof Error ? error.message : "Failed to load findings");
+        showError(error instanceof Error ? error.message : "SYS_ERR: VULN_FETCH_FAIL");
       } finally {
-        setButtonLoading(loadFindingsBtn, "Loading...", false);
+        setButtonLoading(loadFindingsBtn, "FETCHING...", false);
       }
     }
 
     async function loadScanEvents(scanIdOverride) {
       clearError();
       const scanId = scanIdOverride || getActiveScanId();
+      const icon = refreshConsoleBtn.querySelector('i');
+      if(icon) icon.classList.add('fa-spin');
 
       try {
         const response = await apiRequest(`/scans/${encodeURIComponent(scanId)}/events`, {
@@ -1369,13 +1165,15 @@
         backendConsoleEvents = await response.json();
         renderConsole();
       } catch (error) {
-        showError(error instanceof Error ? error.message : "Failed to load scan events");
+        showError(error instanceof Error ? error.message : "SYS_ERR: LOG_FETCH_FAIL");
+      } finally {
+        if(icon) setTimeout(() => icon.classList.remove('fa-spin'), 500);
       }
     }
 
     async function downloadReport() {
       clearError();
-      setButtonLoading(downloadReportBtn, "Downloading...", true);
+      setButtonLoading(downloadReportBtn, "EXPORTING...", true);
 
       try {
         const scanId = getActiveScanId();
@@ -1383,7 +1181,7 @@
           method: "GET"
         });
         const markdown = await response.text();
-        reportPanel.textContent = markdown || "No report content";
+        reportPanel.textContent = markdown || "NULL_DATA";
         const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
@@ -1394,9 +1192,9 @@
         link.remove();
         URL.revokeObjectURL(url);
       } catch (error) {
-        showError(error instanceof Error ? error.message : "Failed to download report");
+        showError(error instanceof Error ? error.message : "SYS_ERR: EXPORT_FAIL");
       } finally {
-        setButtonLoading(downloadReportBtn, "Downloading...", false);
+        setButtonLoading(downloadReportBtn, "EXPORTING...", false);
       }
     }
 
@@ -1405,17 +1203,18 @@
         await navigator.clipboard.writeText(text);
         clearError();
         if (successMessage) {
-          errorBox.textContent = successMessage;
-          errorBox.style.display = "block";
-          errorBox.style.borderColor = "rgba(42,193,116,0.6)";
-          errorBox.style.background = "rgba(42,193,116,0.12)";
-          errorBox.style.color = "#cbf4dd";
+          errorText.textContent = successMessage;
+          errorBox.classList.remove("hidden");
+          errorBox.className = "bg-cyber-success/10 border border-cyber-success text-cyber-success rounded-xl p-4 mb-6 shadow-[0_0_15px_rgba(0,255,157,0.2)] backdrop-blur-sm relative overflow-hidden animate-[fadeIn_0.2s_ease-out]";
+          errorDeco.className = "absolute left-0 top-0 bottom-0 w-1 bg-cyber-success";
+          errorIcon.className = "fa-solid fa-check text-cyber-success text-lg";
+          
           setTimeout(() => {
-            errorBox.style.borderColor = "rgba(224, 82, 82, 0.6)";
-            errorBox.style.background = "rgba(224, 82, 82, 0.15)";
-            errorBox.style.color = "#ffd6d6";
+            errorBox.className = "hidden bg-cyber-danger/10 border border-cyber-danger text-red-200 rounded-xl p-4 mb-6 shadow-[0_0_15px_rgba(255,59,107,0.2)] backdrop-blur-sm relative overflow-hidden";
+            errorDeco.className = "absolute left-0 top-0 bottom-0 w-1 bg-cyber-danger";
+            errorIcon.className = "fa-solid fa-triangle-exclamation text-cyber-danger text-lg";
             clearError();
-          }, 1500);
+          }, 2000);
         }
       } catch (error) {
         showError(failMessage);
@@ -1426,7 +1225,7 @@
       clearError();
       const scanId = manualScanIdInput.value.trim();
       if (!scanId) {
-        showError("Enter a scan ID to open monitor");
+        showError("REQ_ERR: SCAN_ID_MISSING");
         return;
       }
       scanIdInput.value = scanId;
@@ -1455,19 +1254,19 @@
     copyScanIdBtn.addEventListener("click", () => {
       const id = createdScanId.textContent.trim();
       if (!id) {
-        showError("No scan ID to copy");
+        showError("NULL_DATA");
         return;
       }
-      copyText(id, "Scan ID copied", "Failed to copy scan ID");
+      copyText(id, "COPIED_TO_CLIPBOARD", "COPY_FAIL");
     });
 
     copyReportBtn.addEventListener("click", () => {
       const text = reportPanel.textContent || "";
-      if (!text || text === "No report loaded") {
-        showError("No report content to copy");
+      if (!text || text === "AWAITING_REPORT_GENERATION...") {
+        showError("NULL_DATA");
         return;
       }
-      copyText(text, "Report copied", "Failed to copy report");
+      copyText(text, "COPIED_TO_CLIPBOARD", "COPY_FAIL");
     });
 
     clearFindings();

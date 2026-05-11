@@ -1,0 +1,55 @@
+id: mass_assignment_probe
+attack_class: mass_assignment
+preconditions:
+  methods: ["PUT", "PATCH"]
+steps:
+  - id: baseline_get
+    action: observe_profile_state
+    identity_selector: current_user
+    observe_only: true
+    probe_template:
+      mode: observe
+      template: current_endpoint_get
+      variables:
+        capture: "baseline_object_state"
+    expected_signal: baseline object state captured before bounded write probe
+    max_attempts: 1
+  - id: bounded_hidden_field_write
+    action: update_profile_safe_fixture
+    identity_selector: current_user
+    safe_fixture_required: true
+    probe_template:
+      mode: bounded_probe
+      template: json_body_extension
+      allowed_methods: ["PUT", "PATCH"]
+      variables:
+        hidden_fields: ["role", "admin", "is_admin", "verified", "balance", "credits", "permission", "status", "plan", "subscription_tier"]
+        safe_boolean_value: true
+        safe_numeric_value: 1
+    expected_signal: write accepts hidden privilege fields without rejecting request
+    validator: mass_assignment_validator
+    max_attempts: 1
+  - id: verify_get_and_rollback
+    action: update_profile_rollback_verify
+    identity_selector: current_user
+    safe_fixture_required: true
+    probe_template:
+      mode: bounded_probe
+      template: verify_then_restore_original_values
+      allowed_methods: ["GET", "PUT", "PATCH"]
+      variables:
+        compare: "baseline_object_state"
+        restore: "original_values"
+    expected_signal: post-write GET shows hidden field changed and rollback evidence is emitted
+    validator: mass_assignment_validator
+    max_attempts: 1
+validators:
+  mass_assignment_validator:
+    signal: differential_hidden_field_persisted
+safety_budget:
+  max_requests: 3
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default
+  safe_fixture_required: true

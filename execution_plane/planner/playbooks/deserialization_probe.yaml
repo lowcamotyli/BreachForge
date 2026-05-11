@@ -1,0 +1,35 @@
+id: deserialization_probe
+attack_class: deserialization
+preconditions:
+  content_type_contains_any: [application/x-java-serialized-object, application/octet-stream, application/x-www-form-urlencoded, application/yaml, application/x-yaml]
+steps:
+  - id: baseline_request
+    action: send_baseline
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: serialized_body_baseline
+    expected_signal: baseline response captured
+    observe_only: true
+    max_attempts: 1
+  - id: deserialization_probe
+    action: send_malformed_serialized_object
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: serialized_body_malformed
+      variables:
+        strategy: truncated_magic_bytes
+    expected_signal: serialization framework error in response
+    validator: deserialization_probe_validator
+    max_attempts: 1
+validators:
+  deserialization_probe_validator:
+    signal: framework_error_message
+safety_budget:
+  max_requests: 2
+  max_attempts_per_step: 1
+  timeout_guard_seconds: 3
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

@@ -7,6 +7,7 @@ from storage.db.models import AttackTask, Endpoint
 
 
 class AuthBypass(AttackRule):
+    requires_auth = True
     attack_class = "auth_bypass"
     name = "AuthBypass"
 

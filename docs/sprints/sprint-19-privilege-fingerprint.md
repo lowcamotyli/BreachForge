@@ -7,7 +7,7 @@ Ten sprint zmienia status matrix z Sprintu 18 w zrozumialy dla klienta opis: ano
 ### Architektura - dokumenty referencyjne
 
 ```bash
-DAD_PROMPT="Read /mnt/d/SimpliAppSec/docs/architecture/auth-architecture.md and validation-model.md. Extract constraints for identity context, proof confidence, and role inference. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
+DAD_PROMPT="Read /mnt/d/BreachForge/docs/architecture/auth-architecture.md and validation-model.md. Extract constraints for identity context, proof confidence, and role inference. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
 ```
 
 ### Workstream A - Fingerprint Model

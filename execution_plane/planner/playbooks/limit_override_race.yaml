@@ -1,0 +1,46 @@
+id: limit_override_race
+attack_class: limit_override_race
+preconditions:
+  param_contains_any:
+    - limit
+    - max_per_user
+    - one_per_account
+    - quota
+    - balance
+steps:
+  - id: burst_limit_probe
+    action: concurrent_burst_probe
+    identity_selector: current_user
+    probe_template:
+      mode: concurrent
+      template: limit_override_burst
+      burst_concurrency: 5
+      probe_type: race_concurrent
+    expected_signal: accepted_count exceeds allowed_limit
+    max_attempts: 10
+    observe_only: true
+  - id: reproduce_burst
+    action: concurrent_burst_probe
+    identity_selector: current_user
+    probe_template:
+      mode: concurrent
+      template: limit_override_burst
+      burst_concurrency: 5
+      probe_type: race_concurrent
+      reproduction_count: 2
+    expected_signal: second burst confirms limit bypass
+    max_attempts: 10
+    observe_only: true
+validators:
+  limit_override_validator:
+    signal: accepted_count_gt_limit
+  reproducibility_required: true
+safety_budget:
+  max_requests: 20
+  max_attempts_per_step: 10
+  burst_concurrency: 5
+  scope: current_endpoint
+  rate_limit_rps: 1.0
+  proof_gate: default
+  safe_fixture_required: false
+  read_only: false

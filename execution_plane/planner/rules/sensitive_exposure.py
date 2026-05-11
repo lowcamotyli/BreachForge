@@ -36,6 +36,7 @@ _PATTERN_GROUPS: tuple[tuple[str, str], ...] = (
 
 
 class SensitiveExposure(AttackRule):
+    requires_auth = False
     attack_class = "sensitive_exposure"
     name = "SensitiveExposure"
 

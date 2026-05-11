@@ -1,0 +1,53 @@
+id: deprecated_version_probe
+attack_class: api_inventory
+preconditions:
+  methods: ["GET"]
+  url_pattern_contains_any: ["/api/", "/v1/", "/v2/"]
+  in_scope_only: true
+steps:
+  - id: probe_v0_variant
+    action: probe_deprecated_version_path
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: deprecated_version_url_variant
+      allowed_methods: ["GET"]
+      variables:
+        version_prefix: "/api/v0"
+    validator: deprecated_version_validator
+    expected_signal: deprecated endpoint responds with 200 and JSON body
+    max_attempts: 1
+  - id: probe_v1_variant
+    action: probe_deprecated_version_path
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: deprecated_version_url_variant
+      allowed_methods: ["GET"]
+      variables:
+        version_prefix: "/api/v1"
+    validator: deprecated_version_validator
+    expected_signal: deprecated endpoint responds with 200 and JSON body
+    max_attempts: 1
+  - id: probe_beta_variant
+    action: probe_deprecated_version_path
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: deprecated_version_url_variant
+      allowed_methods: ["GET"]
+      variables:
+        version_prefix: "/api/beta"
+    validator: deprecated_version_validator
+    expected_signal: deprecated endpoint responds with 200 and JSON body
+    max_attempts: 1
+validators:
+  deprecated_version_validator:
+    signal: deprecated_endpoint_active
+safety_budget:
+  max_requests: 5
+  max_requests_per_base_path: 5
+  rate_limit_rps: 0.5
+  scope: target_only
+  read_only: true
+  proof_gate: default

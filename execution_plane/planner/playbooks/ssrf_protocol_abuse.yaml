@@ -1,0 +1,59 @@
+id: ssrf_protocol_abuse
+attack_class: ssrf
+preconditions:
+  methods: ["GET", "POST"]
+  parameter_name_contains_any: ["url", "endpoint", "callback", "redirect", "webhook", "src", "href", "fetch", "load", "file"]
+  allow_protocol_ssrf: true
+steps:
+  - id: file_scheme_probe
+    action: send_ssrf_protocol_get
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssrf_url_parameter
+      allowed_methods: ["GET"]
+      variables:
+        target: "file:///etc/passwd"
+        requires_explicit_allowlist: true
+    expected_signal: restricted protocol fetch is accepted only under explicit safe fixture
+    validator: ssrf_protocol_validator
+    max_attempts: 1
+    safe_fixture_required: true
+  - id: dict_scheme_probe
+    action: send_ssrf_protocol_get
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssrf_url_parameter
+      allowed_methods: ["GET"]
+      variables:
+        target: "dict://127.0.0.1:6379/"
+        requires_explicit_allowlist: true
+    expected_signal: restricted protocol fetch is accepted only under explicit safe fixture
+    validator: ssrf_protocol_validator
+    max_attempts: 1
+    safe_fixture_required: true
+  - id: gopher_scheme_probe
+    action: send_ssrf_protocol_get
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssrf_url_parameter
+      allowed_methods: ["GET"]
+      variables:
+        target: "gopher://127.0.0.1:25/"
+        requires_explicit_allowlist: true
+    expected_signal: restricted protocol fetch is accepted only under explicit safe fixture
+    validator: ssrf_protocol_validator
+    max_attempts: 1
+    safe_fixture_required: true
+validators:
+  ssrf_protocol_validator:
+    signal: restricted_protocol_requires_explicit_allowlist
+safety_budget:
+  max_requests: 3
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.3
+  scope: current_endpoint
+  proof_gate: default
+  requires_explicit_safe_fixture: true

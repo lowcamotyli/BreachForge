@@ -1,0 +1,28 @@
+id: admin_endpoint_fuzz
+attack_class: api_inventory
+preconditions:
+  methods: ["GET"]
+  in_scope_only: true
+steps:
+  - id: probe_admin_path
+    action: probe_admin_endpoint
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: admin_path_wordlist
+      allowed_methods: ["GET"]
+      variables:
+        paths: ["/admin/", "/internal/", "/management/", "/actuator/", "/debug/", "/console/", "/ops/"]
+    validator: admin_endpoint_validator
+    expected_signal: administrative endpoint accessible without authentication
+    max_attempts: 1
+validators:
+  admin_endpoint_validator:
+    signal: admin_endpoint_accessible
+safety_budget:
+  max_requests: 20
+  rate_limit_rps: 0.5
+  scope: target_only
+  read_only: true
+  bounded_path_budget: true
+  proof_gate: default

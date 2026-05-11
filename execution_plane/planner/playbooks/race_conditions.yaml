@@ -1,0 +1,61 @@
+id: race_conditions
+attack_class: race_condition
+preconditions:
+  methods:
+    - POST
+    - PUT
+    - PATCH
+  race_markers:
+    - idempotency
+    - balance
+    - quota
+    - reserve
+    - checkout
+  requires_repeatable_boundary: true
+steps:
+  - id: observe_double_submit_target
+    action: observe_double_submit_boundary
+    identity_selector: anonymous
+    probe_template:
+      mode: observe
+      template: identify_double_submit_candidate
+    expected_signal: endpoint appears sensitive to duplicate near-simultaneous submission
+    max_attempts: 1
+    observe_only: true
+  - id: observe_toctou_gap
+    action: observe_toctou_boundary
+    identity_selector: anonymous
+    probe_template:
+      mode: observe
+      template: identify_check_then_use_gap
+    expected_signal: separate check and use phases are visible or inferable
+    max_attempts: 1
+    observe_only: true
+  - id: observe_idempotency_boundary
+    action: observe_idempotency_bypass_boundary
+    identity_selector: anonymous
+    probe_template:
+      mode: observe
+      template: identify_idempotency_boundary
+    expected_signal: duplicate handling appears missing or inconsistent
+    max_attempts: 1
+    observe_only: true
+  - id: model_parallel_window
+    action: observe_parallel_submission_window
+    identity_selector: anonymous
+    probe_template:
+      mode: observe
+      template: model_bounded_parallel_window
+    expected_signal: bounded parallel window can be reasoned about without changing state
+    max_attempts: 1
+    observe_only: true
+validators:
+  signal_validator:
+    signal: race_window_candidate
+  reproducibility_required: true
+safety_budget:
+  max_requests: 4
+  scope: current_endpoint
+  rate_limit_rps: 0.5
+  proof_gate: default
+  burst_concurrency: 2

@@ -15,7 +15,25 @@ def test_validator_default_registry_includes_planner_supported_attack_classes() 
 
     registered_attack_classes = set(validator._strategies.keys())
 
-    assert {"bola", "tenant_isolation", "auth_bypass", "privilege_escalation", "sensitive_exposure", "workflow_abuse"} <= registered_attack_classes
+    assert {
+        "bfla",
+        "bola",
+        "tenant_isolation",
+        "auth_bypass",
+        "privilege_escalation",
+        "sensitive_exposure",
+        "workflow_abuse",
+        "mass_assignment",
+        "excessive_exposure",
+        "graphql_introspection",
+        "graphql_batch",
+        "graphql_field_suggestion",
+        "graphql_depth",
+        "oauth_redirect",
+        "oauth_state_csrf",
+        "oauth_token_reuse",
+        "oauth_error_disclosure",
+    } <= registered_attack_classes
     for attack_class, strategy in validator._strategies.items():
         assert strategy.expected_attack_class() == attack_class
 

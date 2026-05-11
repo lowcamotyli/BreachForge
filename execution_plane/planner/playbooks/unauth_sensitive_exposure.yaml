@@ -1,0 +1,46 @@
+id: unauth_sensitive_exposure
+attack_class: sensitive_exposure
+preconditions:
+  methods:
+    - GET
+  source:
+    - asset_map
+  in_scope_only: true
+  unauth_compatible: true
+steps:
+  - id: observe_public_endpoints
+    action: observe_public_endpoint_list
+    identity_selector: anonymous_user
+    probe_template:
+      mode: observe
+      template: collect_public_endpoints_from_asset_map
+    expected_signal: public endpoints available without authentication
+    max_attempts: 1
+    observe_only: true
+  - id: fetch_public_responses
+    action: observe_public_response_bodies
+    identity_selector: anonymous_user
+    probe_template:
+      mode: observe
+      template: get_public_endpoint_responses_read_only
+    expected_signal: public endpoint returns response body with potential sensitive data
+    max_attempts: 1
+    observe_only: true
+  - id: classify_sensitive_exposure
+    action: observe_sensitive_data_in_response
+    identity_selector: anonymous_user
+    probe_template:
+      mode: observe
+      template: scan_response_for_sensitive_patterns
+    expected_signal: sensitive data pattern matched in unauthenticated response
+    max_attempts: 1
+    observe_only: true
+validators:
+  signal_validator:
+    signal: sensitive_data_exposed_publicly
+safety_budget:
+  max_requests: 10
+  scope: target_only
+  rate_limit_rps: 0.5
+  proof_gate: default
+  bounded_path_budget: true

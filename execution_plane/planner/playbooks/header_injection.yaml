@@ -1,0 +1,36 @@
+id: header_injection
+attack_class: header_injection
+preconditions:
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE"]
+steps:
+  - id: host_header_probe
+    action: send_header_injection_probe
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: host_header_manipulation
+      variables:
+        injected_host: "evil.com"
+    expected_signal: injected host reflected in response or redirect
+    validator: header_injection_validator
+    max_attempts: 1
+  - id: xff_probe
+    action: send_xff_spoofing_probe
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: xff_spoofing
+      variables:
+        spoofed_ip: "127.0.0.1"
+    expected_signal: access control changes after XFF spoofing
+    validator: header_injection_validator
+    max_attempts: 1
+validators:
+  header_injection_validator:
+    signal: host_reflection_or_access_change
+safety_budget:
+  max_requests: 3
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

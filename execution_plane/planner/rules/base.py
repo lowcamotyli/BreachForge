@@ -26,6 +26,7 @@ class ScanContext:
 class AttackRule(ABC):
     attack_class: ClassVar[str]
     name: ClassVar[str]
+    requires_auth: bool = False
 
     @abstractmethod
     def matches(self, endpoint: Endpoint, asset_map: AssetMap) -> bool:

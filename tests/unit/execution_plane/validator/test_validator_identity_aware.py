@@ -43,7 +43,7 @@ def _probe() -> RawProbe:
     )
 
 
-def test_validate_attaches_identity_role_and_state_diff() -> None:
+async def test_validate_attaches_identity_role_and_state_diff() -> None:
     validator = ExploitValidator.__new__(ExploitValidator)
     strategy = _StubStrategy()
     attack_probe = _probe()
@@ -71,7 +71,7 @@ def test_validate_attaches_identity_role_and_state_diff() -> None:
         version=2,
     )
 
-    artifact = validator.validate(
+    artifact = await validator.validate(
         strategy=strategy,
         attack_probe=attack_probe,
         control_probe=control_probe,
@@ -90,12 +90,12 @@ def test_validate_attaches_identity_role_and_state_diff() -> None:
     }
 
 
-def test_validate_defaults_identity_role_to_none() -> None:
+async def test_validate_defaults_identity_role_to_none() -> None:
     validator = ExploitValidator.__new__(ExploitValidator)
     strategy = _StubStrategy()
     attack_probe = _probe()
 
-    artifact = validator.validate(strategy=strategy, attack_probe=attack_probe, control_probe=None)
+    artifact = await validator.validate(strategy=strategy, attack_probe=attack_probe, control_probe=None)
 
     assert artifact is not None
     assert artifact.identity_role is None

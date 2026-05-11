@@ -12,6 +12,7 @@ _UNSAFE_METHODS: tuple[str, ...] = ("TRACE", "OPTIONS")
 
 
 class MisconfigurationRule(AttackRule):
+    requires_auth = False
     attack_class = "misconfiguration"
     name = "MisconfigurationRule"
 

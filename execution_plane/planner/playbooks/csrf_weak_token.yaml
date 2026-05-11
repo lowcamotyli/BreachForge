@@ -1,0 +1,53 @@
+id: csrf_weak_token
+attack_class: csrf
+preconditions:
+  methods: ["POST", "PUT", "PATCH", "DELETE"]
+  has_parameter_any: ["csrf_token", "_token", "authenticity_token", "x-csrf-token", "x-xsrf-token"]
+steps:
+  - id: baseline
+    action: capture_csrf_token_baseline
+    identity_selector: primary
+    probe_template:
+      mode: observe
+      template: state_changing_request_with_csrf_token
+      allowed_methods: ["POST", "PUT", "PATCH", "DELETE"]
+    expected_signal: baseline request with valid CSRF token
+    observe_only: true
+    max_attempts: 1
+  - id: reuse_token
+    action: replay_same_csrf_token
+    identity_selector: primary
+    safe_fixture_required: true
+    probe_template:
+      mode: bounded_probe
+      template: state_changing_request_reuse_token
+      allowed_methods: ["POST", "PUT", "PATCH", "DELETE"]
+      variables:
+        replay_prior_guard: true
+    expected_signal: same CSRF token accepted on second request (not single-use)
+    validator: csrf_guard_validator
+    max_attempts: 1
+  - id: static_token_check
+    action: send_modified_csrf_token
+    identity_selector: primary
+    safe_fixture_required: true
+    probe_template:
+      mode: bounded_probe
+      template: state_changing_request_modified_token
+      allowed_methods: ["POST", "PUT", "PATCH", "DELETE"]
+      variables:
+        mutate_guard: true
+        mutation_strategy: increment
+    expected_signal: predictable or static CSRF token accepted
+    validator: csrf_guard_validator
+    max_attempts: 1
+validators:
+  csrf_guard_validator:
+    signal: repeated_or_static_token_accepted
+safety_budget:
+  max_requests: 3
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default
+  safe_fixture_required: true

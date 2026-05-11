@@ -1,0 +1,68 @@
+{
+  "id": "jwt_claim_escalation",
+  "attack_class": "jwt_attack",
+  "preconditions": {
+    "methods": ["GET", "POST"],
+    "auth_required": true,
+    "auth_scheme": "bearer"
+  },
+  "steps": [
+    {
+      "id": "baseline_authenticated",
+      "action": "capture_authenticated_baseline",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "observe",
+        "template": "send_with_valid_token",
+        "allowed_methods": ["GET"]
+      },
+      "expected_signal": "authenticated baseline response captured",
+      "observe_only": true,
+      "max_attempts": 1
+    },
+    {
+      "id": "role_escalation_probe",
+      "action": "send_claim_escalated_token",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "bounded_probe",
+        "template": "jwt_mutate_claim",
+        "allowed_methods": ["GET"],
+        "variables": {
+          "claim_overrides": {"role": "admin"},
+          "preserve_original_alg": true
+        }
+      },
+      "expected_signal": "elevated role claim accepted by server",
+      "validator": "claim_escalation_validator",
+      "max_attempts": 1
+    },
+    {
+      "id": "scope_escalation_probe",
+      "action": "send_scope_escalated_token",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "bounded_probe",
+        "template": "jwt_mutate_claim",
+        "allowed_methods": ["GET"],
+        "variables": {
+          "claim_overrides": {"scope": "admin read:all"},
+          "preserve_original_alg": true
+        }
+      },
+      "expected_signal": "elevated scope claim accepted by server",
+      "validator": "claim_escalation_validator",
+      "max_attempts": 1
+    }
+  ],
+  "validators": {
+    "claim_escalation_validator": {"signal": "escalated_claim_accepted"}
+  },
+  "safety_budget": {
+    "max_requests": 3,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default"
+  }
+}

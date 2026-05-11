@@ -2,7 +2,39 @@ from __future__ import annotations
 # dispatcher.py - RQ jobs for attack dispatch and scan finalization
 
 AUTONOMOUS_ATTACK_ROUNDS_ENV = "AUTONOMOUS_ATTACK_ROUNDS"
+LIFECYCLE_SECOND_CHECK_DELAY_ENV = "LIFECYCLE_SECOND_CHECK_DELAY_SECONDS"
+LIFECYCLE_SECOND_CHECK_CAP_SECONDS = 300
+DEFAULT_LIFECYCLE_SECOND_CHECK_DELAY = 0
 DEFAULT_AUTONOMOUS_ATTACK_ROUNDS = 2
+
+
+def create_empty_auth_context(scan_id: UUID) -> AuthContext:
+    from datetime import UTC, datetime
+
+    from storage.db.models import AuthContext
+
+    return AuthContext(
+        scan_id=scan_id,
+        type="none",
+        session_snapshot={
+            "cookies": [],
+            "auth_headers": {},
+            "csrf_tokens": {},
+            "captured_at": datetime.now(UTC).isoformat(),
+            "expires_at": None,
+        },
+        health={},
+    )
+
+
+def _auth_type_from_context(auth_context: object) -> str:
+    auth_type = getattr(auth_context, "auth_type", None)
+    if isinstance(auth_type, str) and auth_type:
+        return auth_type
+    legacy_type = getattr(auth_context, "type", None)
+    if isinstance(legacy_type, str) and legacy_type:
+        return legacy_type
+    return "none"
 
 
 def dispatch_attack_tasks(scan_id: str) -> None:
@@ -75,7 +107,7 @@ async def _execute_attack_async(attack_task_id: str, hypothesis_override: str | 
 
     import structlog
     from control_plane.auth_manager import AuthManager, default_pause_scan
-    from execution_plane.workers.attack_worker import AttackWorker
+    from execution_plane.workers.attack_worker import AttackWorker, AuthExpiredError
     from sqlalchemy import select
     from sqlalchemy.orm import selectinload
     from storage.db.models import AttackTask, AttackTaskStatus, AuthContext, Endpoint, Scan
@@ -116,9 +148,10 @@ async def _execute_attack_async(attack_task_id: str, hypothesis_override: str | 
             auth_result = await db.execute(select(AuthContext).where(AuthContext.scan_id == scan.id))
             auth_context = auth_result.scalar_one_or_none()
             if auth_context is None:
-                raise RuntimeError("Auth context is not initialized")
+                auth_context = create_empty_auth_context(scan.id)
             session_snapshot = _session_snapshot_from_auth_context(auth_context, scan.id)
             manager._session_snapshot = session_snapshot
+            manager._auth_type = _auth_type_from_context(auth_context)
         except Exception:
             logger.exception("attack_task_session_snapshot_failed", attack_task_id=attack_task_id, scan_id=str(scan.id))
             task.status = AttackTaskStatus.failed
@@ -134,6 +167,10 @@ async def _execute_attack_async(attack_task_id: str, hypothesis_override: str | 
             await worker.execute(task, session_snapshot, hypothesis_override=hypothesis_override)
             task.status = AttackTaskStatus.done
             await db.commit()
+        except AuthExpiredError:
+            logger.warning("attack_task_paused_auth_expired", attack_task_id=attack_task_id, scan_id=str(scan.id))
+            task.status = AttackTaskStatus.pending
+            await db.commit()
         except Exception:
             logger.exception("attack_task_execution_failed", attack_task_id=attack_task_id, scan_id=str(scan.id))
             task.status = AttackTaskStatus.failed
@@ -144,12 +181,21 @@ async def _execute_attack_async(attack_task_id: str, hypothesis_override: str | 
 
 def _session_snapshot_from_auth_context(auth_context: object, scan_id: object) -> object:
     from datetime import UTC, datetime
-    from typing import Any
     from uuid import UUID
 
     from control_plane.auth_manager import SessionSnapshot, _decrypt_snapshot_field
 
     scan_uuid = scan_id if isinstance(scan_id, UUID) else UUID(str(scan_id))
+    if _auth_type_from_context(auth_context) == "none":
+        return SessionSnapshot(
+            scan_id=scan_uuid,
+            cookies=[],
+            auth_headers={},
+            csrf_tokens={},
+            captured_at=datetime.now(UTC),
+            expires_at=None,
+        )
+
     snapshot = getattr(auth_context, "session_snapshot", {})
     if not isinstance(snapshot, dict):
         snapshot = {}
@@ -214,6 +260,7 @@ async def _finalize_scan_async(scan_id: str) -> None:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     connection = Redis.from_url(redis_url, decode_responses=True)
     max_rounds = _autonomous_attack_rounds(os.getenv(AUTONOMOUS_ATTACK_ROUNDS_ENV))
+    delay_seconds = _lifecycle_second_check_delay(os.getenv(LIFECYCLE_SECOND_CHECK_DELAY_ENV))
     for round_index in range(max_rounds + 1):
         await _validate_and_score_evidence(scan_uuid=scan_uuid, redis_connection=connection, logger=logger)
         if round_index >= max_rounds:
@@ -246,6 +293,7 @@ async def _finalize_scan_async(scan_id: str) -> None:
         await orchestrator.on_all_validated(scan_uuid)
 
     logger.info("scan_finalized", scan_id=scan_id)
+    logger.debug("lifecycle_second_check_configured", scan_id=scan_id, delay_seconds=delay_seconds)
 
 
 def _autonomous_attack_rounds(raw_value: object) -> int:
@@ -258,17 +306,37 @@ def _autonomous_attack_rounds(raw_value: object) -> int:
     return min(max(parsed, 0), 5)
 
 
+def _lifecycle_second_check_delay(raw: str | None) -> int:
+    if raw is None or not raw.strip():
+        return DEFAULT_LIFECYCLE_SECOND_CHECK_DELAY
+    try:
+        parsed_value = int(raw)
+    except ValueError:
+        return 0
+    if parsed_value <= 0:
+        return 0
+    return min(parsed_value, LIFECYCLE_SECOND_CHECK_CAP_SECONDS)
+
+
 async def _create_autonomous_follow_up_tasks(*, scan_uuid: object, logger: object) -> list[dict[str, str | None]]:
     import json
 
     from sqlalchemy import select
     from sqlalchemy.orm import selectinload
-    from storage.db.models import AttackTask, AttackTaskStatus, Finding, ProofArtifact
+    from storage.db.models import AssetMap, AttackTask, AttackTaskStatus, Finding, ProofArtifact, Scan
     from storage.db.session import AsyncSessionLocal
     from storage.evidence.store import EvidenceStore
 
     evidence_store = EvidenceStore()
     async with AsyncSessionLocal() as db:
+        scan_result = await db.execute(
+            select(Scan)
+            .where(Scan.id == scan_uuid)
+            .options(selectinload(Scan.asset_map).selectinload(AssetMap.endpoints))
+        )
+        scan_record = scan_result.scalar_one_or_none()
+        scan_asset_map = getattr(scan_record, "asset_map", None)
+
         result = await db.execute(
             select(Finding)
             .where(Finding.scan_id == scan_uuid)
@@ -283,6 +351,12 @@ async def _create_autonomous_follow_up_tasks(*, scan_uuid: object, logger: objec
         for finding in findings:
             if finding.attack_class != "sensitive_exposure":
                 continue
+            _annotate_replay_artifacts_with_scan_activity(
+                scan_id=str(scan_uuid),
+                finding_id=str(finding.id),
+                proof_artifacts=list(finding.proof_artifacts),
+                evidence_store=evidence_store,
+            )
             endpoint = finding.affected_endpoint
             if endpoint is None:
                 continue
@@ -300,6 +374,32 @@ async def _create_autonomous_follow_up_tasks(*, scan_uuid: object, logger: objec
                     evidence_store=evidence_store,
                 )
             )
+            replay_payload = next(
+                (
+                    payload
+                    for _target_parameter, payload in follow_ups
+                    if payload.get("probe_type") == "impact_secret_replay"
+                ),
+                None,
+            )
+            if replay_payload is not None and scan_asset_map is not None:
+                secret_kind = replay_payload.get("secret_kind")
+                secret_value = replay_payload.get("secret_value")
+                if isinstance(secret_kind, str) and isinstance(secret_value, str):
+                    follow_ups.extend(
+                        _blast_radius_follow_up_payloads(
+                            scan_id=str(scan_uuid),
+                            finding_id=str(finding.id),
+                            source_endpoint_pattern=(
+                                str(replay_payload.get("source_endpoint_pattern"))
+                                if isinstance(replay_payload.get("source_endpoint_pattern"), str)
+                                else None
+                            ),
+                            asset_map=scan_asset_map,
+                            secret_kind=secret_kind,
+                            secret_value=secret_value,
+                        )
+                    )
             for target_parameter, payload in follow_ups:
                 persisted_payload = _redacted_follow_up_payload(payload)
                 existing = await db.execute(
@@ -328,7 +428,7 @@ async def _create_autonomous_follow_up_tasks(*, scan_uuid: object, logger: objec
                     {
                         "task_id": str(task.id),
                         "hypothesis_override": json.dumps(payload, sort_keys=True)
-                        if payload.get("probe_type") == "impact_secret_replay"
+                        if payload.get("probe_type") in {"impact_secret_replay", "impact_secret_blast_radius"}
                         else None,
                     }
                 )
@@ -421,6 +521,7 @@ def _safe_secret_replay_follow_up_payloads(
             continue
 
         secret_kind, secret_value = secret
+        source_endpoint_pattern = _extract_source_endpoint_pattern(probe_payload)
         return [
             (
                 f"impact.secret_replay.{secret_kind}.{finding_id}",
@@ -429,12 +530,163 @@ def _safe_secret_replay_follow_up_payloads(
                     "parent_finding_id": finding_id,
                     "secret_kind": secret_kind,
                     "secret_value": secret_value,
+                    "source_endpoint_pattern": source_endpoint_pattern,
                     "safe_mode": True,
                     "goal": "replay an exposed secret once against the same read-only endpoint to confirm it is active",
                 },
             )
         ]
     return []
+
+
+def _annotate_replay_artifacts_with_scan_activity(
+    *,
+    scan_id: str,
+    finding_id: str,
+    proof_artifacts: list[object],
+    evidence_store: object,
+) -> None:
+    for artifact in proof_artifacts:
+        if not _is_impact_secret_replay_artifact(artifact):
+            continue
+        existing_notes = str(getattr(artifact, "evidence_notes", "") or "")
+        if "active_during_scan=" in existing_notes.lower():
+            continue
+        active_during_scan = _replay_artifact_active_during_scan(
+            scan_id=scan_id,
+            finding_id=finding_id,
+            artifact=artifact,
+            evidence_store=evidence_store,
+        )
+        suffix = "true" if active_during_scan else "false"
+        setattr(artifact, "evidence_notes", f"{existing_notes}; active_during_scan={suffix}")
+
+
+def _is_impact_secret_replay_artifact(artifact: object) -> bool:
+    direct_probe_type = getattr(artifact, "probe_type", None)
+    if isinstance(direct_probe_type, str) and direct_probe_type.strip().lower() == "impact_secret_replay":
+        return True
+
+    attack_task = getattr(artifact, "attack_task", None)
+    hypothesis = getattr(attack_task, "hypothesis", None)
+    if isinstance(hypothesis, str) and hypothesis.strip():
+        import json
+
+        try:
+            parsed = json.loads(hypothesis)
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            probe_type = parsed.get("probe_type")
+            if isinstance(probe_type, str) and probe_type.strip().lower() == "impact_secret_replay":
+                return True
+
+    evidence_notes = str(getattr(artifact, "evidence_notes", "") or "").lower()
+    return "impact_probe=impact_secret_replay" in evidence_notes or "probe_type=impact_secret_replay" in evidence_notes
+
+
+def _replay_artifact_active_during_scan(*, scan_id: str, finding_id: str, artifact: object, evidence_store: object) -> bool:
+    attack_probe_id = getattr(artifact, "attack_probe_id", None)
+    if attack_probe_id is not None:
+        try:
+            probe_payload = evidence_store.read_probe(scan_id=scan_id, finding_id=finding_id, probe_id=str(attack_probe_id))
+        except Exception:
+            probe_payload = None
+        if isinstance(probe_payload, dict):
+            status_code = _probe_status_code(probe_payload)
+            if status_code is not None:
+                return status_code < 400
+
+    confidence_score = getattr(artifact, "confidence_score", None)
+    if isinstance(confidence_score, (int, float)):
+        return float(confidence_score) >= 0.95
+    return False
+
+
+def _probe_status_code(probe_payload: dict[str, object]) -> int | None:
+    response = probe_payload.get("response")
+    if not isinstance(response, dict):
+        return None
+    raw_status_code = response.get("status_code", response.get("status"))
+    if isinstance(raw_status_code, bool):
+        return None
+    if isinstance(raw_status_code, int):
+        return raw_status_code
+    if isinstance(raw_status_code, str) and raw_status_code.strip():
+        try:
+            return int(raw_status_code.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _blast_radius_follow_up_payloads(
+    *,
+    scan_id: str,
+    finding_id: str,
+    source_endpoint_pattern: str | None,
+    asset_map: object,
+    secret_kind: str,
+    secret_value: str,
+) -> list[tuple[str, dict[str, object]]]:
+    del scan_id
+    from execution_plane.crawler.asset_map import AssetMap as RuntimeAssetMap
+    from execution_plane.crawler.asset_map import Endpoint as RuntimeEndpoint
+    from execution_plane.planner.secret_blast_radius import BlastRadiusSelector
+
+    runtime_asset_map = RuntimeAssetMap(endpoints=[])
+    raw_endpoints = getattr(asset_map, "endpoints", [])
+    if not isinstance(raw_endpoints, list):
+        return []
+
+    for endpoint in raw_endpoints:
+        url_pattern = getattr(endpoint, "url_pattern", None)
+        method = getattr(endpoint, "method", None)
+        auth_required = getattr(endpoint, "auth_required", False)
+        if not isinstance(url_pattern, str) or not isinstance(method, str):
+            continue
+        runtime_asset_map.endpoints.append(
+            RuntimeEndpoint(
+                url_pattern=url_pattern,
+                method=method,
+                in_scope=True,
+                auth_required=bool(auth_required),
+                parameters=[],
+            )
+        )
+
+    selected = BlastRadiusSelector(runtime_asset_map, source_endpoint_pattern=source_endpoint_pattern).select()
+    payloads: list[tuple[str, dict[str, object]]] = []
+    for index, endpoint in enumerate(selected):
+        payloads.append(
+            (
+                f"impact.blast_radius.{secret_kind}.{finding_id}.{index}",
+                {
+                    "probe_type": "impact_secret_blast_radius",
+                    "parent_finding_id": finding_id,
+                    "secret_kind": secret_kind,
+                    "secret_value": secret_value,
+                    "target_url": endpoint["url_pattern"],
+                    "target_method": endpoint["method"],
+                    "priority_rank": endpoint["priority_rank"],
+                    "safe_mode": True,
+                    "goal": "map blast radius of active secret across read-only endpoints",
+                },
+            )
+        )
+    return payloads
+
+
+def _extract_source_endpoint_pattern(probe_payload: dict[str, object]) -> str | None:
+    from execution_plane.crawler.asset_map import normalize_url_pattern
+
+    request = probe_payload.get("request")
+    if not isinstance(request, dict):
+        return None
+    request_url = request.get("url")
+    if not isinstance(request_url, str) or not request_url:
+        return None
+    return normalize_url_pattern(request_url)
 
 
 def _extract_replayable_secret(probe_payload: dict[str, object]) -> tuple[str, str] | None:

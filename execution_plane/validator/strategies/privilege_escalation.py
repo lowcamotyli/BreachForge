@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from execution_plane.validator.differential import DifferentialProbeResult
 from execution_plane.validator.strategies.base import ValidationStrategy
 from storage.db.models import ProofArtifact, RawProbe
 
@@ -37,7 +38,12 @@ class PrivilegeEscalationStrategy(ValidationStrategy):
     _MIN_PROOF_CONFIDENCE_THRESHOLD = 0.85
     _ABSOLUTE_CONFIDENCE = 0.95
 
-    def validate(self, attack_probe: RawProbe, control_probe: RawProbe | None) -> ProofArtifact | None:
+    def validate(
+        self,
+        attack_probe: RawProbe,
+        control_probe: RawProbe | None,
+        differential_result: DifferentialProbeResult | None = None,
+    ) -> ProofArtifact | None:
         if control_probe is None:
             return None
 
@@ -61,6 +67,19 @@ class PrivilegeEscalationStrategy(ValidationStrategy):
             return None
 
         confidence = self._ABSOLUTE_CONFIDENCE
+        evidence_suffix = ""
+        if differential_result is not None:
+            observed_access = differential_result.challenger_status in (200, 201, 204)
+            elevated_blocked = differential_result.baseline_status in (200, 201, 204)
+            boundary_collapse = observed_access and elevated_blocked and (not differential_result.status_differs)
+            evidence_suffix = (
+                ", differential_observed_access="
+                f"{observed_access}, differential_elevated_blocked={elevated_blocked}, "
+                f"differential_status_differs={differential_result.status_differs}"
+            )
+            if boundary_collapse:
+                confidence = min(1.0, confidence + 0.2)
+                evidence_suffix = f"{evidence_suffix}, privilege boundary collapse"
         if confidence < self._MIN_PROOF_CONFIDENCE_THRESHOLD:
             return None
 
@@ -74,7 +93,7 @@ class PrivilegeEscalationStrategy(ValidationStrategy):
             evidence_notes=(
                 f"attack_access_score={attack_score}, control_access_score={control_score}, "
                 f"attack_status={attack_status}, control_status={control_status}, "
-                f"attack_snapshot={json.dumps(attack_snapshot, sort_keys=True)}"
+                f"attack_snapshot={json.dumps(attack_snapshot, sort_keys=True)}{evidence_suffix}"
             ),
         )
 

@@ -1,0 +1,48 @@
+id: cache_auth_drift
+attack_class: sensitive_exposure
+preconditions:
+  methods:
+    - GET
+  cache_markers:
+    - profile
+    - account
+    - dashboard
+    - export
+  requires_authenticated_baseline: true
+steps:
+  - id: observe_private_response_shape
+    action: observe_private_response_shape
+    identity_selector: current_user
+    probe_template:
+      mode: observe
+      template: fingerprint_authenticated_response_metadata
+    expected_signal: authenticated response has cacheable private content indicators
+    max_attempts: 1
+    observe_only: true
+  - id: observe_post_logout_access
+    action: observe_post_logout_cache_access
+    identity_selector: current_user
+    probe_template:
+      mode: observe
+      template: compare_response_after_logout_state
+    expected_signal: private response shape appears accessible after logout state
+    max_attempts: 1
+    observe_only: true
+  - id: observe_cross_user_cache_shape
+    action: observe_cross_user_cache_drift
+    identity_selector: alternate_user
+    probe_template:
+      mode: observe
+      template: compare_private_response_across_users
+    expected_signal: cached private response shape appears reused across identities
+    max_attempts: 1
+    observe_only: true
+validators:
+  signal_validator:
+    signal: private_cache_drift
+safety_budget:
+  max_requests: 3
+  scope: target_only
+  rate_limit_rps: 0.5
+  proof_gate: default
+

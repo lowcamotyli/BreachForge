@@ -1,0 +1,50 @@
+{
+  "id": "negative_value_attack",
+  "attack_class": "negative_value",
+  "preconditions": {
+    "methods": ["POST", "PUT", "PATCH"],
+    "param_name_contains_any": ["price", "amount", "quantity", "balance", "credits", "discount", "fee", "cost", "total"]
+  },
+  "steps": [
+    {
+      "id": "observe_numeric_param",
+      "action": "observe_numeric_param_presence",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "observe",
+        "template": "map_numeric_params",
+        "allowed_methods": ["GET"]
+      },
+      "expected_signal": "numeric parameter present in write endpoint",
+      "observe_only": true,
+      "max_attempts": 1
+    },
+    {
+      "id": "probe_negative_value",
+      "action": "probe_with_negative_value",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "safe_fixture",
+        "template": "numeric_negative_probe",
+        "probe_values": [-1, -99999, -0.01],
+        "safe_fixture": true,
+        "allowed_methods": ["POST", "PUT", "PATCH"]
+      },
+      "expected_signal": "server accepts negative value without rejection",
+      "observe_only": false,
+      "validator": "negative_value_validator",
+      "max_attempts": 1
+    }
+  ],
+  "validators": {
+    "negative_value_validator": {"signal": "negative_accepted"}
+  },
+  "safety_budget": {
+    "max_requests": 3,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default",
+    "safe_fixture_required": true
+  }
+}

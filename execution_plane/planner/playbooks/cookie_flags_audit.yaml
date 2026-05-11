@@ -1,0 +1,27 @@
+id: cookie_flags_audit
+attack_class: cookie_analysis
+preconditions:
+  methods: ["GET"]
+steps:
+  - id: observe_response
+    action: observe_set_cookie_headers
+    identity_selector: none
+    probe_template:
+      mode: observe
+      template: get_request_observe_headers
+      allowed_methods: ["GET"]
+      variables:
+        analyze_response_headers: true
+    expected_signal: Set-Cookie headers present with missing HttpOnly/Secure/SameSite flags
+    validator: header_security_validator
+    observe_only: true
+    max_attempts: 1
+validators:
+  header_security_validator:
+    signal: set_cookie_missing_flags
+safety_budget:
+  max_requests: 1
+  max_attempts_per_step: 1
+  rate_limit_rps: 1.0
+  scope: current_endpoint
+  proof_gate: default

@@ -7,7 +7,7 @@ Ten sprint klasyfikuje miejsce wycieku: response body, header, debug endpoint, c
 ### Architektura - dokumenty referencyjne
 
 ```bash
-DAD_PROMPT="Read /mnt/d/SimpliAppSec/docs/architecture/attack-engine.md and data-model.md. Extract endpoint/probe metadata useful for leak source diagnosis. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
+DAD_PROMPT="Read /mnt/d/BreachForge/docs/architecture/attack-engine.md and data-model.md. Extract endpoint/probe metadata useful for leak source diagnosis. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
 ```
 
 ### Workstream A - Source Classifier

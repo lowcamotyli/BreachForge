@@ -1,0 +1,84 @@
+{
+  "id": "unauth_injection_public_forms",
+  "attack_class": "injection",
+  "preconditions": {
+    "auth_required": false,
+    "methods": ["GET", "POST"],
+    "any_of": [
+      {"has_query_params": true},
+      {"is_form_endpoint": true}
+    ],
+    "in_scope_only": true,
+    "unauth_compatible": true
+  },
+  "steps": [
+    {
+      "id": "sql_injection_probe",
+      "action": "observe_public_sql_injection_signals",
+      "identity_selector": "anonymous",
+      "probe_template": {
+        "mode": "probe",
+        "template": "sql_injection_read_only_public_forms",
+        "allowed_methods": ["GET", "POST"],
+        "variables": {
+          "payloads": ["' OR 1=1 --", "''", "\" OR \"1\"=\"1"],
+          "read_only": true
+        }
+      },
+      "expected_signal": "public form or query endpoint returns SQL error or boolean differential signal",
+      "validator": "injection_signal_validator",
+      "max_attempts": 1,
+      "observe_only": true
+    },
+    {
+      "id": "nosql_probe",
+      "action": "observe_public_nosql_injection_signals",
+      "identity_selector": "anonymous",
+      "probe_template": {
+        "mode": "probe",
+        "template": "nosql_injection_read_only_public_forms",
+        "allowed_methods": ["GET", "POST"],
+        "variables": {
+          "payloads": ["{\"$ne\": null}", "{\"$gt\": \"\"}"],
+          "read_only": true
+        }
+      },
+      "expected_signal": "public form or query endpoint returns NoSQL parser or differential signal",
+      "validator": "injection_signal_validator",
+      "max_attempts": 1,
+      "observe_only": true
+    },
+    {
+      "id": "ssti_basic_probe",
+      "action": "observe_public_ssti_basic_signals",
+      "identity_selector": "anonymous",
+      "probe_template": {
+        "mode": "probe",
+        "template": "ssti_basic_read_only_public_forms",
+        "allowed_methods": ["GET", "POST"],
+        "variables": {
+          "payloads": ["{{7*7}}", "${7*7}", "<%= 7*7 %>"],
+          "read_only": true
+        }
+      },
+      "expected_signal": "public form or query endpoint evaluates basic template expression",
+      "validator": "injection_signal_validator",
+      "max_attempts": 1,
+      "observe_only": true
+    }
+  ],
+  "validators": {
+    "injection_signal_validator": {
+      "signal": "public_injection_probe_signal"
+    }
+  },
+  "safety_budget": {
+    "max_requests": 5,
+    "max_payloads_per_endpoint": 5,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default",
+    "read_only": true
+  }
+}

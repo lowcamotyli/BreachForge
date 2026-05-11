@@ -1,0 +1,54 @@
+id: idempotency_bypass
+attack_class: idempotency_bypass
+preconditions:
+  header_contains_any:
+    - Idempotency-Key
+  param_contains_any:
+    - idempotency_key
+steps:
+  - id: send_original
+    action: single_probe
+    identity_selector: current_user
+    probe_template:
+      mode: send
+      template: idempotency_original_request
+      probe_type: race_concurrent
+    expected_signal: original request accepted with idempotency key
+    max_attempts: 1
+    observe_only: true
+  - id: send_duplicate_different_params
+    action: single_probe
+    identity_selector: current_user
+    probe_template:
+      mode: send
+      template: idempotency_duplicate_request
+      probe_type: race_concurrent
+      reuse_idempotency_key: true
+    expected_signal: server executes second request instead of returning cached response
+    max_attempts: 2
+    observe_only: true
+  - id: reproduce_bypass
+    action: single_probe
+    identity_selector: current_user
+    probe_template:
+      mode: send
+      template: idempotency_duplicate_request
+      probe_type: race_concurrent
+      reuse_idempotency_key: true
+      reproduction_count: 2
+    expected_signal: second attempt confirms idempotency bypass
+    max_attempts: 1
+    observe_only: true
+validators:
+  idempotency_bypass_validator:
+    signal: response_diff_on_reuse
+  reproducibility_required: true
+safety_budget:
+  max_requests: 4
+  max_attempts_per_step: 2
+  burst_concurrency: 1
+  scope: current_endpoint
+  rate_limit_rps: 1.0
+  proof_gate: default
+  safe_fixture_required: false
+  read_only: false

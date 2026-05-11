@@ -1,0 +1,50 @@
+{
+  "id": "web_cache_deception",
+  "attack_class": "web_cache_deception",
+  "preconditions": {
+    "methods": ["GET"],
+    "auth_required": true
+  },
+  "steps": [
+    {
+      "id": "baseline_authenticated",
+      "action": "capture_authenticated_baseline",
+      "identity_selector": "current_user",
+      "observe_only": true,
+      "max_attempts": 1,
+      "probe_template": {
+        "mode": "observe",
+        "template": "send_with_valid_token",
+        "allowed_methods": ["GET"]
+      },
+      "expected_signal": "authenticated baseline captured"
+    },
+    {
+      "id": "cache_deception_probe",
+      "action": "send_static_extension_path",
+      "identity_selector": "none",
+      "probe_template": {
+        "mode": "bounded_probe",
+        "template": "path_suffix_static_extension",
+        "variables": {
+          "probe_type": "cache_probe",
+          "suffix": ".css",
+          "cache_candidate": true
+        }
+      },
+      "expected_signal": "private profile data returned on static extension path response",
+      "validator": "cache_deception_validator",
+      "max_attempts": 1
+    }
+  ],
+  "validators": {
+    "cache_deception_validator": {"signal": "private_data_in_static_path_response"}
+  },
+  "safety_budget": {
+    "max_requests": 2,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default"
+  }
+}

@@ -1,0 +1,68 @@
+id: cors_deep_analysis
+attack_class: cors_analysis
+requires_auth: false
+preconditions:
+  methods: ["GET", "POST"]
+steps:
+  - id: probe_null_origin
+    action: probe_cors_header
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: cors_origin_probe
+      allowed_methods: ["GET"]
+      variables:
+        origin: "null"
+        method: GET
+    expected_signal: Access-Control-Allow-Origin reflects null origin
+    validator: cors_analysis_validator
+    max_attempts: 1
+  - id: probe_evil_origin
+    action: probe_cors_header
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: cors_origin_probe
+      allowed_methods: ["GET"]
+      variables:
+        origin: https://evil.example.com
+        method: GET
+    expected_signal: Access-Control-Allow-Origin reflects arbitrary origin
+    validator: cors_analysis_validator
+    max_attempts: 1
+  - id: probe_subdomain_origin
+    action: probe_cors_header
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: cors_origin_probe
+      allowed_methods: ["GET"]
+      variables:
+        origin: https://sub.target.com
+        method: GET
+    expected_signal: Access-Control-Allow-Origin reflects subdomain origin
+    validator: cors_analysis_validator
+    max_attempts: 1
+  - id: probe_with_credentials
+    action: probe_cors_header
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: cors_origin_probe
+      allowed_methods: ["GET"]
+      variables:
+        origin: https://evil.example.com
+        include_credentials: true
+        method: GET
+    expected_signal: CORS accepts arbitrary origin with credentials
+    validator: cors_analysis_validator
+    max_attempts: 1
+validators:
+  cors_analysis_validator:
+    signal: cors_misconfiguration
+safety_budget:
+  max_requests: 4
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

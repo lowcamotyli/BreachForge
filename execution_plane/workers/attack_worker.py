@@ -8,7 +8,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import structlog
@@ -28,6 +28,10 @@ class GuardrailViolation(RuntimeError):
     pass
 
 
+class AuthExpiredError(RuntimeError):
+    pass
+
+
 class AttackWorker:
     def __init__(
         self,
@@ -44,12 +48,14 @@ class AttackWorker:
         self._state_store = StateStore()
         self._snapshot_versions: dict[tuple[str, str], int] = {}
         self._rate_limit_wait_timeout_s = max(0.0, float(os.getenv("RATE_LIMIT_WAIT_TIMEOUT_S", "15")))
+        self._scan_id: UUID | None = None
 
     async def execute(
         self,
         task: AttackTask,
-        session: SessionSnapshot,
+        session: SessionSnapshot | None = None,
         identity_role: IdentityRole | str | None = None,
+        identity_name: str | None = None,
         hypothesis_override: str | None = None,
     ) -> RawProbe:
         self._save_state_snapshot(task=task, status="pre")
@@ -58,13 +64,16 @@ class AttackWorker:
             self._save_state_snapshot(task=task, status="failed")
             raise ValueError("AttackTask.endpoint must be loaded before execute()")
 
-        execution_session = session
-        if identity_role is not None:
-            if self._auth_manager is None:
-                self._save_state_snapshot(task=task, status="failed")
-                raise GuardrailViolation("identity_role requires AttackWorker(auth_manager=...)")
-            identity_context = await self._auth_manager.get_identity_context(scan_id=task.scan_id, role=identity_role)
-            execution_session = identity_context.to_session_snapshot()
+        try:
+            execution_session = await self._resolve_execution_session(
+                task=task,
+                provided_session=session,
+                identity_role=identity_role,
+                identity_name=identity_name,
+            )
+        except Exception:
+            self._save_state_snapshot(task=task, status="failed")
+            raise
         raw_probe: RawProbe | None = None
         try:
             hypothesis_config = self._parse_hypothesis(hypothesis_override if hypothesis_override is not None else task.hypothesis)
@@ -80,10 +89,16 @@ class AttackWorker:
                 method = endpoint.method.upper()
                 url = endpoint.url_pattern
                 probe_type = hypothesis_config.get("probe_type")
-                if probe_type == "impact_secret_replay":
+                identity_selector = hypothesis_config.get("identity_selector")
+                if probe_type in {"impact_secret_replay", "impact_secret_blast_radius"}:
                     self._enforce_safe_secret_replay_method(method=method, task_id=task.id)
-                request_headers = self._build_probe_headers(session=execution_session, probe_type=probe_type)
-                self._apply_secret_replay_headers(headers=request_headers, hypothesis_config=hypothesis_config)
+                request_headers = self._build_probe_headers(
+                    session=execution_session,
+                    probe_type=probe_type,
+                    identity_selector=identity_selector if isinstance(identity_selector, str) else None,
+                )
+                if probe_type in {"impact_secret_replay", "impact_secret_blast_radius"}:
+                    self._apply_secret_replay_headers(headers=request_headers, hypothesis_config=hypothesis_config)
                 request_body = self._build_request_body(task=task, probe_type=probe_type)
                 worker_id = self._worker_id()
 
@@ -104,7 +119,11 @@ class AttackWorker:
                 await self._enforce_rate_limit(scan_id=str(task.scan_id), domain=domain, method=method, worker_id=worker_id)
                 await self._apply_timing_profile(hypothesis_config.get("timing_profile"))
 
-                cookies = self._build_probe_cookies(session=execution_session, probe_type=probe_type)
+                cookies = self._build_probe_cookies(
+                    session=execution_session,
+                    probe_type=probe_type,
+                    identity_selector=identity_selector if isinstance(identity_selector, str) else None,
+                )
                 async with httpx.AsyncClient(headers=request_headers, cookies=cookies, follow_redirects=True) as client:
                     request, response, latency_ms = await self._send_request(
                         client=client,
@@ -119,6 +138,7 @@ class AttackWorker:
                     request=request,
                     response=response,
                     latency_ms=latency_ms,
+                    probe_type=probe_type,
                 )
 
                 evidence_metadata: dict[str, str] = {}
@@ -143,6 +163,79 @@ class AttackWorker:
         response_status_code = status_value if isinstance(status_value, int) else None
         self._save_state_snapshot(task=task, status="post", response_status_code=response_status_code)
         return raw_probe
+
+    async def _resolve_execution_session(
+        self,
+        task: AttackTask,
+        provided_session: SessionSnapshot | None,
+        identity_role: IdentityRole | str | None,
+        identity_name: str | None,
+    ) -> SessionSnapshot:
+        unauth_mode = self._is_unauth_mode(task)
+        if self._auth_manager is None:
+            if not unauth_mode and (identity_role is not None or identity_name is not None):
+                raise GuardrailViolation("identity_role/identity_name requires AttackWorker(auth_manager=...)")
+            if provided_session is None:
+                if unauth_mode:
+                    return SessionSnapshot(
+                        scan_id=task.scan_id,
+                        cookies=[],
+                        auth_headers={},
+                        csrf_tokens={},
+                        local_storage={},
+                        session_storage={},
+                        cookie_count=0,
+                        has_auth_token=False,
+                    )
+                raise GuardrailViolation("session is required when auth_manager is not configured")
+            return provided_session
+
+        self._scan_id = task.scan_id
+        try:
+            healthy = await self._auth_manager.health_check()
+        except Exception as exc:
+            await self._pause_for_auth_expired("auth_expired:auth_health_check_raised")
+            raise AuthExpiredError(
+                f"auth_expired: auth health check raised for scan_id={self._scan_id}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        if not healthy:
+            raise AuthExpiredError(f"auth_expired: auth health check failed for scan_id={self._scan_id}")
+
+        try:
+            fresh_session = await self._auth_manager.get_session_snapshot(self._scan_id)
+        except Exception as exc:
+            await self._pause_for_auth_expired("auth_expired:get_session_snapshot_failed")
+            raise AuthExpiredError(
+                f"auth_expired: failed to fetch session snapshot for scan_id={self._scan_id}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        selected_identity = identity_name if identity_name is not None else identity_role
+        if selected_identity is None:
+            return fresh_session
+
+        try:
+            identity_context = await self._auth_manager.get_identity_context(scan_id=self._scan_id, role=selected_identity)
+        except Exception as exc:
+            await self._pause_for_auth_expired("auth_expired:get_identity_context_failed")
+            raise AuthExpiredError(
+                f"auth_expired: failed to load identity context={selected_identity!r} for scan_id={self._scan_id}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        return identity_context.to_session_snapshot()
+
+    async def _pause_for_auth_expired(self, reason: str) -> None:
+        if self._auth_manager is None:
+            return
+        pause_with_error = getattr(self._auth_manager, "_pause_with_error", None)
+        if pause_with_error is None:
+            return
+        if not callable(pause_with_error):
+            return
+        try:
+            await pause_with_error(reason)
+        except Exception:
+            logger.exception("attack_worker_pause_for_auth_failed", scan_id=str(self._scan_id), reason=reason)
 
     async def _enforce_rate_limit(self, scan_id: str, domain: str, method: str, worker_id: str) -> None:
         def _acquire() -> bool:
@@ -199,6 +292,90 @@ class AttackWorker:
             return ""
         return domain.strip().lower().rstrip(".")
 
+    def _is_unauth_mode(self, task: AttackTask) -> bool:
+        scan = task.scan
+        if scan is None:
+            return False
+        scan_unauth_mode = getattr(scan, "unauth_mode", None)
+        if isinstance(scan_unauth_mode, bool):
+            return scan_unauth_mode
+        target = getattr(scan, "target", None)
+        config = getattr(target, "config", None)
+        if isinstance(config, dict):
+            return bool(config.get("unauth_mode"))
+        return False
+
+    async def execute_safe_token_replay(self, finding: dict, in_scope_domains: list[str]) -> dict:
+        evidence = finding.get("evidence", {})
+        token: str | None = None
+        if isinstance(evidence, dict):
+            for key in ("bearer_token", "api_key", "authorization", "token"):
+                value = evidence.get(key)
+                if isinstance(value, str) and value.strip():
+                    token = value.strip()
+                    break
+        if token is None:
+            raise ValueError("No replay token found in finding evidence")
+
+        method = str(finding.get("method", "GET")).upper()
+        if method != "GET":
+            raise ValueError("Safe replay is GET-only")
+
+        normalized_scope = {self._normalize_domain(domain) for domain in in_scope_domains if self._normalize_domain(domain)}
+        if not normalized_scope:
+            raise ValueError("Out-of-scope URL blocked by safe replay policy")
+
+        endpoint = str(finding.get("endpoint", "") or "").strip()
+        target_urls: list[str] = []
+        if endpoint:
+            parsed_endpoint = urlparse(endpoint)
+            endpoint_host = self._normalize_domain(parsed_endpoint.hostname)
+            if endpoint_host not in normalized_scope:
+                raise ValueError("Out-of-scope URL blocked by safe replay policy")
+            target_urls.append(endpoint)
+            path_with_query = parsed_endpoint.path or "/"
+            if parsed_endpoint.query:
+                path_with_query = f"{path_with_query}?{parsed_endpoint.query}"
+            for domain in normalized_scope:
+                if len(target_urls) >= 3:
+                    break
+                if domain == endpoint_host:
+                    continue
+                scheme = parsed_endpoint.scheme or "https"
+                target_urls.append(f"{scheme}://{domain}{path_with_query}")
+        else:
+            for domain in normalized_scope:
+                if len(target_urls) >= 3:
+                    break
+                target_urls.append(f"https://{domain}/")
+
+        target_urls = target_urls[:3]
+        results: list[dict[str, Any]] = []
+        headers = {"Authorization": f"Bearer {token}"}
+        logger.info("safe_token_replay_started", token_used="[REDACTED]", requests_planned=len(target_urls))
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            for url in target_urls:
+                parsed = urlparse(url)
+                url_host = self._normalize_domain(parsed.hostname)
+                if url_host not in normalized_scope:
+                    raise ValueError("Out-of-scope URL blocked by safe replay policy")
+                response = await client.get(url, headers=headers)
+                results.append(
+                    {
+                        "url": url,
+                        "status_code": response.status_code,
+                        "response_size": len(response.content),
+                        "content_type": response.headers.get("content-type", ""),
+                    }
+                )
+        logger.info("safe_token_replay_completed", token_used="[REDACTED]", requests_made=len(results))
+        return {
+            "token_used": "[REDACTED]",
+            "requests_made": len(results),
+            "results": results,
+            "scope_validated": True,
+        }
+
     async def _publish_evidence(self, scan_id: Any, raw_probe: RawProbe, metadata: dict[str, str] | None = None) -> None:
         stream_key = f"evidence:{scan_id}"
         # Evidence stored unredacted per invariant #6; redaction at ReportingService only.
@@ -242,8 +419,19 @@ class AttackWorker:
             headers[key] = value
         return headers
 
-    def _build_probe_headers(self, session: SessionSnapshot, probe_type: Any) -> dict[str, str]:
-        if probe_type in {"impact_unauthenticated_repeat", "impact_secret_replay"}:
+    def _build_probe_headers(
+        self,
+        session: SessionSnapshot,
+        probe_type: Any,
+        identity_selector: str | None = None,
+    ) -> dict[str, str]:
+        if isinstance(probe_type, str) and probe_type.startswith("ssrf_"):
+            return {}
+
+        if identity_selector == "anonymous":
+            return {}
+
+        if probe_type in {"impact_unauthenticated_repeat", "impact_secret_replay", "impact_secret_blast_radius"}:
             return {}
 
         if probe_type == "replay":
@@ -261,13 +449,22 @@ class AttackWorker:
             headers["X-Session-Age"] = "99999"
         return headers
 
-    def _build_probe_cookies(self, session: SessionSnapshot, probe_type: Any) -> httpx.Cookies:
-        if probe_type in {"impact_unauthenticated_repeat", "impact_secret_replay"}:
+    def _build_probe_cookies(
+        self,
+        session: SessionSnapshot,
+        probe_type: Any,
+        identity_selector: str | None = None,
+    ) -> httpx.Cookies:
+        if isinstance(probe_type, str) and probe_type.startswith("ssrf_"):
+            return httpx.Cookies()
+        if identity_selector == "anonymous":
+            return httpx.Cookies()
+        if probe_type in {"impact_unauthenticated_repeat", "impact_secret_replay", "impact_secret_blast_radius"}:
             return httpx.Cookies()
         return self._to_httpx_cookies(session.cookies)
 
     def _apply_secret_replay_headers(self, headers: dict[str, str], hypothesis_config: dict[str, Any]) -> None:
-        if hypothesis_config.get("probe_type") != "impact_secret_replay":
+        if hypothesis_config.get("probe_type") not in {"impact_secret_replay", "impact_secret_blast_radius"}:
             return
         secret_value = hypothesis_config.get("secret_value")
         secret_kind = str(hypothesis_config.get("secret_kind") or "bearer").lower()
@@ -284,11 +481,20 @@ class AttackWorker:
             raise GuardrailViolation(f"Safe secret replay only supports read-only methods for task {task_id}: {method}")
 
     def _build_request_body(self, task: AttackTask, probe_type: Any = None) -> bytes | None:
-        if probe_type in {"impact_unauthenticated_repeat", "impact_secret_replay"}:
+        if probe_type in {"impact_unauthenticated_repeat", "impact_secret_replay", "impact_secret_blast_radius"}:
             return None
         if not task.hypothesis:
             return None
         return task.hypothesis.encode("utf-8")
+
+    def _cap_blast_radius_body(self, body: bytes | str | None, *, max_bytes: int = 4096) -> str | None:
+        if body is None:
+            return None
+        if isinstance(body, bytes):
+            text = body.decode("utf-8", errors="replace")
+        else:
+            text = body
+        return text[:max_bytes]
 
     def _parse_hypothesis(self, hypothesis: str | None) -> dict[str, Any]:
         if not hypothesis:
@@ -343,19 +549,29 @@ class AttackWorker:
         url: str,
         content: bytes | None = None,
         headers: dict[str, str] | None = None,
+        cookies: httpx.Cookies | None = None,
         params: dict[str, Any] | None = None,
     ) -> tuple[httpx.Request, httpx.Response, int]:
         if self._behavior_config.request_delay_ms > 0:
             await asyncio.sleep(self._behavior_config.request_delay_ms / 1000)
-        if headers is None and params is None:
+        if headers is None and params is None and cookies is None:
             request = client.build_request(method=method, url=url, content=content)
         else:
             try:
-                request = client.build_request(method=method, url=url, content=content, headers=headers, params=params)
+                request = client.build_request(
+                    method=method,
+                    url=url,
+                    content=content,
+                    headers=headers,
+                    cookies=cookies,
+                    params=params,
+                )
             except TypeError:
                 request = client.build_request(method=method, url=url, content=content)
                 if headers:
                     request.headers.update(headers)
+                if cookies:
+                    request.headers.update(httpx.Headers({"cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}))
                 if params:
                     request.url = request.url.copy_merge_params(params)
         start = time.perf_counter()
@@ -370,7 +586,11 @@ class AttackWorker:
         request: httpx.Request,
         response: httpx.Response,
         latency_ms: int,
+        probe_type: Any = None,
     ) -> RawProbe:
+        response_body: str | None = response.text
+        if probe_type == "impact_secret_blast_radius":
+            response_body = self._cap_blast_radius_body(response_body)
         return RawProbe(
             id=uuid4(),
             attack_task_id=task.id,
@@ -385,7 +605,7 @@ class AttackWorker:
             response={
                 "status": response.status_code,
                 "headers": dict(response.headers),
-                "body": response.text,
+                "body": response_body,
                 "latency_ms": latency_ms,
             },
         )
@@ -403,15 +623,15 @@ class AttackWorker:
 
         worker_id = self._worker_id()
         allowed_domains = self._resolve_allowed_domains(task)
-        cookies = self._to_httpx_cookies(session.cookies)
         carried_values: dict[str, Any] = {}
         chain_entries: list[dict[str, Any]] = []
 
         last_request: httpx.Request | None = None
         last_response: httpx.Response | None = None
         last_latency_ms = 0
+        last_probe_type: Any = None
 
-        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             for idx, step in enumerate(steps, start=1):
                 if not isinstance(step, dict):
                     continue
@@ -420,6 +640,8 @@ class AttackWorker:
                 step_url = str(step.get("url_pattern") or endpoint.url_pattern)
                 url = self._apply_value_templates(step_url, carried_values)
                 probe_type = step.get("probe_type")
+                identity_selector = step.get("identity_selector")
+                last_probe_type = probe_type
 
                 domain = self._extract_request_domain(url)
                 if not self._is_domain_allowed(domain, allowed_domains):
@@ -436,7 +658,16 @@ class AttackWorker:
                 await self._enforce_rate_limit(scan_id=str(task.scan_id), domain=domain, method=method, worker_id=worker_id)
                 await self._apply_timing_profile(hypothesis_config.get("timing_profile"))
 
-                headers = self._build_probe_headers(session=session, probe_type=probe_type)
+                headers = self._build_probe_headers(
+                    session=session,
+                    probe_type=probe_type,
+                    identity_selector=identity_selector if isinstance(identity_selector, str) else None,
+                )
+                cookies = self._build_probe_cookies(
+                    session=session,
+                    probe_type=probe_type,
+                    identity_selector=identity_selector if isinstance(identity_selector, str) else None,
+                )
                 extra_headers = step.get("headers")
                 if isinstance(extra_headers, dict):
                     for key, value in extra_headers.items():
@@ -460,6 +691,7 @@ class AttackWorker:
                     method=method,
                     url=url,
                     headers=headers,
+                    cookies=cookies,
                     params=params_payload or None,
                 )
                 last_request = request
@@ -498,6 +730,7 @@ class AttackWorker:
             request=last_request,
             response=last_response,
             latency_ms=last_latency_ms,
+            probe_type=last_probe_type,
         )
         await self._publish_evidence(
             task.scan_id,

@@ -1,0 +1,70 @@
+{
+  "id": "http_method_override",
+  "attack_class": "http_method_override",
+  "preconditions": {
+    "methods": ["POST"],
+    "auth_required": false
+  },
+  "steps": [
+    {
+      "id": "baseline",
+      "action": "capture_baseline",
+      "identity_selector": "none",
+      "observe_only": true,
+      "max_attempts": 1,
+      "probe_template": {
+        "mode": "observe",
+        "template": "send_request",
+        "allowed_methods": ["POST"]
+      },
+      "expected_signal": "baseline POST response captured"
+    },
+    {
+      "id": "method_override_probe",
+      "action": "send_post_with_method_override",
+      "identity_selector": "none",
+      "probe_template": {
+        "mode": "bounded_probe",
+        "template": "method_override_delete",
+        "variables": {
+          "probe_type": "method_override",
+          "override_header": "X-HTTP-Method-Override",
+          "override_value": "DELETE",
+          "form_param": "_method",
+          "form_value": "DELETE"
+        }
+      },
+      "expected_signal": "server executes DELETE via POST with method override header",
+      "validator": "method_override_validator",
+      "max_attempts": 1
+    },
+    {
+      "id": "hpp_probe",
+      "action": "send_with_duplicate_parameter",
+      "identity_selector": "none",
+      "probe_template": {
+        "mode": "bounded_probe",
+        "template": "parameter_pollution",
+        "variables": {
+          "probe_type": "hpp",
+          "param_name": "id",
+          "values": ["1", "2"]
+        }
+      },
+      "expected_signal": "response differs from baseline indicating HPP processing difference",
+      "validator": "hpp_validator",
+      "max_attempts": 1
+    }
+  ],
+  "validators": {
+    "method_override_validator": {"signal": "delete_executed_via_post"},
+    "hpp_validator": {"signal": "parameter_processing_difference"}
+  },
+  "safety_budget": {
+    "max_requests": 3,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default"
+  }
+}

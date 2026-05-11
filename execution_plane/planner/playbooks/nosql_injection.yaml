@@ -1,0 +1,63 @@
+id: nosql_injection
+attack_class: nosql_injection
+preconditions:
+  methods: ["GET", "POST", "PUT", "PATCH"]
+  content_type_contains: "json"
+steps:
+  - id: gt_operator_probe
+    action: send_nosql_operator_probe
+    identity_selector: attacker
+    probe_template:
+      mode: bounded_probe
+      template: nosql_json_body
+      variables:
+        operator: "$gt"
+        value: ""
+    expected_signal: auth bypass or body diff after gt operator
+    validator: nosql_body_diff_validator
+    max_attempts: 1
+  - id: ne_operator_probe
+    action: send_nosql_operator_probe
+    identity_selector: attacker
+    probe_template:
+      mode: bounded_probe
+      template: nosql_json_body
+      variables:
+        operator: "$ne"
+        value: null
+    expected_signal: auth bypass or body diff after ne operator
+    validator: nosql_body_diff_validator
+    max_attempts: 1
+  - id: regex_operator_probe
+    action: send_nosql_operator_probe
+    identity_selector: attacker
+    probe_template:
+      mode: bounded_probe
+      template: nosql_json_body
+      variables:
+        operator: "$regex"
+        value: ".*"
+    expected_signal: auth bypass or body diff after regex operator
+    validator: nosql_body_diff_validator
+    max_attempts: 1
+  - id: where_operator_probe
+    action: send_nosql_operator_probe
+    identity_selector: attacker
+    probe_template:
+      mode: bounded_probe
+      template: nosql_json_body
+      variables:
+        operator: "$where"
+        value: "1==1"
+    expected_signal: auth bypass or body diff after where operator
+    validator: nosql_body_diff_validator
+    max_attempts: 1
+validators:
+  nosql_body_diff_validator:
+    signal: body_diff_or_auth_bypass
+safety_budget:
+  max_requests: 4
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

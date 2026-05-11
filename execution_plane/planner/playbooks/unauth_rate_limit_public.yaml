@@ -1,0 +1,81 @@
+{
+  "id": "unauth_rate_limit_public",
+  "attack_class": "rate_limit_abuse",
+  "preconditions": {
+    "auth_required": false,
+    "methods": ["POST", "GET"],
+    "path_contains_any": ["login", "search", "register", "api"],
+    "in_scope_only": true,
+    "unauth_compatible": true
+  },
+  "steps": [
+    {
+      "id": "staircase_probe",
+      "action": "observe_public_rate_limit_staircase",
+      "identity_selector": "anonymous",
+      "probe_template": {
+        "mode": "timing",
+        "template": "rate_limit_staircase_public_no_credentials",
+        "allowed_methods": ["GET", "POST"],
+        "variables": {
+          "staircase_requests": [1, 5, 10],
+          "no_credentials": true
+        }
+      },
+      "expected_signal": "public endpoint does not throttle staircase request pattern",
+      "validator": "rate_limit_signal_validator",
+      "max_attempts": 1,
+      "observe_only": true
+    },
+    {
+      "id": "burst_pattern",
+      "action": "observe_public_rate_limit_burst_pattern",
+      "identity_selector": "anonymous",
+      "probe_template": {
+        "mode": "timing",
+        "template": "rate_limit_burst_public_no_credentials",
+        "allowed_methods": ["GET", "POST"],
+        "variables": {
+          "burst_pattern": true,
+          "no_credentials": true
+        }
+      },
+      "expected_signal": "public endpoint accepts burst pattern without rate-limit signal",
+      "validator": "rate_limit_signal_validator",
+      "max_attempts": 1,
+      "observe_only": true
+    },
+    {
+      "id": "measure_response_times",
+      "action": "observe_public_rate_limit_response_times",
+      "identity_selector": "anonymous",
+      "probe_template": {
+        "mode": "timing",
+        "template": "measure_public_rate_limit_response_times",
+        "allowed_methods": ["GET", "POST"],
+        "variables": {
+          "measure_response_times": true,
+          "no_credentials": true
+        }
+      },
+      "expected_signal": "response timing remains stable across unauthenticated request pattern",
+      "validator": "rate_limit_signal_validator",
+      "max_attempts": 1,
+      "observe_only": true
+    }
+  ],
+  "validators": {
+    "rate_limit_signal_validator": {
+      "signal": "public_rate_limit_absent_or_weak"
+    }
+  },
+  "safety_budget": {
+    "max_requests": 10,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 1.0,
+    "scope": "current_endpoint",
+    "proof_gate": "default",
+    "no_credentials": true,
+    "read_only": true
+  }
+}

@@ -28,6 +28,7 @@ class Endpoint:
     method: str
     in_scope: bool
     auth_required: bool
+    source: str | None = None
     parameters: list[dict[str, str]] = field(default_factory=list)
     observed_content_type: str | None = None
     example_response_code: int | None = None
@@ -65,6 +66,7 @@ class AssetMapBuilder:
         auth_required: bool,
         parameters: list[dict[str, str]],
         in_scope: bool = True,
+        source: str | None = None,
         observed_content_type: str | None = None,
         example_response_code: int | None = None,
     ) -> None:
@@ -77,6 +79,7 @@ class AssetMapBuilder:
                 method=method.upper(),
                 in_scope=in_scope,
                 auth_required=auth_required,
+                source=source,
                 parameters=list(parameters),
                 observed_content_type=observed_content_type,
                 example_response_code=example_response_code,
@@ -85,6 +88,8 @@ class AssetMapBuilder:
 
         existing.in_scope = existing.in_scope or in_scope
         existing.auth_required = existing.auth_required or auth_required
+        if existing.source is None and source is not None:
+            existing.source = source
         existing.example_response_code = existing.example_response_code or example_response_code
         if existing.observed_content_type is None and observed_content_type is not None:
             existing.observed_content_type = observed_content_type

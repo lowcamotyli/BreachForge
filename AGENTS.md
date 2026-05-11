@@ -75,6 +75,32 @@ proofscan/
 
 ---
 
+## codex-dad Operational Contract
+
+- `codex-dad` is the WSL-backed worker running in distro `worker-dad` via `/usr/local/bin/codex-dad-exec`.
+- Preferred wrapper: `DAD_PROMPT="..." bash ~/.claude/scripts/dad-exec.sh`.
+- From Windows PowerShell, multiline prompts may not propagate through `DAD_PROMPT`; use the direct pipe fallback:
+  ```powershell
+  @'
+  cd /mnt/d/BreachForge
+  <bounded work package>
+  '@ | wsl -d worker-dad -e bash -lc 'PROMPT=$(cat); /usr/local/bin/codex-dad-exec "$PROMPT"'
+  ```
+- Always set the repo path inside the prompt (`cd /mnt/d/BreachForge`) because the worker can start elsewhere.
+- Use `codex-dad` when explicitly requested, for large context extraction, Alembic migrations, or bounded implementation packages where parallel worker output saves time.
+- `codex-dad` must return evidence: files changed, commands run with results, and open risks/follow-ups.
+- Codex-main reviews and integrates `codex-dad` output before commit/push; do not blindly ship delegated changes.
+
+### Sprint Worker Assignments Are Binding
+
+- When a sprint document assigns an implementation task to `codex-dad`, Codex-main MUST delegate that task to `codex-dad` as a bounded implementation package. Do not downgrade it to context extraction or analysis.
+- Codex-main may only implement the tasks explicitly assigned to `codex-main`, plus small integration glue after reviewing `codex-dad` output.
+- If a sprint table or workstream says `codex-dad` in the Worker column, the prompt to `codex-dad` must say that edits are expected and must list the exact files/tasks owned by `codex-dad`.
+- Codex-main must collect `codex-dad` evidence, inspect the resulting diff, run verification, and report both `codex-dad` evidence and Codex-main integration evidence.
+- If the sprint/user explicitly says "use codex-dad" or "codex-dad wdraza", Codex-main must start with implementation delegation to `codex-dad` before doing local implementation work.
+
+---
+
 ## Coding Conventions
 
 - `from __future__ import annotations` — first import in every file

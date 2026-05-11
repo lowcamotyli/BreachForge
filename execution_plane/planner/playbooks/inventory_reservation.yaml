@@ -1,0 +1,66 @@
+{
+  "id": "inventory_reservation",
+  "attack_class": "inventory_reservation",
+  "preconditions": {
+    "methods": ["POST", "PUT", "PATCH"],
+    "path_contains_any": ["/reserve", "/hold", "/book", "/cart"]
+  },
+  "steps": [
+    {
+      "id": "reserve_item",
+      "action": "reserve_inventory_item",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "safe_fixture",
+        "template": "reserve_item_probe",
+        "safe_fixture": true,
+        "allowed_methods": ["POST"]
+      },
+      "expected_signal": "item reserved successfully",
+      "observe_only": false,
+      "validator": "reservation_cycle_validator",
+      "max_attempts": 1
+    },
+    {
+      "id": "confirm_hold",
+      "action": "get_inventory_state",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "observe",
+        "template": "get_item_state",
+        "allowed_methods": ["GET"]
+      },
+      "expected_signal": "item held without inventory decrement",
+      "observe_only": true,
+      "max_attempts": 1
+    },
+    {
+      "id": "cancel_and_rereserve",
+      "action": "cancel_and_repeat_reservation",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "safe_fixture",
+        "template": "cancel_rereserve_cycle",
+        "max_cycles": 3,
+        "safe_fixture": true,
+        "allowed_methods": ["POST", "DELETE"]
+      },
+      "expected_signal": "item can be re-reserved without inventory change",
+      "observe_only": false,
+      "validator": "reservation_cycle_validator",
+      "max_attempts": 3
+    }
+  ],
+  "validators": {
+    "reservation_cycle_validator": {"signal": "cyclic_reservation_no_decrement"}
+  },
+  "safety_budget": {
+    "max_requests": 9,
+    "max_attempts_per_step": 3,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default",
+    "safe_fixture_required": true,
+    "max_cycles": 3
+  }
+}

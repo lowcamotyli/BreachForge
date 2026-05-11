@@ -12,6 +12,7 @@ _HEALTH_HINTS: tuple[str, ...] = ("/health", "/status", "/metrics", "/live", "/r
 
 
 class RateLimitAbuseRule(AttackRule):
+    requires_auth = False
     attack_class = "rate_limit_abuse"
     name = "RateLimitAbuseRule"
 
@@ -21,9 +22,7 @@ class RateLimitAbuseRule(AttackRule):
         path = endpoint.url_pattern.lower()
         if any(hint in path for hint in _HEALTH_HINTS):
             return False
-        if method in _METHODS and any(hint in path for hint in _PATH_HINTS):
-            return True
-        return endpoint.auth_required
+        return method in _METHODS and any(hint in path for hint in _PATH_HINTS)
 
     def generate_tasks(self, endpoint: Endpoint, context: ScanContext) -> List[AttackTask]:
         base_params = {

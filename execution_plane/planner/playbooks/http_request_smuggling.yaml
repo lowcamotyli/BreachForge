@@ -1,0 +1,52 @@
+{
+  "id": "http_request_smuggling",
+  "attack_class": "http_smuggling",
+  "preconditions": {
+    "methods": ["POST", "PUT"],
+    "auth_required": false
+  },
+  "steps": [
+    {
+      "id": "baseline",
+      "action": "capture_baseline",
+      "identity_selector": "none",
+      "observe_only": true,
+      "max_attempts": 1,
+      "probe_template": {
+        "mode": "observe",
+        "template": "send_request",
+        "allowed_methods": ["POST"]
+      },
+      "expected_signal": "baseline response captured"
+    },
+    {
+      "id": "cl_te_probe",
+      "action": "send_cl_te_smuggling_probe",
+      "identity_selector": "none",
+      "probe_template": {
+        "mode": "bounded_probe",
+        "template": "smuggling_cl_te",
+        "variables": {
+          "probe_type": "cl_te_probe",
+          "allow_smuggling_probes_required": true
+        }
+      },
+      "expected_signal": "timeout differential or poisoned response prefix indicating front/back desync",
+      "validator": "smuggling_validator",
+      "max_attempts": 1
+    }
+  ],
+  "validators": {
+    "smuggling_validator": {"signal": "cl_te_differential"}
+  },
+  "safety_budget": {
+    "max_requests": 2,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.2,
+    "scope": "current_endpoint",
+    "proof_gate": "default"
+  },
+  "guardrails": {
+    "require_scan_flag": "allow_smuggling_probes"
+  }
+}

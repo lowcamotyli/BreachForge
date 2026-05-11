@@ -1,0 +1,56 @@
+id: bfla_http_verb
+attack_class: bfla
+preconditions:
+  auth_required: true
+  methods: ["DELETE", "PUT", "PATCH"]
+steps:
+  - id: baseline_get
+    action: observe_resource_before_restricted_verb
+    identity_selector: elevated_admin
+    observe_only: true
+    probe_template:
+      mode: observe
+      template: current_resource_get
+      allowed_methods: ["GET"]
+      variables:
+        capture: baseline_resource_state
+    expected_signal: safe fixture state captured before restricted verb probe
+    max_attempts: 1
+  - id: restricted_verb_low_privilege_probe
+    action: bounded_update_or_delete_safe_fixture
+    identity_selector: low_privilege_user
+    safe_fixture_required: true
+    probe_template:
+      mode: bounded_probe
+      template: same_resource_restricted_verb
+      allowed_methods: ["DELETE", "PUT", "PATCH"]
+      variables:
+        expected_low_priv_status: [403, 404, 405]
+        mutation_allowed: true
+        verify_fixture_intact: true
+    expected_signal: low privilege identity can execute restricted verb without elevated authorization
+    validator: bfla_verb_validator
+    max_attempts: 1
+  - id: verify_fixture_intact
+    action: verify_safe_fixture_intact
+    identity_selector: elevated_admin
+    observe_only: true
+    safe_fixture_required: true
+    probe_template:
+      mode: observe
+      template: current_resource_get
+      allowed_methods: ["GET"]
+      variables:
+        compare: baseline_resource_state
+    expected_signal: fixture remains recoverable after bounded restricted verb probe
+    max_attempts: 1
+validators:
+  bfla_verb_validator:
+    signal: restricted_http_verb_succeeded_for_low_privilege_identity
+safety_budget:
+  max_requests: 3
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default
+  safe_fixture_required: true

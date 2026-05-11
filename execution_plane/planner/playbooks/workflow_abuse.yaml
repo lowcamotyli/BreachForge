@@ -10,7 +10,7 @@
     {
       "id": "draft_observe",
       "action": "create_draft_observation",
-      "identity_selector": "current_user",
+      "identity_selector": "anonymous",
       "probe_template": {
         "mode": "observe",
         "template": "map_prerequisite_step",
@@ -23,7 +23,7 @@
     {
       "id": "approval_skip_observe",
       "action": "skip_approval_observation",
-      "identity_selector": "current_user",
+      "identity_selector": "anonymous",
       "probe_template": {
         "mode": "observe",
         "template": "model_terminal_step_without_execution",
@@ -36,7 +36,7 @@
     {
       "id": "final_replay_observe",
       "action": "replay_final_step_observation",
-      "identity_selector": "current_user",
+      "identity_selector": "anonymous",
       "probe_template": {
         "mode": "observe",
         "template": "compare_workflow_transitions",

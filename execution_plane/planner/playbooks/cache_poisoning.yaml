@@ -1,0 +1,42 @@
+{
+  "id": "cache_poisoning",
+  "attack_class": "cache_poisoning",
+  "preconditions": {
+    "methods": ["GET", "POST"],
+    "auth_required": false
+  },
+  "steps": [
+    {
+      "id": "host_injection_probe",
+      "action": "send_with_injected_host_header",
+      "identity_selector": "none",
+      "probe_template": {
+        "mode": "bounded_probe",
+        "template": "host_header_injection",
+        "variables": {
+          "probe_type": "cache_probe",
+          "inject_headers": {
+            "X-Forwarded-Host": "evil-probe.invalid",
+            "X-Host": "evil-probe.invalid"
+          }
+        }
+      },
+      "expected_signal": "injected host value reflected in Location header CORS header or response body",
+      "validator": "cache_poison_validator",
+      "max_attempts": 1
+    }
+  ],
+  "validators": {
+    "cache_poison_validator": {"signal": "host_reflected_in_response"}
+  },
+  "safety_budget": {
+    "max_requests": 1,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default"
+  },
+  "guardrails": {
+    "no_cache_persistence": true
+  }
+}

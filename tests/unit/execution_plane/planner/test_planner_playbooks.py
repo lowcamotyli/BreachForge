@@ -152,3 +152,85 @@ def test_planner_generates_secret_to_impact_playbook_without_secret_value_false_
     ]
     assert len(secret_tasks) == 3
     assert all(_hypothesis_value(task.hypothesis, "safety_budget") for task in secret_tasks)
+
+
+def test_planner_selects_bfla_admin_function_playbook_for_admin_path() -> None:
+    endpoint = _build_endpoint(
+        method="GET",
+        auth_required=True,
+        url_pattern="/api/admin/users",
+        parameters=[],
+    )
+    context = _build_context([endpoint], {})
+    planner = AttackPlanner()
+
+    tasks = planner.plan(context)
+
+    bfla_tasks = [
+        task
+        for task in tasks
+        if _hypothesis_value(task.hypothesis, "playbook_id") == "bfla_admin_function"
+    ]
+    assert len(bfla_tasks) == 2
+    bfla_tasks_by_step = sorted(bfla_tasks, key=lambda task: task.step_order or 0)
+    assert [task.step_order for task in bfla_tasks_by_step] == [1, 2]
+    assert bfla_tasks_by_step[1].prerequisites == ["bfla_admin_function:1:baseline_elevated_access"]
+
+
+def test_planner_selects_bfla_http_verb_playbook_with_safe_fixture_budget() -> None:
+    endpoint = _build_endpoint(
+        method="DELETE",
+        auth_required=True,
+        url_pattern="/api/users/{id}",
+        parameters=[{"name": "id", "in": "path"}],
+    )
+    context = _build_context([endpoint], {})
+    planner = AttackPlanner()
+
+    tasks = planner.plan(context)
+
+    bfla_tasks = [
+        task
+        for task in tasks
+        if _hypothesis_value(task.hypothesis, "playbook_id") == "bfla_http_verb"
+    ]
+    assert len(bfla_tasks) == 3
+    probe_task = next(task for task in bfla_tasks if task.step_order == 2)
+    payload = json.loads(probe_task.hypothesis)
+    assert payload["safety_budget"]["max_requests"] == 3
+    assert payload["safety_budget"]["safe_fixture_required"] is True
+    assert payload["probe_template"]["variables"]["mutation_allowed"] is True
+
+
+def test_planner_selects_oauth_playbooks_for_authorization_endpoint() -> None:
+    endpoint = _build_endpoint(
+        method="GET",
+        auth_required=False,
+        url_pattern="/oauth/authorize",
+        parameters=[
+            {"name": "redirect_uri", "in": "query"},
+            {"name": "state", "in": "query"},
+            {"name": "response_type", "in": "query"},
+        ],
+    )
+    context = _build_context([endpoint], {})
+    planner = AttackPlanner()
+
+    tasks = planner.plan(context)
+
+    redirect_tasks = [
+        task
+        for task in tasks
+        if _hypothesis_value(task.hypothesis, "playbook_id") == "oauth_redirect_manipulation"
+    ]
+    state_tasks = [
+        task
+        for task in tasks
+        if _hypothesis_value(task.hypothesis, "playbook_id") == "oauth_state_csrf"
+    ]
+    assert len(redirect_tasks) == 3
+    assert len(state_tasks) == 2
+    redirect_payload = json.loads(redirect_tasks[0].hypothesis)
+    state_payload = json.loads(state_tasks[-1].hypothesis)
+    assert redirect_payload["safety_budget"]["max_requests"] == 3
+    assert state_payload["safety_budget"]["max_requests"] == 2

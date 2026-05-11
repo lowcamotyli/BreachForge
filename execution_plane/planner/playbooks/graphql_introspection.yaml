@@ -1,0 +1,28 @@
+id: graphql_introspection
+attack_class: graphql_introspection
+preconditions:
+  methods: ["POST"]
+  path_contains_any: ["/graphql", "/gql"]
+steps:
+  - id: unauth_introspection_probe
+    action: send_graphql_introspection_query
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: graphql_query
+      variables:
+        query: "query IntrospectionProbe { __schema { types { name } } }"
+        read_only: true
+        unauth_first: true
+    expected_signal: graphql response exposes __schema or __type metadata
+    validator: graphql_introspection
+    max_attempts: 1
+validators:
+  graphql_introspection:
+    signal: introspection_enabled
+safety_budget:
+  max_requests: 1
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

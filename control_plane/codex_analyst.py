@@ -3,6 +3,13 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
+from execution_plane.planner.hypothesis_ranker import (
+    HypothesisFeedbackState,
+    apply_probe_outcomes,
+    rank_hypotheses,
+)
+from execution_plane.planner.hypotheses import AttackHypothesis
+
 
 class CodexAnalyst:
     """Advisory analyzer for next-step hypotheses.
@@ -40,6 +47,31 @@ class CodexAnalyst:
 
         hypotheses.sort(key=lambda item: float(item["priority"]), reverse=True)
         return hypotheses
+
+    def rank_hypotheses_advisory(
+        self,
+        hypotheses: list[AttackHypothesis],
+        outcomes: list[dict[str, str]] | None = None,
+        *,
+        top_k: int = 10,
+        feedback_state: HypothesisFeedbackState | None = None,
+    ) -> list[dict[str, Any]]:
+        state = feedback_state or HypothesisFeedbackState()
+        if outcomes:
+            by_key = {hypothesis.key(): hypothesis for hypothesis in hypotheses}
+            apply_probe_outcomes(state, by_key, outcomes)
+
+        ranked = rank_hypotheses(hypotheses, top_k=top_k, feedback_state=state)
+        return [
+            {
+                "confidence": item.confidence,
+                "hypothesis_key": item.hypothesis.key(),
+                "priority": item.score,
+                "rationale": item.rationale,
+                "type": item.hypothesis.type,
+            }
+            for item in ranked
+        ]
 
     def _extract_endpoints(self, asset_map_summary: dict[str, Any]) -> list[dict[str, Any]]:
         raw_endpoints = asset_map_summary.get("endpoints")

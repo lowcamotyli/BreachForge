@@ -4,6 +4,7 @@ import copy
 import gzip
 import json
 import re
+import uuid as _uuid_mod
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -14,6 +15,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from api.models.responses import AttackChain, AttackChainReportResponse, AttackChainScoreFactors, AttackChainStep
+from control_plane.attack_chain_builder import (
+    ChainConfidenceResult,
+    adjust_chain_severity,
+    build_remediation,
+    compute_chain_confidence,
+    compute_chain_score,
+)
 from storage.db.models import Finding, ProofArtifact, Scan, Severity
 from storage.evidence.store import EvidenceStore
 
@@ -22,12 +31,37 @@ logger = structlog.get_logger(__name__)
 REDACTED = "[REDACTED]"
 _SENSITIVE_KEY_PATTERN = re.compile(r"authorization|cookie|password|token|secret", re.IGNORECASE)
 _REQUEST_HEADER_SENSITIVE_KEYS: tuple[str, ...] = ("authorization", "cookie", "password", "token", "x-api-key")
+_SAFE_SECRET_METADATA_KEYS: tuple[str, ...] = ("secret_blast_radius", "secret_blast_radius_matrix")
 _SENSITIVE_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\bbearer\s+[a-z0-9\-\._~\+/]+=*"),
     re.compile(r"(?i)\beyJ[a-z0-9\-_]+\.[a-z0-9\-_]+(?:\.[a-z0-9\-_]+)?"),
     re.compile(r"(?i)(access[_-]?token|refresh[_-]?token|session[_-]?token|api[_-]?key|client[_-]?secret)\s*[:=]"),
     re.compile(r"(?i)\b(secret|password)\b\s*[:=]"),
 )
+LEAK_SOURCE_GUIDANCE: dict[str, str] = {
+    "debug_endpoint": "Disable or restrict access to debug endpoints in production. Remove the route or add authentication.",
+    "config_json": "Remove secrets from configuration files served over HTTP. Use environment variables or a secret manager.",
+    "source_map": "Disable source map generation in production builds or restrict access to .map files.",
+    "stack_trace": "Suppress stack traces in HTTP error responses. Configure the error handler to return generic messages.",
+    "response_header": "Audit response headers. Remove headers that expose credentials or tokens.",
+    "public_asset": "Audit publicly accessible static assets. Remove or protect files that contain secrets.",
+    "response_body": "Sanitize API responses. Ensure secrets are not included in response payloads.",
+    "unknown": "Review the endpoint response to identify and remove exposed secrets.",
+}
+_UNTESTED_CLASS_DESCRIPTIONS: dict[str, str] = {
+    "bola": "Tests object-level access control. Requires authenticated user to manipulate another user IDs.",
+    "idor": "Tests object-level access control. Requires authenticated user to manipulate another user IDs.",
+    "tenant_isolation": "Tests cross-tenant data isolation. Requires two separate authenticated tenant sessions.",
+    "privilege_escalation": "Tests vertical privilege abuse. Requires low-privilege auth session + admin target endpoints.",
+    "auth_bypass": "Tests authentication bypass. Requires valid session baseline to compare against.",
+    "mass_assignment": "Tests field injection on write endpoints. Requires auth to reach protected write APIs.",
+    "csrf": "Tests state-changing requests without tokens. Requires authenticated session context.",
+    "jwt_attack": "Tests JWT manipulation. Requires JWT token in session (or from JS/HAR leak).",
+    "oauth": "Tests OAuth flow manipulation. Requires active OAuth session.",
+    "session_misuse": "Tests session fixation/hijacking. Requires active session.",
+    "business_logic_advanced": "Tests advanced business logic. Requires auth to reach business endpoints.",
+}
+_DEFAULT_UNTESTED_REASON = "Requires authenticated session. Re-run with credentials for full coverage."
 
 
 class ReportingService:
@@ -42,8 +76,9 @@ class ReportingService:
             self._evidence_store = None
 
     async def assemble_report(self, scan_id: UUID) -> dict[str, Any]:
-        scan_result = await self._db.execute(select(Scan.id).where(Scan.id == scan_id))
-        if scan_result.scalar_one_or_none() is None:
+        scan_result = await self._db.execute(select(Scan).where(Scan.id == scan_id).options(selectinload(Scan.target)))
+        scan = scan_result.scalar_one_or_none()
+        if scan is None:
             raise LookupError(f"Scan not found: {scan_id}")
 
         findings_result = await self._db.execute(
@@ -59,6 +94,8 @@ class ReportingService:
 
         report_findings: list[dict[str, Any]] = []
         for finding in findings:
+            metadata = copy.deepcopy(getattr(finding, "metadata", None))
+            severity = self._severity_value(finding.severity)
             artifacts: list[dict[str, Any]] = []
             for artifact in finding.proof_artifacts:
                 artifacts.append(self._artifact_payload(scan_id=scan_id, finding_id=finding.id, artifact=artifact))
@@ -74,7 +111,9 @@ class ReportingService:
                 {
                     "id": str(finding.id),
                     "title": finding.title,
-                    "severity": self._severity_value(finding.severity),
+                    "severity": severity,
+                    "severity_factors": self._severity_factors_from_metadata(metadata),
+                    "remediation_priority": self._remediation_priority(severity, metadata),
                     "attack_class": finding.attack_class,
                     "description": finding.description,
                     "repro_steps": finding.repro_steps,
@@ -95,25 +134,213 @@ class ReportingService:
                         endpoint_url=finding.affected_endpoint.url_pattern,
                         artifacts=artifacts,
                     ),
+                    "secret_blast_radius": self._build_secret_blast_radius_payload(
+                        self._extract_secret_blast_radius_matrix_from_metadata(metadata)
+                    ),
                     "score_explanation": self._score_explanation_for_artifacts(artifacts),
+                    "metadata": metadata,
                 }
             )
 
         return {
             "scan_id": str(scan_id),
             "generated_at": datetime.now(UTC).isoformat(),
+            "scan_config": scan.target.config if scan.target is not None else {},
             "findings": report_findings,
+        }
+
+    async def assemble_chain_report(self, scan_id: UUID) -> dict[str, Any]:
+        scan_result = await self._db.execute(select(Scan.id).where(Scan.id == scan_id))
+        if scan_result.scalar_one_or_none() is None:
+            raise LookupError(f"Scan not found: {scan_id}")
+
+        findings_result = await self._db.execute(
+            select(Finding)
+            .where(Finding.scan_id == scan_id)
+            .options(
+                selectinload(Finding.affected_endpoint),
+                selectinload(Finding.proof_artifacts).selectinload(ProofArtifact.attack_probe),
+                selectinload(Finding.proof_artifacts).selectinload(ProofArtifact.control_probe),
+            )
+        )
+        findings = findings_result.scalars().all()
+
+        grouped_findings: dict[str, list[Finding]] = {}
+        for finding in findings:
+            grouped_findings.setdefault(finding.attack_class, []).append(finding)
+
+        chains: list[AttackChain] = []
+        for attack_class, group in grouped_findings.items():
+            if not group:
+                continue
+
+            steps: list[AttackChainStep] = []
+            step_confidences: list[tuple[str, float]] = []
+            identity_set: set[str] = set()
+
+            for index, finding in enumerate(group):
+                phase = "entry" if index == 0 else "exploit"
+                metadata_raw = getattr(finding, "extra_metadata", None)
+                if not isinstance(metadata_raw, dict):
+                    metadata_raw = getattr(finding, "metadata", None)
+
+                confidence_raw: Any = 0.9
+                if isinstance(metadata_raw, dict):
+                    confidence_raw = metadata_raw.get("proof_confidence", 0.9)
+                    identity_ids = metadata_raw.get("identity_ids", [])
+                    if isinstance(identity_ids, list):
+                        for identity_id in identity_ids:
+                            if identity_id is None:
+                                continue
+                            identity_set.add(str(identity_id))
+
+                try:
+                    confidence = float(confidence_raw)
+                except (TypeError, ValueError):
+                    confidence = 0.9
+                confidence = min(max(confidence, 0.0), 1.0)
+
+                endpoint = str(getattr(finding.affected_endpoint, "url_pattern", finding.affected_endpoint))
+                step = AttackChainStep(
+                    phase=phase,
+                    description=finding.title,
+                    endpoint=endpoint,
+                    evidence_ref=str(finding.id),
+                    confidence=confidence,
+                )
+                steps.append(step)
+                step_confidences.append((step.phase, confidence))
+
+            chain_identities = sorted(identity_set)
+            chain_conf_result: ChainConfidenceResult = compute_chain_confidence(
+                step_confidences=step_confidences,
+                has_differential=False,
+                has_reproducible=True,
+            )
+
+            base_severity = (
+                group[0].severity.value if isinstance(group[0].severity, Severity) else str(group[0].severity)
+            )
+            severity_adjustment = adjust_chain_severity(
+                base_severity=base_severity.lower(),
+                chain_confidence=chain_conf_result.chain_confidence,
+                has_impact_evidence=len(group) > 1,
+                step_count=len(group),
+            )
+
+            score_result = compute_chain_score(
+                impact=0.8,
+                reachability=0.7,
+                privilege=0.6,
+                repeatability=0.8,
+                blast_radius=0.5,
+                safety_confidence=chain_conf_result.chain_confidence,
+            )
+            score_factors = AttackChainScoreFactors(**score_result)
+
+            root_endpoint = str(getattr(group[0].affected_endpoint, "url_pattern", group[0].affected_endpoint))
+            remediation = build_remediation(
+                attack_class=attack_class,
+                root_cause_endpoint=root_endpoint,
+                step_count=len(group),
+                identities=chain_identities,
+            )
+
+            chains.append(
+                AttackChain(
+                    id=str(_uuid_mod.uuid4()),
+                    root_cause_id=f"{attack_class}_{str(scan_id)[:8]}",
+                    steps=steps,
+                    identities=chain_identities,
+                    evidence_refs=[str(finding.id) for finding in group],
+                    chain_confidence=chain_conf_result.chain_confidence,
+                    severity=severity_adjustment.adjusted,
+                    severity_explanation=severity_adjustment.explanation,
+                    score_factors=score_factors,
+                    remediation=remediation,
+                )
+            )
+
+        _existing_report = await self.assemble_report(scan_id)
+        _ = _existing_report.get("findings", [])
+
+        return {
+            "scan_id": str(scan_id),
+            "chains": [chain.model_dump() for chain in chains],
+            "findings": [],
+            "generated_at": datetime.now(UTC).isoformat(),
         }
 
     def render_markdown(self, report: dict[str, Any]) -> str:
         lines: list[str] = [f"# Scan Report: {report['scan_id']}", ""]
+        scan_config_raw = report.get("scan_config")
+        scan_config = scan_config_raw if isinstance(scan_config_raw, dict) else {}
+        unauth_mode = bool(scan_config.get("unauth_mode", False))
+        active_rules: list[str] = []
+        skipped_rules: list[str] = []
+        all_rules: list[str] = []
+        if unauth_mode:
+            all_rules = self._normalize_rule_list(scan_config.get("all_rules"))
+            active_rules = self._normalize_rule_list(scan_config.get("active_rules"))
+            skipped_rules = self._normalize_rule_list(scan_config.get("skipped_rules"))
+            if not all_rules or not active_rules:
+                planner_all_rules, planner_active_rules, planner_skipped_rules = self._resolve_unauth_rule_sets()
+                if not all_rules:
+                    all_rules = planner_all_rules
+                if not active_rules:
+                    active_rules = planner_active_rules
+                if not skipped_rules:
+                    skipped_rules = planner_skipped_rules
+            if skipped_rules:
+                lines.extend([self.generate_untested_classes_section(scan_config=scan_config, skipped_rules=skipped_rules), ""])
         findings = report.get("findings", [])
 
         for index, finding in enumerate(findings, start=1):
+            leak_source_section = ""
+            metadata = finding.get("metadata")
+            if isinstance(metadata, dict):
+                leak_source_section = self._format_leak_source_section(metadata)
+            severity = str(finding.get("severity", ""))
+            severity_factors = self._severity_factors_for_finding(finding)
             lines.extend(
                 [
                     f"## {index}. {finding.get('title', '')}",
-                    f"- Severity: {finding.get('severity', '')}",
+                    f"- Severity: {severity}",
+                ]
+            )
+            if finding.get("attack_class") == "sensitive_exposure":
+                summary = self._build_executive_summary(finding)
+                if unauth_mode:
+                    coverage = self.calculate_unauth_coverage(all_rules=all_rules, active_rules=active_rules)
+                    summary = (
+                        f"{summary} Unauth coverage: {coverage:.0f}% of attack classes tested without credentials."
+                    ).strip()
+                lines.extend(
+                    [
+                        "### Executive Summary",
+                        "",
+                        summary,
+                        "",
+                        "#### Attack Narrative",
+                        "",
+                        self._build_attack_narrative(finding),
+                        "",
+                    ]
+                )
+            if severity_factors:
+                lines.extend(
+                    [
+                        f"**Why Severity Is {severity}:**",
+                        *[
+                            f"- {factor['description']} "
+                            f"(source: {factor['source']}, confidence: {factor['confidence']:.0%})"
+                            for factor in severity_factors
+                        ],
+                    ]
+                )
+            lines.extend(
+                [
+                    f"- Remediation Priority: {self._remediation_priority(severity, metadata)}",
                     f"- Attack Class: {finding.get('attack_class', '')}",
                     f"- Affected Endpoint: {finding.get('affected_endpoint', '')}",
                     f"- Score Explanation: {finding.get('score_explanation', '')}",
@@ -126,10 +353,26 @@ class ReportingService:
                     "",
                     "### Fix Guidance",
                     str(finding.get("fix_guidance", "")),
-                    "",
-                    "### Attack Path",
                 ]
             )
+            if leak_source_section:
+                lines.extend(["", leak_source_section])
+            lines.extend(["", "### Attack Path"])
+
+            secret_metadata = self._parse_secret_metadata(str(finding.get("evidence_notes", "")))
+            if secret_metadata is not None:
+                lines.extend(
+                    [
+                        "### Secret Properties",
+                        f"- Type: {secret_metadata.get('secret_type', '')}",
+                        f"- Fingerprint: `{secret_metadata.get('secret_fingerprint', '')}` (dedup hash, not the secret value)",
+                        f"- TTL Bucket: {secret_metadata.get('ttl_bucket', '')}",
+                        "",
+                        "### Expiration and Revocation",
+                        f"- Lifecycle Guidance: {self._lifecycle_guidance(secret_metadata)}",
+                        "",
+                    ]
+                )
 
             attack_path = finding.get("attack_path", [])
             if not attack_path:
@@ -162,29 +405,28 @@ class ReportingService:
             proof_artifacts = finding.get("proof_artifacts", [])
             if not proof_artifacts:
                 lines.extend(["- No proof artifacts available", ""])
-                continue
-
-            for artifact in proof_artifacts:
-                lines.extend(
-                    [
-                        f"#### Artifact {artifact.get('artifact_id', '')}",
-                        f"- Type: {artifact.get('proof_type', '')}",
-                        f"- Confidence Score: {artifact.get('confidence_score', '')}",
-                        f"- Summary: {artifact.get('summary', '')}",
-                        f"- Evidence Notes: {artifact.get('evidence_notes', '')}",
-                        "",
-                        "##### Exact Request",
-                        "```json",
-                        json.dumps(artifact.get("request", {}), indent=2, ensure_ascii=False),
-                        "```",
-                        "",
-                        "##### Exact Response",
-                        "```json",
-                        json.dumps(artifact.get("response", {}), indent=2, ensure_ascii=False),
-                        "```",
-                        "",
-                    ]
-                )
+            else:
+                for artifact in proof_artifacts:
+                    lines.extend(
+                        [
+                            f"#### Artifact {artifact.get('artifact_id', '')}",
+                            f"- Type: {artifact.get('proof_type', '')}",
+                            f"- Confidence Score: {artifact.get('confidence_score', '')}",
+                            f"- Summary: {artifact.get('summary', '')}",
+                            f"- Evidence Notes: {artifact.get('evidence_notes', '')}",
+                            "",
+                            "##### Exact Request",
+                            "```json",
+                            json.dumps(artifact.get("request", {}), indent=2, ensure_ascii=False),
+                            "```",
+                            "",
+                            "##### Exact Response",
+                            "```json",
+                            json.dumps(artifact.get("response", {}), indent=2, ensure_ascii=False),
+                            "```",
+                            "",
+                        ]
+                    )
 
             lines.append("### Attacker Impact")
             attacker_impact = finding.get("attacker_impact", [])
@@ -198,10 +440,116 @@ class ReportingService:
                     )
                 lines.append("")
 
+            secret_blast_radius = self._secret_blast_radius_for_finding(finding)
+            if secret_blast_radius is not None:
+                lines.extend(
+                    [
+                        "### Secret Blast Radius",
+                        "| Endpoint | Method | Status | Content-Type | Response Size | Auth Accepted |",
+                        "|---|---|---|---|---|---|",
+                    ]
+                )
+                for entry in secret_blast_radius["matrix"]:
+                    endpoint_raw = entry.get("endpoint")
+                    endpoint_text = "-" if endpoint_raw is None else self._truncate_markdown_cell(str(endpoint_raw), limit=80)
+                    method_text = "-" if entry.get("method") is None else str(entry["method"])
+                    status_text = "-" if entry.get("status") is None else str(entry["status"])
+                    content_type_text = "-" if entry.get("content_type") is None else str(entry["content_type"])
+                    response_size_text = "-" if entry.get("response_size") is None else str(entry["response_size"])
+                    auth_text = "YES" if entry.get("auth_accepted") else "NO"
+                    lines.append(
+                        f"| {endpoint_text} | {method_text} | {status_text} | {content_type_text} | {response_size_text} | {auth_text} |"
+                    )
+                lines.append("")
+
+            privilege_fp: dict[str, Any] | None = None
+            metadata = finding.get("metadata")
+            if isinstance(metadata, dict):
+                privilege_fp_entry = metadata.get("privilege_fingerprint")
+                if isinstance(privilege_fp_entry, dict):
+                    privilege_fp = privilege_fp_entry
+            if privilege_fp:
+                lines.append("### Privilege Fingerprint")
+                lines.append("- **Observed access level:** " + str(privilege_fp.get("observed_access_level", "unknown")))
+                lines.append("- **Inferred level (JWT hints):** " + str(privilege_fp.get("inferred_level", "unknown")))
+                confidence_val_raw = privilege_fp.get("confidence", 0.0)
+                try:
+                    confidence_val = float(confidence_val_raw)
+                except (TypeError, ValueError):
+                    confidence_val = 0.0
+                lines.append(f"- **Confidence:** {confidence_val:.2f}")
+                evidence_eps_raw = privilege_fp.get("evidence_endpoints", [])
+                evidence_eps: list[str] = []
+                if isinstance(evidence_eps_raw, list):
+                    evidence_eps = [str(endpoint) for endpoint in evidence_eps_raw if endpoint is not None]
+                if evidence_eps:
+                    lines.append("- **Evidence endpoints:** " + ", ".join(evidence_eps))
+                else:
+                    lines.append("- **Evidence endpoints:** none observed")
+                lines.append("")
+                lines.append("#### Remediation")
+                level = str(privilege_fp.get("observed_access_level", "unknown"))
+                if level in ("admin", "service"):
+                    lines.append(
+                        "**Critical:** Secret grants admin/service-level access. Rotate immediately and audit all usage in the last 90 days."
+                    )
+                elif level == "elevated_user":
+                    lines.append(
+                        "**High:** Secret grants elevated access beyond standard user scope. Rotate and review granted permissions."
+                    )
+                else:
+                    lines.append(
+                        "**Standard:** Rotate the secret and review whether the access scope matches the principle of least privilege."
+                    )
+                lines.append("")
+
+            if finding.get("attack_class") == "sensitive_exposure":
+                lines.extend(
+                    [
+                        "",
+                        self._build_remediation_plan_section(finding),
+                        "",
+                    ]
+                )
+
         return "\n".join(lines)
 
     def render_json(self, report: dict[str, Any]) -> str:
-        return json.dumps(report, indent=2, ensure_ascii=False)
+        output = copy.deepcopy(report)
+        findings = output.get("findings")
+        if isinstance(findings, list):
+            for finding in findings:
+                if not isinstance(finding, dict):
+                    continue
+                finding["secret_blast_radius"] = self._secret_blast_radius_for_finding(finding)
+                privilege_fp_entry: Any = None
+                metadata = finding.get("metadata")
+                if isinstance(metadata, dict):
+                    privilege_fp_entry = metadata.get("privilege_fingerprint")
+                severity = str(finding.get("severity", ""))
+                finding["severity_factors"] = self._severity_factors_for_finding(finding)
+                finding["remediation_priority"] = self._remediation_priority(severity, metadata)
+                finding["leak_source"] = metadata.get("leak_source") if isinstance(metadata, dict) else None
+                finding["privilege_fingerprint"] = privilege_fp_entry
+                if str(finding.get("attack_class", "")) == "sensitive_exposure":
+                    evidence_notes = str(finding.get("evidence_notes", ""))
+                    if not evidence_notes:
+                        proof_artifacts = finding.get("proof_artifacts")
+                        if isinstance(proof_artifacts, list):
+                            primary_artifact = self._primary_artifact(
+                                [artifact for artifact in proof_artifacts if isinstance(artifact, dict)]
+                            )
+                            if primary_artifact is not None:
+                                evidence_notes = str(primary_artifact.get("evidence_notes", ""))
+                    secret_metadata = self._parse_secret_metadata(evidence_notes)
+                    if secret_metadata is not None:
+                        finding["lifecycle"] = {
+                            "ttl_bucket": secret_metadata.get("ttl_bucket", ""),
+                            "active_during_scan": secret_metadata.get("active_during_scan", "false") == "true",
+                            "guidance": self._lifecycle_guidance(secret_metadata),
+                        }
+                finding["secret_exposure_evidence_pack"] = self._build_secret_exposure_evidence_pack(finding)
+        return json.dumps(output, indent=2, ensure_ascii=False)
 
     async def export(self, scan_id: UUID, fmt: str = "json") -> str:
         report = await self.assemble_report(scan_id)
@@ -303,6 +651,57 @@ class ReportingService:
         if isinstance(severity, Severity):
             return severity.value
         return str(severity)
+
+    def _severity_factors_for_finding(self, finding: dict[str, Any]) -> list[dict[str, Any]]:
+        factors = finding.get("severity_factors")
+        if isinstance(factors, list):
+            normalized = self._normalize_severity_factors(factors)
+            if normalized:
+                return normalized
+        return self._severity_factors_from_metadata(finding.get("metadata"))
+
+    def _severity_factors_from_metadata(self, metadata: Any) -> list[dict[str, Any]]:
+        if not isinstance(metadata, dict):
+            return []
+        return self._normalize_severity_factors(metadata.get("severity_factors"))
+
+    def _normalize_severity_factors(self, factors: Any) -> list[dict[str, Any]]:
+        if not isinstance(factors, list):
+            return []
+
+        normalized: list[dict[str, Any]] = []
+        for factor in factors:
+            if not isinstance(factor, dict):
+                continue
+            confidence = 0.0
+            try:
+                confidence = float(factor.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            normalized.append(
+                {
+                    "source": str(factor.get("source", "")),
+                    "confidence": confidence,
+                    "description": str(factor.get("description", "")),
+                }
+            )
+        return normalized
+
+    def _remediation_priority(self, severity: str, metadata: Any) -> str:
+        normalized_severity = severity.strip().lower()
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        if normalized_severity == "critical" and metadata_dict.get("active_replay"):
+            return "Priority 1: Rotate immediately"
+
+        blast_radius_score = 0.0
+        try:
+            blast_radius_score = float(metadata_dict.get("blast_radius_score", 0.0))
+        except (TypeError, ValueError):
+            blast_radius_score = 0.0
+        if normalized_severity == "high" and blast_radius_score >= 0.7:
+            return "Priority 2: Rotate within 24h"
+
+        return "Priority 3: Rotate in next maintenance window"
 
     def _redact_report(self, report: dict[str, Any]) -> dict[str, Any]:
         redacted = copy.deepcopy(report)
@@ -409,6 +808,42 @@ class ReportingService:
                 continue
             parsed_steps.append({"method": method_normalized, "url": url_normalized})
         return parsed_steps
+
+    def _parse_secret_metadata(self, evidence_notes: str) -> dict[str, str] | None:
+        parsed: dict[str, str] = {}
+        for key, value in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=([^;,\n]+)", evidence_notes):
+            parsed[key.strip()] = value.strip()
+        if "secret_type" not in parsed:
+            return None
+        return parsed
+
+    def _lifecycle_guidance(self, secret_metadata: dict[str, str]) -> str:
+        if secret_metadata.get("active_during_scan") == "true":
+            return "Immediately rotate or revoke — confirmed active during scan."
+        ttl_bucket = secret_metadata.get("ttl_bucket", "")
+        if ttl_bucket == "expired":
+            return "Secret appears expired. Confirm revocation is complete and purge from all consumers."
+        if ttl_bucket == "long":
+            return "Secret is long-lived. Reduce TTL, bind audience (aud claim), and narrow scope."
+        if ttl_bucket in ("unknown", ""):
+            return "No expiry detected. Add expiration, bind audience, and restrict scope."
+        if ttl_bucket == "short":
+            return "TTL is short. Ensure automated rotation is in place."
+        return "Rotate this secret and review access logs."
+
+    def _format_leak_source_section(self, metadata: dict[str, Any]) -> str:
+        leak_source = metadata.get("leak_source")
+        if not isinstance(leak_source, dict):
+            return ""
+        source_type = str(leak_source.get("type") or "unknown")
+        confidence_raw = leak_source.get("confidence")
+        confidence = 0.0
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        guidance = LEAK_SOURCE_GUIDANCE.get(source_type, LEAK_SOURCE_GUIDANCE["unknown"])
+        return f"**Leak Source:** {source_type} (confidence: {confidence:.0%})\n**Remediation:** {guidance}"
 
     def _build_kill_chain(
         self,
@@ -613,7 +1048,9 @@ class ReportingService:
         if isinstance(value, dict):
             output: dict[str, Any] = {}
             for key, item in value.items():
-                if _SENSITIVE_KEY_PATTERN.search(key):
+                if key in _SAFE_SECRET_METADATA_KEYS:
+                    output[key] = self._redact_value(item)
+                elif _SENSITIVE_KEY_PATTERN.search(key):
                     output[key] = REDACTED
                 else:
                     output[key] = self._redact_value(item)
@@ -625,3 +1062,307 @@ class ReportingService:
                 if pattern.search(value):
                     return REDACTED
         return value
+
+    def _extract_secret_blast_radius_matrix_from_metadata(self, metadata: Any) -> list[dict[str, Any]]:
+        if not isinstance(metadata, dict):
+            return []
+        matrix = metadata.get("secret_blast_radius_matrix")
+        if not isinstance(matrix, list):
+            return []
+
+        normalized_matrix: list[dict[str, Any]] = []
+        for raw_entry in matrix:
+            if not isinstance(raw_entry, dict):
+                continue
+            endpoint_raw = raw_entry.get("url_pattern")
+            if endpoint_raw is None:
+                endpoint_raw = raw_entry.get("endpoint")
+            method_raw = raw_entry.get("method")
+            status_raw = raw_entry.get("status")
+            content_type_raw = raw_entry.get("content_type")
+            response_size_raw = raw_entry.get("response_size")
+            auth_accepted_raw = raw_entry.get("auth_accepted")
+
+            status_value: int | None = None
+            if isinstance(status_raw, int):
+                status_value = status_raw
+            else:
+                try:
+                    status_value = int(status_raw) if status_raw is not None else None
+                except (TypeError, ValueError):
+                    status_value = None
+
+            response_size_value: int | None = None
+            if isinstance(response_size_raw, int):
+                response_size_value = response_size_raw
+            else:
+                try:
+                    response_size_value = int(response_size_raw) if response_size_raw is not None else None
+                except (TypeError, ValueError):
+                    response_size_value = None
+
+            auth_accepted_value = False
+            if isinstance(auth_accepted_raw, bool):
+                auth_accepted_value = auth_accepted_raw
+            elif isinstance(auth_accepted_raw, (int, float)):
+                auth_accepted_value = auth_accepted_raw != 0
+            elif isinstance(auth_accepted_raw, str):
+                auth_accepted_value = auth_accepted_raw.strip().lower() in {"1", "true", "yes", "y"}
+
+            normalized_matrix.append(
+                {
+                    "endpoint": str(endpoint_raw) if endpoint_raw is not None else None,
+                    "method": str(method_raw) if method_raw is not None else None,
+                    "status": status_value,
+                    "content_type": str(content_type_raw) if content_type_raw is not None else None,
+                    "response_size": response_size_value,
+                    "auth_accepted": auth_accepted_value,
+                }
+            )
+
+        return normalized_matrix
+
+    def _secret_blast_radius_for_finding(self, finding: dict[str, Any]) -> dict[str, Any] | None:
+        secret_blast_radius = finding.get("secret_blast_radius")
+        if isinstance(secret_blast_radius, dict):
+            matrix_raw = secret_blast_radius.get("matrix")
+            if isinstance(matrix_raw, list):
+                matrix = self._extract_secret_blast_radius_matrix_from_metadata(
+                    {"secret_blast_radius_matrix": matrix_raw}
+                )
+                if matrix:
+                    return self._build_secret_blast_radius_payload(matrix)
+
+        matrix = self._extract_secret_blast_radius_matrix_from_metadata(finding.get("metadata"))
+        if matrix:
+            return self._build_secret_blast_radius_payload(matrix)
+
+        matrix = self._extract_secret_blast_radius_matrix_from_metadata(
+            {"secret_blast_radius_matrix": finding.get("secret_blast_radius_matrix")}
+        )
+        return self._build_secret_blast_radius_payload(matrix)
+
+    def _build_secret_blast_radius_payload(self, matrix: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not matrix:
+            return None
+        auth_accepted_count = sum(1 for entry in matrix if entry.get("auth_accepted") is True)
+        return {
+            "matrix": matrix,
+            "endpoints_tested": len(matrix),
+            "auth_accepted_count": auth_accepted_count,
+        }
+
+    def _build_executive_summary(self, finding: dict[str, Any]) -> str:
+        if finding.get("attack_class") != "sensitive_exposure":
+            return ""
+        metadata_raw = finding.get("metadata") or {}
+        metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
+        secret_meta = self._parse_secret_metadata(str(finding.get("evidence_notes", ""))) or {}
+        priv_raw = metadata.get("privilege_fingerprint") or {}
+        priv = priv_raw if isinstance(priv_raw, dict) else {}
+        secret_type = secret_meta.get("secret_type") or "credential"
+        endpoint = finding.get("affected_endpoint", "an endpoint")
+        level = str(priv.get("observed_access_level", "")).lower()
+        if "admin" in level or "privileged" in level:
+            impact = "An attacker with this credential could gain administrative access."
+        elif "user" in level or "authenticated" in level:
+            impact = "An attacker could access user-scoped data and API resources."
+        else:
+            impact = "An attacker could make authenticated API calls."
+        if str(secret_meta.get("active_during_scan", "")).lower() == "true":
+            activity = "The credential was confirmed active during the scan."
+        else:
+            activity = "Active status was not confirmed during the scan."
+        return f"A {secret_type} was discovered exposed at {endpoint}. {impact} {activity}"
+
+    def _build_attack_narrative(self, finding: dict[str, Any]) -> str:
+        if finding.get("attack_class") != "sensitive_exposure":
+            return ""
+        metadata_raw = finding.get("metadata") or {}
+        metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
+        secret_meta = self._parse_secret_metadata(str(finding.get("evidence_notes", ""))) or {}
+        leak_source = metadata.get("leak_source") if isinstance(metadata, dict) else None
+        blast_radius = self._secret_blast_radius_for_finding(finding)
+        priv_raw = metadata.get("privilege_fingerprint") or {}
+        priv = priv_raw if isinstance(priv_raw, dict) else {}
+        factors = self._severity_factors_for_finding(finding)
+
+        lines: list[str] = []
+        n = 1
+        if leak_source:
+            leak_type = "unknown"
+            leak_confidence = 0.0
+            if isinstance(leak_source, dict):
+                leak_type = str(leak_source.get("type") or "unknown")
+                try:
+                    leak_confidence = float(leak_source.get("confidence", 0.0))
+                except (TypeError, ValueError):
+                    leak_confidence = 0.0
+            else:
+                leak_type = str(leak_source)
+            lines.append(f"{n}. **Discovered**: Secret found at {leak_type} ({leak_confidence * 100:.0f}% confidence)")
+        else:
+            lines.append(f"{n}. **Discovered**: Secret found in response at {finding.get('affected_endpoint')}")
+        n += 1
+
+        if secret_meta.get("secret_type"):
+            lines.append(
+                f"{n}. **Classified**: Type: {secret_meta.get('secret_type')}, "
+                f"Fingerprint: `{secret_meta.get('secret_fingerprint')}` (dedup hash, not the secret value)"
+            )
+            n += 1
+        if blast_radius:
+            lines.append(f"{n}. **Replayed**: Tested against {blast_radius.get('endpoints_tested')} endpoint(s)")
+            n += 1
+            lines.append(
+                f"{n}. **Blast Radius**: {blast_radius.get('auth_accepted_count')} "
+                f"of {blast_radius.get('endpoints_tested')} endpoints accepted the credential"
+            )
+            n += 1
+        if priv.get("observed_access_level"):
+            lines.append(f"{n}. **Privilege**: Observed access level: {priv.get('observed_access_level')}")
+            n += 1
+        if secret_meta.get("ttl_bucket"):
+            lines.append(
+                f"{n}. **Lifecycle**: TTL bucket: {secret_meta.get('ttl_bucket')}, "
+                f"active during scan: {secret_meta.get('active_during_scan')}"
+            )
+            n += 1
+        if factors:
+            first_factor = factors[0] if isinstance(factors[0], dict) else {}
+            lines.append(f"{n}. **Severity Factor**: {first_factor.get('description', '')}")
+        return "\n".join(lines)
+
+    def _build_remediation_plan_section(self, finding: dict[str, Any]) -> str:
+        if finding.get("attack_class") != "sensitive_exposure":
+            return ""
+        metadata_raw = finding.get("metadata") or {}
+        metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
+        priv_raw = metadata.get("privilege_fingerprint") or {}
+        priv = priv_raw if isinstance(priv_raw, dict) else {}
+        leak_source = metadata.get("leak_source") if isinstance(metadata, dict) else None
+        blast_radius = self._secret_blast_radius_for_finding(finding)
+
+        items: list[str] = [
+            "1. **Rotate / Revoke**: Immediately invalidate the exposed credential and replace it with a new one."
+        ]
+        n = 2
+
+        observed_level = str(priv.get("observed_access_level", "")).lower()
+        if "admin" in observed_level or "privileged" in observed_level:
+            items.append(f"{n}. **Restrict Scope**: Downscope permissions to minimum required by the service.")
+            n += 1
+
+        leak_type = ""
+        if leak_source:
+            if isinstance(leak_source, dict):
+                leak_type = str(leak_source.get("type") or "unknown")
+            else:
+                leak_type = str(leak_source)
+            guidance_map = {
+                "debug_endpoint": "Disable or restrict access to debug endpoints in production.",
+                "config_json": "Remove credentials from public-facing config responses.",
+                "source_map": "Restrict .map files from production deployments.",
+                "env_file": "Remove .env files from web-accessible paths and rotate affected secrets.",
+                "backup_file": "Restrict access to backup and archive files.",
+            }
+            guidance = guidance_map.get(leak_type, "Audit the endpoint returning this secret and restrict access.")
+            items.append(f"{n}. **Fix Source ({leak_type})**: {guidance}")
+            n += 1
+
+        accepted_count = 0
+        if blast_radius:
+            try:
+                accepted_count = int(blast_radius.get("auth_accepted_count", 0))
+            except (TypeError, ValueError):
+                accepted_count = 0
+        if blast_radius and accepted_count > 2:
+            items.append(f"{n}. **Audit Access Logs**: Review server logs for unauthorized access using this credential.")
+            n += 1
+
+        if isinstance(metadata, dict) and metadata.get("cors_permissive"):
+            items.append(f"{n}. **CORS Policy**: Tighten CORS headers to prevent cross-origin credential harvesting.")
+            n += 1
+
+        if isinstance(metadata, dict) and metadata.get("cache_permissive"):
+            items.append(f"{n}. **Cache Control**: Add Cache-Control: no-store to responses containing credentials.")
+
+        return "#### Remediation Plan\n\n" + "\n".join(items)
+
+    def _build_secret_exposure_evidence_pack(self, finding: dict[str, Any]) -> dict[str, Any] | None:
+        if finding.get("attack_class") != "sensitive_exposure":
+            return None
+        metadata = finding.get("metadata") or {}
+        secret_meta = self._parse_secret_metadata(str(finding.get("evidence_notes", "")))
+        blast_radius = self._secret_blast_radius_for_finding(finding)
+        priv = metadata.get("privilege_fingerprint") if isinstance(metadata, dict) else None
+        lifecycle: dict[str, Any] | None = None
+        if secret_meta:
+            lifecycle = {
+                "ttl_bucket": secret_meta.get("ttl_bucket"),
+                "active_during_scan": secret_meta.get("active_during_scan"),
+                "guidance": self._lifecycle_guidance(secret_meta),
+            }
+        return {
+            "secret_properties": secret_meta,
+            "blast_radius": blast_radius,
+            "privilege_fingerprint": priv,
+            "lifecycle": lifecycle,
+            "severity_factors": self._severity_factors_for_finding(finding),
+            "leak_source": metadata.get("leak_source") if isinstance(metadata, dict) else None,
+            "remediation_priority": self._remediation_priority(str(finding.get("severity", "")), metadata),
+        }
+
+    def _truncate_markdown_cell(self, value: str, limit: int) -> str:
+        if len(value) <= limit:
+            return value
+        return f"{value[: limit - 3]}..."
+
+    def generate_untested_classes_section(self, scan_config: dict, skipped_rules: list[str]) -> str:
+        _ = scan_config
+        lines: list[str] = [
+            "## Untested Attack Classes (Require Authentication)",
+            "| Attack Class | Why Skipped | How to Enable |",
+            "|---|---|---|",
+        ]
+        for rule_name in skipped_rules:
+            description = _UNTESTED_CLASS_DESCRIPTIONS.get(rule_name, _DEFAULT_UNTESTED_REASON)
+            lines.append(f"| {rule_name} | {description} | Provide credentials or session cookies |")
+        return "\n".join(lines)
+
+    def calculate_unauth_coverage(self, all_rules: list, active_rules: list) -> float:
+        if not all_rules:
+            return 0.0
+        return (len(active_rules) / len(all_rules)) * 100.0
+
+    def _normalize_rule_list(self, raw_rules: Any) -> list[str]:
+        if not isinstance(raw_rules, list):
+            return []
+        normalized: list[str] = []
+        for item in raw_rules:
+            if item is None:
+                continue
+            item_text = str(item).strip()
+            if item_text:
+                normalized.append(item_text)
+        return normalized
+
+    def _resolve_unauth_rule_sets(self) -> tuple[list[str], list[str], list[str]]:
+        try:
+            from execution_plane.planner.planner import AttackPlanner
+        except Exception:
+            return [], [], []
+        planner = AttackPlanner()
+        all_rules: list[str] = []
+        active_rules: list[str] = []
+        skipped_rules: list[str] = []
+        for rule in planner.rules:
+            name = str(getattr(rule, "name", "")).strip()
+            if not name:
+                continue
+            all_rules.append(name)
+            if bool(getattr(rule, "requires_auth", False)):
+                skipped_rules.append(name)
+            else:
+                active_rules.append(name)
+        return all_rules, active_rules, skipped_rules

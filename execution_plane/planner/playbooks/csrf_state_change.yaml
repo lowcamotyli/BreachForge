@@ -1,0 +1,39 @@
+id: csrf_state_change
+attack_class: csrf
+preconditions:
+  methods: ["POST", "PUT", "PATCH", "DELETE"]
+steps:
+  - id: baseline
+    action: capture_state_changing_baseline
+    identity_selector: primary
+    probe_template:
+      mode: observe
+      template: state_changing_request_baseline
+      allowed_methods: ["POST", "PUT", "PATCH", "DELETE"]
+    expected_signal: baseline state-changing request with normal headers
+    observe_only: true
+    max_attempts: 1
+  - id: csrf_probe
+    action: send_state_changing_without_origin_referer
+    identity_selector: none
+    safe_fixture_required: true
+    probe_template:
+      mode: bounded_probe
+      template: state_changing_request_stripped_headers
+      allowed_methods: ["POST", "PUT", "PATCH", "DELETE"]
+      variables:
+        strip_headers: ["Origin", "Referer"]
+        omit_csrf_guard: true
+    expected_signal: state-changing request without Origin/Referer accepted with 2xx response
+    validator: csrf_no_guard_validator
+    max_attempts: 1
+validators:
+  csrf_no_guard_validator:
+    signal: 2xx_without_origin_referer
+safety_budget:
+  max_requests: 2
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default
+  safe_fixture_required: true

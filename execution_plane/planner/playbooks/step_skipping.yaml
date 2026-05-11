@@ -1,0 +1,48 @@
+id: step_skipping
+attack_class: workflow_abuse
+preconditions:
+  methods:
+    - GET
+    - POST
+  workflow_markers:
+    - confirm
+    - complete
+    - checkout
+    - finalize
+  requires_intermediate_state: true
+steps:
+  - id: map_required_state
+    action: observe_required_intermediate_state
+    identity_selector: anonymous
+    probe_template:
+      mode: observe
+      template: map_required_state_before_final_action
+    expected_signal: required intermediate workflow state is visible or inferable
+    max_attempts: 1
+    observe_only: true
+  - id: model_final_action
+    action: observe_final_action_without_state
+    identity_selector: anonymous
+    probe_template:
+      mode: observe
+      template: model_final_action_without_required_state
+    expected_signal: final action appears reachable without required intermediate state
+    max_attempts: 1
+    observe_only: true
+  - id: compare_state_sequence
+    action: compare_workflow_state_sequence
+    identity_selector: anonymous
+    probe_template:
+      mode: observe
+      template: compare_expected_and_observed_state_order
+    expected_signal: observed sequence suggests missing prerequisite enforcement
+    max_attempts: 1
+    observe_only: true
+validators:
+  signal_validator:
+    signal: skipped_intermediate_state
+safety_budget:
+  max_requests: 3
+  scope: current_endpoint
+  rate_limit_rps: 0.5
+  proof_gate: default

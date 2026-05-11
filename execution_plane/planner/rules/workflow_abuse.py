@@ -30,6 +30,7 @@ _FINALIZE_HINTS: tuple[str, ...] = (
 
 
 class WorkflowAbuse(AttackRule):
+    requires_auth = False
     attack_class = "workflow_abuse"
     name = "WorkflowAbuse"
 

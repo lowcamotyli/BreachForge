@@ -1,0 +1,71 @@
+id: ssti
+attack_class: ssti
+preconditions:
+  methods: ["GET", "POST"]
+  parameter_types: ["query", "form", "body"]
+steps:
+  - id: jinja2_probe
+    action: send_ssti_probe
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssti_string_parameter
+      variables:
+        payload: "{{7*7}}"
+    expected_signal: math eval result 49 in response
+    validator: ssti_math_eval_validator
+    max_attempts: 1
+  - id: dollar_probe
+    action: send_ssti_probe
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssti_string_parameter
+      variables:
+        payload: "${7*7}"
+    expected_signal: math eval result 49 in response
+    validator: ssti_math_eval_validator
+    max_attempts: 1
+  - id: erb_probe
+    action: send_ssti_probe
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssti_string_parameter
+      variables:
+        payload: "<%= 7*7 %>"
+    expected_signal: math eval result 49 in response
+    validator: ssti_math_eval_validator
+    max_attempts: 1
+  - id: ruby_probe
+    action: send_ssti_probe
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssti_string_parameter
+      variables:
+        payload: "#{7*7}"
+    expected_signal: math eval result 49 in response
+    validator: ssti_math_eval_validator
+    max_attempts: 1
+  - id: smarty_probe
+    action: send_ssti_probe
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssti_string_parameter
+      variables:
+        payload: "*{7*7}"
+    expected_signal: math eval result 49 in response
+    validator: ssti_math_eval_validator
+    max_attempts: 1
+validators:
+  ssti_math_eval_validator:
+    signal: math_eval_result
+    expected_value: "49"
+safety_budget:
+  max_requests: 5
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

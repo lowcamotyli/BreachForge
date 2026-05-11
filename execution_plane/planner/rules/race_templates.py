@@ -10,6 +10,7 @@ from storage.db.models import AttackTask
 class RaceTemplate(ABC):
     name: str
     description: str
+    requires_auth = False
 
     def __init__(self, scan_id: UUID, endpoint_id: UUID) -> None:
         self._scan_id = scan_id

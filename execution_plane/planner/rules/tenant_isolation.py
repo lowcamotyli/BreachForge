@@ -10,6 +10,7 @@ _PATH_PARAM_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 
 
 class TenantIsolation(AttackRule):
+    requires_auth = False
     attack_class = "tenant_isolation"
     name = "TenantIsolation"
 

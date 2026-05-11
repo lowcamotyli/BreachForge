@@ -11,6 +11,7 @@ _SUPPORTED_LOCATIONS: set[str] = {"path", "query", "body", "json", "form"}
 
 
 class PrivilegeEscalation(AttackRule):
+    requires_auth = False
     attack_class = "privilege_escalation"
     name = "PrivilegeEscalation"
 

@@ -1,0 +1,75 @@
+id: api_doc_exposure
+attack_class: api_doc_exposure
+preconditions:
+  methods: ["GET"]
+  in_scope_only: true
+steps:
+  - id: probe_swagger_json
+    action: probe_api_doc_path
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: api_doc_path_probe
+      allowed_methods: ["GET"]
+      variables:
+        path: "/swagger.json"
+    validator: api_doc_exposure_validator
+    expected_signal: swagger/openapi spec body in response
+    max_attempts: 1
+  - id: probe_openapi_json
+    action: probe_api_doc_path
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: api_doc_path_probe
+      allowed_methods: ["GET"]
+      variables:
+        path: "/openapi.json"
+    validator: api_doc_exposure_validator
+    expected_signal: swagger/openapi spec body in response
+    max_attempts: 1
+  - id: probe_api_docs
+    action: probe_api_doc_path
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: api_doc_path_probe
+      allowed_methods: ["GET"]
+      variables:
+        path: "/api-docs"
+    validator: api_doc_exposure_validator
+    expected_signal: swagger/openapi spec body in response
+    max_attempts: 1
+  - id: probe_swagger_ui
+    action: probe_api_doc_path
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: api_doc_path_probe
+      allowed_methods: ["GET"]
+      variables:
+        path: "/swagger-ui.html"
+    validator: api_doc_exposure_validator
+    expected_signal: swagger UI HTML page served
+    max_attempts: 1
+  - id: probe_api_swagger
+    action: probe_api_doc_path
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: api_doc_path_probe
+      allowed_methods: ["GET"]
+      variables:
+        path: "/api/swagger"
+    validator: api_doc_exposure_validator
+    expected_signal: swagger/openapi spec body in response
+    max_attempts: 1
+validators:
+  api_doc_exposure_validator:
+    signal: api_spec_exposed
+safety_budget:
+  max_requests: 6
+  rate_limit_rps: 0.5
+  scope: target_only
+  read_only: true
+  proof_gate: default

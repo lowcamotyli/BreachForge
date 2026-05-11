@@ -1,0 +1,28 @@
+id: excessive_data_exposure
+attack_class: excessive_exposure
+preconditions:
+  methods: ["GET"]
+  structured_response: true
+steps:
+  - id: response_schema_probe
+    action: observe_response_schema
+    identity_selector: current_user
+    observe_only: true
+    probe_template:
+      mode: observe
+      template: current_endpoint_get
+      allowed_methods: ["GET"]
+      variables:
+        compare_to_openapi_schema: true
+    expected_signal: response contains undocumented or sensitive object properties
+    validator: excessive_exposure_validator
+    max_attempts: 1
+validators:
+  excessive_exposure_validator:
+    signal: sensitive_or_undocumented_response_fields
+safety_budget:
+  max_requests: 1
+  max_attempts_per_step: 1
+  rate_limit_rps: 1.0
+  scope: current_endpoint
+  proof_gate: default

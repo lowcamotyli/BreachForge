@@ -1,0 +1,48 @@
+id: wordlist_forced_browsing
+attack_class: sensitive_exposure
+preconditions:
+  methods:
+    - GET
+  source:
+    - asset_map
+    - js_endpoints
+    - robots_txt
+  in_scope_only: true
+  unauth_compatible: true
+steps:
+  - id: build_context_wordlist
+    action: observe_context_aware_wordlist
+    identity_selector: anonymous_user
+    probe_template:
+      mode: observe
+      template: build_wordlist_from_asset_map_and_js_mining
+    expected_signal: application-specific path candidates identified from JS mining and AssetMap
+    max_attempts: 1
+    observe_only: true
+  - id: probe_wordlist_paths
+    action: observe_forced_path_responses
+    identity_selector: anonymous_user
+    probe_template:
+      mode: observe
+      template: get_each_wordlist_path_read_only
+    expected_signal: unexpected path accessible without authentication
+    max_attempts: 1
+    observe_only: true
+  - id: classify_wordlist_exposure
+    action: observe_forced_browsing_signal
+    identity_selector: anonymous_user
+    probe_template:
+      mode: observe
+      template: classify_unauth_path_access_signal
+    expected_signal: unintended path accessible to unauthenticated user
+    max_attempts: 1
+    observe_only: true
+validators:
+  signal_validator:
+    signal: unintended_direct_path_access
+safety_budget:
+  max_requests: 50
+  scope: target_only
+  rate_limit_rps: 1.0
+  proof_gate: default
+  bounded_path_budget: true

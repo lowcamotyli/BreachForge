@@ -7,7 +7,7 @@ Ten sprint odpowiada klientowi na pytanie: "czy rotacja/revocation jest pilna i 
 ### Architektura - dokumenty referencyjne
 
 ```bash
-DAD_PROMPT="Read /mnt/d/SimpliAppSec/docs/architecture/security-constraints.md and auth-architecture.md. Extract constraints for token lifecycle, credential purge, and safe delayed checks. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
+DAD_PROMPT="Read /mnt/d/BreachForge/docs/architecture/security-constraints.md and auth-architecture.md. Extract constraints for token lifecycle, credential purge, and safe delayed checks. Bullets. Max 25 lines." bash ~/.claude/scripts/dad-exec.sh
 ```
 
 ### Workstream A - TTL & Expiration

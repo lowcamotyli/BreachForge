@@ -1,0 +1,38 @@
+id: oauth_state_csrf
+attack_class: oauth_state_csrf
+preconditions:
+  methods: ["GET", "POST"]
+  path_contains_any: ["/oauth", "/authorize", "/authorization"]
+  parameter_name_contains_any: ["state", "response_type", "redirect_uri"]
+steps:
+  - id: baseline_with_state
+    action: capture_oauth_authorization_baseline
+    identity_selector: none
+    probe_template:
+      mode: observe
+      template: oauth_authorization_with_state
+      allowed_methods: ["GET", "POST"]
+    expected_signal: authorization flow baseline includes state parameter
+    observe_only: true
+    max_attempts: 1
+  - id: omit_state
+    action: send_oauth_authorization_without_state
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: oauth_authorization_without_state
+      allowed_methods: ["GET", "POST"]
+      variables:
+        state_omitted: true
+    expected_signal: authorization request without state is accepted with code or token response
+    validator: oauth_state_csrf_validator
+    max_attempts: 1
+validators:
+  oauth_state_csrf_validator:
+    signal: missing_state_accepted
+safety_budget:
+  max_requests: 2
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

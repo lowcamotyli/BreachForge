@@ -10,6 +10,7 @@ _AUTH_HEADER_NAMES: set[str] = {"authorization", "cookie", "x-api-key", "x-auth-
 
 
 class SessionMisuseRule(AttackRule):
+    requires_auth = False
     attack_class = "session_misuse"
     name = "SessionMisuseRule"
 

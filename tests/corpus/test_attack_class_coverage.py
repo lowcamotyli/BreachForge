@@ -37,6 +37,7 @@ _extend_execution_plane_package_paths()
 
 from execution_plane.planner.rules.auth_bypass import AuthBypass
 from execution_plane.planner.rules.base import AttackRule, ScanContext
+from execution_plane.planner.rules.bfla import BflaRule
 from execution_plane.planner.rules.bola import BolaBidirectional
 from execution_plane.planner.rules.injection import InjectionSql
 from execution_plane.planner.rules.misconfiguration import MisconfigurationRule
@@ -47,6 +48,7 @@ from execution_plane.planner.rules.session_misuse import SessionMisuseRule
 from execution_plane.planner.rules.tenant_isolation import TenantIsolation
 from execution_plane.planner.rules.workflow_abuse import WorkflowAbuse
 from execution_plane.validator.strategies.auth_bypass import AuthBypassStrategy
+from execution_plane.validator.strategies.bfla import BflaStrategy
 from execution_plane.validator.strategies.bola import BolaStrategy
 from execution_plane.validator.strategies.injection import InjectionStrategy
 from execution_plane.validator.strategies.misconfiguration import MisconfigurationStrategy
@@ -87,6 +89,15 @@ def _build_context(endpoints: list[Endpoint]) -> ScanContext:
 
 
 def _rule_case(rule: AttackRule) -> tuple[Endpoint, list[Endpoint]]:
+    if isinstance(rule, BflaRule):
+        endpoint = _build_endpoint(
+            method="GET",
+            auth_required=True,
+            url_pattern="/api/admin/users",
+            parameters=[],
+        )
+        return endpoint, [endpoint]
+
     if isinstance(rule, BolaBidirectional):
         endpoint = _build_endpoint(
             method="GET",
@@ -187,8 +198,9 @@ def _rule_case(rule: AttackRule) -> tuple[Endpoint, list[Endpoint]]:
     raise AssertionError(f"Unhandled rule type: {type(rule).__name__}")
 
 
-def test_all_10_attack_classes_have_rules() -> None:
+def test_all_attack_classes_have_rules() -> None:
     rules: list[AttackRule] = [
+        BflaRule(),
         BolaBidirectional(),
         TenantIsolation(),
         AuthBypass(),
@@ -215,8 +227,9 @@ def test_all_10_attack_classes_have_rules() -> None:
         assert all(task.attack_class == rule.attack_class for task in tasks)
 
 
-def test_all_10_attack_classes_have_strategies() -> None:
+def test_all_attack_classes_have_strategies() -> None:
     strategy_cases = [
+        (BflaStrategy(), "bfla"),
         (BolaStrategy(), "bola"),
         (TenantIsolationStrategy(), "tenant_isolation"),
         (AuthBypassStrategy(), "auth_bypass"),

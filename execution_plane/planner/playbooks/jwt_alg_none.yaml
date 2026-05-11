@@ -1,0 +1,51 @@
+{
+  "id": "jwt_alg_none",
+  "attack_class": "jwt_attack",
+  "preconditions": {
+    "methods": ["GET", "POST"],
+    "auth_required": true,
+    "auth_scheme": "bearer"
+  },
+  "steps": [
+    {
+      "id": "baseline_authenticated",
+      "action": "capture_authenticated_baseline",
+      "identity_selector": "current_user",
+      "probe_template": {
+        "mode": "observe",
+        "template": "send_with_valid_token",
+        "allowed_methods": ["GET"]
+      },
+      "expected_signal": "authenticated baseline 200 response captured",
+      "observe_only": true,
+      "max_attempts": 1
+    },
+    {
+      "id": "alg_none_probe",
+      "action": "send_alg_none_token",
+      "identity_selector": "none",
+      "probe_template": {
+        "mode": "bounded_probe",
+        "template": "jwt_mutate_alg_none",
+        "allowed_methods": ["GET"],
+        "variables": {
+          "alg": "none",
+          "signature": ""
+        }
+      },
+      "expected_signal": "server returns 200 with alg:none token indicating missing signature validation",
+      "validator": "alg_none_validator",
+      "max_attempts": 1
+    }
+  ],
+  "validators": {
+    "alg_none_validator": {"signal": "alg_none_accepted"}
+  },
+  "safety_budget": {
+    "max_requests": 2,
+    "max_attempts_per_step": 1,
+    "rate_limit_rps": 0.5,
+    "scope": "current_endpoint",
+    "proof_gate": "default"
+  }
+}

@@ -1,0 +1,48 @@
+id: replay_state_change
+attack_class: workflow_abuse
+preconditions:
+  methods:
+    - POST
+    - PUT
+    - PATCH
+  state_markers:
+    - complete
+    - cancel
+    - logout
+  requires_prior_state_change: true
+steps:
+  - id: observe_original_transition
+    action: observe_original_state_change
+    identity_selector: anonymous
+    probe_template:
+      mode: observe
+      template: capture_state_transition_shape
+    expected_signal: state-changing request shape is identified without execution
+    max_attempts: 1
+    observe_only: true
+  - id: observe_terminal_state
+    action: observe_terminal_state
+    identity_selector: anonymous
+    probe_template:
+      mode: observe
+      template: confirm_complete_cancel_or_logout_state
+    expected_signal: workflow reaches a terminal or invalidating state
+    max_attempts: 1
+    observe_only: true
+  - id: model_replay_after_terminal
+    action: replay_state_change_observation
+    identity_selector: anonymous
+    probe_template:
+      mode: observe
+      template: model_replay_after_terminal_state
+    expected_signal: repeated request appears accepted or not clearly rejected after terminal state
+    max_attempts: 1
+    observe_only: true
+validators:
+  signal_validator:
+    signal: replay_after_terminal_state
+safety_budget:
+  max_requests: 3
+  scope: current_endpoint
+  rate_limit_rps: 0.5
+  proof_gate: default

@@ -1,0 +1,58 @@
+id: oauth_redirect_manipulation
+attack_class: oauth_redirect
+preconditions:
+  methods: ["GET", "POST"]
+  path_contains_any: ["/oauth", "/authorize", "/callback"]
+  parameter_name_contains_any: ["redirect_uri", "redirect", "callback"]
+steps:
+  - id: partial_host_match
+    action: send_oauth_redirect_probe
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: oauth_redirect_uri_mutation
+      allowed_methods: ["GET", "POST"]
+      variables:
+        mutation_pattern: "partial-host-match"
+        manipulated_redirect_host: "example.com.evil.test"
+        controlled_callback_host: "callback.scanner.local"
+    expected_signal: authorization response redirects to manipulated redirect host or returns code material
+    validator: oauth_redirect_validator
+    max_attempts: 1
+  - id: subdomain_confusion
+    action: send_oauth_redirect_probe
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: oauth_redirect_uri_mutation
+      allowed_methods: ["GET", "POST"]
+      variables:
+        mutation_pattern: "subdomain-confusion"
+        manipulated_redirect_host: "evil.example.com"
+        controlled_callback_host: "callback.scanner.local"
+    expected_signal: authorization response redirects to controlled subdomain-shaped host
+    validator: oauth_redirect_validator
+    max_attempts: 1
+  - id: path_traversal
+    action: send_oauth_redirect_probe
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: oauth_redirect_uri_mutation
+      allowed_methods: ["GET", "POST"]
+      variables:
+        mutation_pattern: "path-traversal"
+        redirect_path_suffix: "/callback/../admin"
+        controlled_callback_host: "callback.scanner.local"
+    expected_signal: authorization endpoint accepts traversal-shaped redirect path
+    validator: oauth_redirect_validator
+    max_attempts: 1
+validators:
+  oauth_redirect_validator:
+    signal: manipulated_redirect_accepted
+safety_budget:
+  max_requests: 3
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

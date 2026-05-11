@@ -1,0 +1,29 @@
+id: graphql_query_depth
+attack_class: graphql_depth
+preconditions:
+  methods: ["POST"]
+  path_contains_any: ["/graphql", "/gql"]
+steps:
+  - id: bounded_depth_probe
+    action: send_graphql_fragment_depth_query
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: graphql_depth_query
+      variables:
+        max_depth: 10
+        timeout_seconds: 5
+        read_only: true
+        retry_on_timeout: false
+    expected_signal: depth query times out or returns query complexity guard signal
+    validator: graphql_depth
+    max_attempts: 1
+validators:
+  graphql_depth:
+    signal: timeout_or_complexity_guard
+safety_budget:
+  max_requests: 1
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.5
+  scope: current_endpoint
+  proof_gate: default

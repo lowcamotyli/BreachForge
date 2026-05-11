@@ -7,8 +7,9 @@ import os
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, TypeAlias
 from uuid import UUID
 
 import httpx
@@ -32,7 +33,34 @@ REDACTED_FIELDS = {"authorization", "cookie", "password", "token"}
 
 logger = structlog.get_logger(__name__)
 
-__all__ = ["AuthManager", "IdentityRole", "IdentityContext", "SessionSnapshot"]
+__all__ = [
+    "AuthManager",
+    "BrowserSessionImporter",
+    "IdentityRole",
+    "IdentityContext",
+    "IdentityProfile",
+    "IdentityMatrix",
+    "SessionSnapshot",
+]
+
+AUTH_STATE_VALUES = {"active", "expired", "none"}
+
+
+@dataclass(slots=True)
+class IdentityProfile:
+    name: str
+    role: str | None
+    tenant: str | None
+    auth_state: Literal["active", "expired", "none"]
+    privilege_hint: str | None
+    session_ref: str | None
+
+    def __post_init__(self) -> None:
+        if self.auth_state not in AUTH_STATE_VALUES:
+            raise ValueError(f"Invalid auth_state: {self.auth_state}")
+
+
+IdentityMatrix: TypeAlias = dict[str, IdentityProfile]
 
 
 class AuthPauseRequiredError(RuntimeError):
@@ -41,12 +69,141 @@ class AuthPauseRequiredError(RuntimeError):
 
 @dataclass(slots=True)
 class SessionSnapshot:
-    scan_id: UUID
-    cookies: list[dict[str, Any]]
-    auth_headers: dict[str, str]
-    csrf_tokens: dict[str, str]
-    captured_at: datetime
+    scan_id: UUID | None = None
+    cookies: list[dict[str, Any]] | dict[str, str] = None
+    auth_headers: dict[str, str] = None
+    csrf_tokens: dict[str, str] = None
+    captured_at: datetime = None
     expires_at: datetime | None = None
+    url: str = ""
+    domain: str = ""
+    local_storage: dict[str, str] = None
+    session_storage: dict[str, str] = None
+    cookie_count: int = 0
+    has_auth_token: bool = False
+
+    def __post_init__(self) -> None:
+        if self.cookies is None:
+            self.cookies = []
+        if self.auth_headers is None:
+            self.auth_headers = {}
+        if self.csrf_tokens is None:
+            self.csrf_tokens = {}
+        if self.captured_at is None:
+            self.captured_at = datetime.now(UTC)
+        if self.local_storage is None:
+            self.local_storage = {}
+        if self.session_storage is None:
+            self.session_storage = {}
+
+
+class BrowserSessionImporter:
+    async def import_from_browser(self, url: str, wait_seconds: int = 5) -> SessionSnapshot:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=False)
+            context = await browser.new_context()
+            page = await context.new_page()
+
+            await page.goto(url)
+            await page.wait_for_timeout(max(wait_seconds, 0) * 1000)
+
+            cookies_raw = await context.cookies()
+            local_storage_raw = await page.evaluate(
+                """
+                () => {
+                    const out = {};
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const key = localStorage.key(i);
+                        if (!key) continue;
+                        const value = localStorage.getItem(key);
+                        if (value !== null) out[key] = value;
+                    }
+                    return out;
+                }
+                """
+            )
+            session_storage_raw = await page.evaluate(
+                """
+                () => {
+                    const out = {};
+                    for (let i = 0; i < sessionStorage.length; i++) {
+                        const key = sessionStorage.key(i);
+                        if (!key) continue;
+                        const value = sessionStorage.getItem(key);
+                        if (value !== null) out[key] = value;
+                    }
+                    return out;
+                }
+                """
+            )
+
+            await browser.close()
+
+        cookie_map: dict[str, str] = {}
+        for cookie in cookies_raw:
+            name = cookie.get("name")
+            value = cookie.get("value")
+            if isinstance(name, str) and isinstance(value, str):
+                cookie_map[name] = value
+
+        local_storage: dict[str, str] = {}
+        if isinstance(local_storage_raw, dict):
+            for key, value in local_storage_raw.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    local_storage[key] = value
+
+        session_storage: dict[str, str] = {}
+        if isinstance(session_storage_raw, dict):
+            for key, value in session_storage_raw.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    session_storage[key] = value
+
+        has_auth_token = any(
+            any(marker in cookie_name.lower() for marker in ("session", "token", "auth", "jwt", "sid"))
+            for cookie_name in cookie_map
+        )
+
+        parsed = urlparse(url)
+        return SessionSnapshot(
+            scan_id=None,
+            url=url,
+            domain=parsed.netloc,
+            cookies=cookie_map,
+            local_storage=local_storage,
+            session_storage=session_storage,
+            auth_headers={},
+            csrf_tokens={},
+            cookie_count=len(cookie_map),
+            has_auth_token=has_auth_token,
+            captured_at=datetime.now(UTC),
+            expires_at=None,
+        )
+
+    async def check_session_health(self, snapshot: SessionSnapshot, test_endpoints: list[str]) -> dict[str, bool | str]:
+        if not test_endpoints:
+            return {"warning": "no_test_endpoints_provided"}
+
+        cookies = snapshot.cookies if isinstance(snapshot.cookies, dict) else {}
+        results: dict[str, bool | str] = {}
+        unauthorized_count = 0
+
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            for endpoint in test_endpoints:
+                try:
+                    response = await client.get(endpoint, cookies=cookies)
+                except httpx.HTTPError:
+                    results[endpoint] = False
+                    continue
+
+                is_authenticated = response.status_code not in {401, 403}
+                results[endpoint] = is_authenticated
+                if response.status_code in {401, 403}:
+                    unauthorized_count += 1
+
+        if unauthorized_count == len(test_endpoints):
+            results["warning"] = "all_test_endpoints_returned_401_or_403_scan_continues_unauthenticated"
+
+        return results
 
 
 class IdentityRole(str, Enum):
@@ -176,6 +333,28 @@ class AuthManager:
             if self._session_snapshot is None:
                 raise RuntimeError("Session snapshot is not initialized")
             return deepcopy(self._session_snapshot)
+
+    async def health_check(self) -> bool:
+        try:
+            ok = await self._probe_authenticated_endpoint()
+        except Exception:
+            await self._pause_with_error("auth_expired:health_check_failed")
+            return False
+
+        if ok:
+            return True
+
+        try:
+            refreshed = await self._attempt_refresh()
+        except Exception:
+            await self._pause_with_error("auth_expired:refresh_failed")
+            return False
+
+        if refreshed:
+            return True
+
+        await self._pause_with_error("auth_expired")
+        return False
 
     async def get_identity_context(self, scan_id: UUID, role: IdentityRole | str) -> IdentityContext:
         if scan_id != self._scan_id:

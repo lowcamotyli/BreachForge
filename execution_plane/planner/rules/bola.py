@@ -11,6 +11,7 @@ _SUPPORTED_LOCATIONS: set[str] = {"path", "query", "body", "form", "json"}
 
 
 class BolaBidirectional(AttackRule):
+    requires_auth = False
     attack_class = "bola"
     name = "BolaBidirectional"
 
@@ -18,7 +19,6 @@ class BolaBidirectional(AttackRule):
         del asset_map
         return (
             endpoint.method.upper() == "GET"
-            and endpoint.auth_required
             and bool(self._id_parameters(endpoint))
         )
 

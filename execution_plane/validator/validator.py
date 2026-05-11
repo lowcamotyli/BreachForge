@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 from datetime import UTC, datetime
@@ -15,14 +16,70 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from execution_plane.validator.strategies.auth_bypass import AuthBypassStrategy
 from execution_plane.validator.strategies.base import ValidationStrategy
+from execution_plane.validator.strategies.bfla import BflaStrategy
 from execution_plane.validator.strategies.bola import BolaStrategy
+from execution_plane.validator.strategies.graphql import (
+    GraphqlBatchStrategy,
+    GraphqlDepthStrategy,
+    GraphqlFieldSuggestionStrategy,
+    GraphqlIntrospectionStrategy,
+)
 from execution_plane.validator.strategies.injection import InjectionStrategy
 from execution_plane.validator.strategies.misconfiguration import MisconfigurationStrategy
+from execution_plane.validator.strategies.oauth import (
+    OauthErrorDisclosureStrategy,
+    OauthRedirectStrategy,
+    OauthStateCsrfStrategy,
+    OauthTokenReuseStrategy,
+)
 from execution_plane.validator.strategies.privilege_escalation import PrivilegeEscalationStrategy
 from execution_plane.validator.strategies.rate_limit_abuse import RateLimitAbuseStrategy
 from execution_plane.validator.strategies.session_misuse import SessionMisuseStrategy
 from execution_plane.validator.strategies.sensitive_exposure import SensitiveExposureStrategy
+from execution_plane.validator.strategies.jwt_attack import JwtAttackStrategy
+from execution_plane.validator.strategies.mass_assignment import ExcessiveExposureStrategy, MassAssignmentStrategy
+from execution_plane.validator.strategies.ssrf import SsrfStrategy
 from execution_plane.validator.strategies.workflow_abuse import WorkflowAbuseStrategy
+from execution_plane.validator.strategies.nosql_injection import NoSqlInjectionStrategy
+from execution_plane.validator.strategies.ssti import SstiStrategy
+from execution_plane.validator.strategies.advanced_injection import (
+    LdapInjectionStrategy,
+    XpathInjectionStrategy,
+    HeaderInjectionStrategy,
+)
+from execution_plane.validator.strategies.xxe import XxeClassicStrategy, XxeErrorStrategy, XxeBlindStrategy
+from execution_plane.validator.strategies.deserialization import DeserializationProbeStrategy, YamlDeserializationStrategy
+from execution_plane.validator.strategies.http_smuggling import (
+    HttpSmugglingStrategy,
+    HttpMethodOverrideStrategy,
+    HttpParameterPollutionStrategy,
+)
+from execution_plane.validator.strategies.cache_poisoning import CachePoisoningStrategy, WebCacheDeceptionStrategy
+from execution_plane.validator.strategies.cookie_analysis import CookieAnalysisStrategy
+from execution_plane.validator.strategies.api_inventory import (
+    ApiInventoryStrategy,
+    ApiDocExposureStrategy,
+    BackupFileExposureStrategy,
+)
+from execution_plane.validator.strategies.csrf import CsrfStrategy
+from execution_plane.validator.strategies.business_logic_advanced import (
+    NegativeValueStrategy,
+    IntegerOverflowStrategy,
+    PriceManipulationStrategy,
+    AccountEnumerationTimingStrategy,
+    InventoryReservationStrategy,
+)
+from execution_plane.validator.strategies.security_headers import (
+    SecurityHeadersStrategy,
+    CorsAnalysisStrategy,
+    TlsAnalysisStrategy,
+)
+from execution_plane.validator.strategies.race_advanced import (
+    LimitOverrideRaceStrategy,
+    DoubleSpendStrategy,
+    IdempotencyBypassStrategy,
+    DistributedLockEvasionStrategy,
+)
 from execution_plane.validator.state_diff import compute_diff
 from storage.db.models import AttackTask, ProofArtifact, RawProbe
 from storage.db.session import AsyncSessionLocal
@@ -52,12 +109,50 @@ SUPPORTED_ATTACK_CLASSES: set[str] = {
     "session_misuse",
     "rate_limit_abuse",
     "misconfiguration",
+    "jwt_attack",
+    "ssrf",
+    "mass_assignment",
+    "excessive_exposure",
+    "bfla",
+    "graphql_introspection",
+    "graphql_batch",
+    "graphql_field_suggestion",
+    "graphql_depth",
+    "oauth_redirect",
+    "oauth_state_csrf",
+    "oauth_token_reuse",
+    "oauth_error_disclosure",
+    "xxe_classic",
+    "xxe_error",
+    "xxe_blind",
+    "deserialization_probe",
+    "yaml_deserialization",
+    "http_smuggling",
+    "web_cache_deception",
+    "cache_poisoning",
+    "http_method_override",
+    "http_parameter_pollution",
+    "cookie_analysis",
+    "csrf",
+    "negative_value",
+    "integer_overflow",
+    "price_manipulation",
+    "account_enumeration_timing",
+    "inventory_reservation",
+    "security_headers",
+    "cors_analysis",
+    "tls_analysis",
 }
 
 
 class _BolaStrategy(BolaStrategy):
     def expected_attack_class(self) -> str:
         return "bola"
+
+
+class _BflaStrategy(BflaStrategy):
+    def expected_attack_class(self) -> str:
+        return "bfla"
 
 
 class _TenantIsolationStrategy(_TenantIsolationStrategyBase):
@@ -103,6 +198,191 @@ class _RateLimitAbuseStrategy(RateLimitAbuseStrategy):
 class _MisconfigurationStrategy(MisconfigurationStrategy):
     def expected_attack_class(self) -> str:
         return "misconfiguration"
+
+
+class _JwtAttackStrategy(JwtAttackStrategy):
+    def expected_attack_class(self) -> str:
+        return "jwt_attack"
+
+
+class _SsrfStrategy(SsrfStrategy):
+    def expected_attack_class(self) -> str:
+        return "ssrf"
+
+
+class _MassAssignmentStrategy(MassAssignmentStrategy):
+    def expected_attack_class(self) -> str:
+        return "mass_assignment"
+
+
+class _ExcessiveExposureStrategy(ExcessiveExposureStrategy):
+    def expected_attack_class(self) -> str:
+        return "excessive_exposure"
+
+
+class _GraphqlIntrospectionStrategy(GraphqlIntrospectionStrategy):
+    def expected_attack_class(self) -> str:
+        return "graphql_introspection"
+
+
+class _GraphqlBatchStrategy(GraphqlBatchStrategy):
+    def expected_attack_class(self) -> str:
+        return "graphql_batch"
+
+
+class _GraphqlFieldSuggestionStrategy(GraphqlFieldSuggestionStrategy):
+    def expected_attack_class(self) -> str:
+        return "graphql_field_suggestion"
+
+
+class _GraphqlDepthStrategy(GraphqlDepthStrategy):
+    def expected_attack_class(self) -> str:
+        return "graphql_depth"
+
+
+class _OauthRedirectStrategy(OauthRedirectStrategy):
+    def expected_attack_class(self) -> str:
+        return "oauth_redirect"
+
+
+class _OauthStateCsrfStrategy(OauthStateCsrfStrategy):
+    def expected_attack_class(self) -> str:
+        return "oauth_state_csrf"
+
+
+class _OauthTokenReuseStrategy(OauthTokenReuseStrategy):
+    def expected_attack_class(self) -> str:
+        return "oauth_token_reuse"
+
+
+class _OauthErrorDisclosureStrategy(OauthErrorDisclosureStrategy):
+    def expected_attack_class(self) -> str:
+        return "oauth_error_disclosure"
+
+
+class _NoSqlInjectionStrategy(NoSqlInjectionStrategy):
+    def expected_attack_class(self) -> str:
+        return "nosql_injection"
+
+
+class _SstiStrategy(SstiStrategy):
+    def expected_attack_class(self) -> str:
+        return "ssti"
+
+
+class _LdapInjectionStrategy(LdapInjectionStrategy):
+    def expected_attack_class(self) -> str:
+        return "ldap_injection"
+
+
+class _XpathInjectionStrategy(XpathInjectionStrategy):
+    def expected_attack_class(self) -> str:
+        return "xpath_injection"
+
+
+class _HeaderInjectionStrategy(HeaderInjectionStrategy):
+    def expected_attack_class(self) -> str:
+        return "header_injection"
+
+
+class _XxeClassicStrategy(XxeClassicStrategy):
+    def expected_attack_class(self) -> str:
+        return "xxe_classic"
+
+
+class _XxeErrorStrategy(XxeErrorStrategy):
+    def expected_attack_class(self) -> str:
+        return "xxe_error"
+
+
+class _XxeBlindStrategy(XxeBlindStrategy):
+    def expected_attack_class(self) -> str:
+        return "xxe_blind"
+
+
+class _DeserializationProbeStrategy(DeserializationProbeStrategy):
+    def expected_attack_class(self) -> str:
+        return "deserialization_probe"
+
+
+class _YamlDeserializationStrategy(YamlDeserializationStrategy):
+    def expected_attack_class(self) -> str:
+        return "yaml_deserialization"
+
+
+class _HttpSmugglingStrategy(HttpSmugglingStrategy):
+    def expected_attack_class(self) -> str:
+        return "http_smuggling"
+
+
+class _WebCacheDeceptionStrategy(WebCacheDeceptionStrategy):
+    def expected_attack_class(self) -> str:
+        return "web_cache_deception"
+
+
+class _CachePoisoningStrategy(CachePoisoningStrategy):
+    def expected_attack_class(self) -> str:
+        return "cache_poisoning"
+
+
+class _HttpMethodOverrideStrategy(HttpMethodOverrideStrategy):
+    def expected_attack_class(self) -> str:
+        return "http_method_override"
+
+
+class _HttpParameterPollutionStrategy(HttpParameterPollutionStrategy):
+    def expected_attack_class(self) -> str:
+        return "http_parameter_pollution"
+
+
+class _CookieAnalysisStrategy(CookieAnalysisStrategy):
+    def expected_attack_class(self) -> str:
+        return "cookie_analysis"
+
+
+class _CsrfStrategy(CsrfStrategy):
+    def expected_attack_class(self) -> str:
+        return "csrf"
+
+
+class _NegativeValueStrategy(NegativeValueStrategy):
+    def expected_attack_class(self) -> str:
+        return "negative_value"
+
+
+class _IntegerOverflowStrategy(IntegerOverflowStrategy):
+    def expected_attack_class(self) -> str:
+        return "integer_overflow"
+
+
+class _PriceManipulationStrategy(PriceManipulationStrategy):
+    def expected_attack_class(self) -> str:
+        return "price_manipulation"
+
+
+class _AccountEnumerationTimingStrategy(AccountEnumerationTimingStrategy):
+    def expected_attack_class(self) -> str:
+        return "account_enumeration_timing"
+
+
+class _InventoryReservationStrategy(InventoryReservationStrategy):
+    def expected_attack_class(self) -> str:
+        return "inventory_reservation"
+
+
+class _SecurityHeadersStrategy(SecurityHeadersStrategy):
+    def expected_attack_class(self) -> str:
+        return "security_headers"
+
+
+class _CorsAnalysisStrategy(CorsAnalysisStrategy):
+    def expected_attack_class(self) -> str:
+        return "cors_analysis"
+
+
+class _TlsAnalysisStrategy(TlsAnalysisStrategy):
+    def expected_attack_class(self) -> str:
+        return "tls_analysis"
 
 
 class ExploitValidator:
@@ -202,7 +482,7 @@ class ExploitValidator:
             return
 
         control_probe = self._resolve_control_probe(attack_probe)
-        artifact = self.validate(strategy=strategy, attack_probe=attack_probe, control_probe=control_probe)
+        artifact = await self.validate(strategy=strategy, attack_probe=attack_probe, control_probe=control_probe)
         estimated_confidence = self._estimate_confidence(
             strategy=strategy,
             attack_probe=attack_probe,
@@ -280,7 +560,7 @@ class ExploitValidator:
             confidence=artifact.confidence_score,
         )
 
-    def validate(
+    async def validate(
         self,
         strategy: ValidationStrategy,
         attack_probe: RawProbe,
@@ -289,7 +569,12 @@ class ExploitValidator:
         before_snapshot: StateSnapshot | None = None,
         after_snapshot: StateSnapshot | None = None,
     ) -> ProofArtifact | None:
-        artifact = strategy.validate(attack_probe=attack_probe, control_probe=control_probe)
+        artifact_or_awaitable = strategy.validate(attack_probe=attack_probe, control_probe=control_probe)
+        artifact = (
+            await artifact_or_awaitable
+            if inspect.isawaitable(artifact_or_awaitable)
+            else artifact_or_awaitable
+        )
         if artifact is None:
             return None
 
@@ -396,6 +681,7 @@ class ExploitValidator:
     def _default_strategies(self) -> dict[str, ValidationStrategy]:
         return {
             "bola": _BolaStrategy(),
+            "bfla": _BflaStrategy(),
             "tenant_isolation": _TenantIsolationStrategy(),
             "auth_bypass": _AuthBypassStrategy(),
             "privilege_escalation": _PrivilegeEscalationStrategy(),
@@ -405,6 +691,50 @@ class ExploitValidator:
             "session_misuse": _SessionMisuseStrategy(),
             "rate_limit_abuse": _RateLimitAbuseStrategy(),
             "misconfiguration": _MisconfigurationStrategy(),
+            "jwt_attack": _JwtAttackStrategy(),
+            "ssrf": _SsrfStrategy(),
+            "mass_assignment": _MassAssignmentStrategy(),
+            "excessive_exposure": _ExcessiveExposureStrategy(),
+            "graphql_introspection": _GraphqlIntrospectionStrategy(),
+            "graphql_batch": _GraphqlBatchStrategy(),
+            "graphql_field_suggestion": _GraphqlFieldSuggestionStrategy(),
+            "graphql_depth": _GraphqlDepthStrategy(),
+            "oauth_redirect": _OauthRedirectStrategy(),
+            "oauth_state_csrf": _OauthStateCsrfStrategy(),
+            "oauth_token_reuse": _OauthTokenReuseStrategy(),
+            "oauth_error_disclosure": _OauthErrorDisclosureStrategy(),
+            "nosql_injection": _NoSqlInjectionStrategy(),
+            "ssti": _SstiStrategy(),
+            "ldap_injection": _LdapInjectionStrategy(),
+            "xpath_injection": _XpathInjectionStrategy(),
+            "header_injection": _HeaderInjectionStrategy(),
+            "xxe_classic": _XxeClassicStrategy(),
+            "xxe_error": _XxeErrorStrategy(),
+            "xxe_blind": _XxeBlindStrategy(),
+            "deserialization_probe": _DeserializationProbeStrategy(),
+            "yaml_deserialization": _YamlDeserializationStrategy(),
+            "http_smuggling": _HttpSmugglingStrategy(),
+            "web_cache_deception": _WebCacheDeceptionStrategy(),
+            "cache_poisoning": _CachePoisoningStrategy(),
+            "http_method_override": _HttpMethodOverrideStrategy(),
+            "http_parameter_pollution": _HttpParameterPollutionStrategy(),
+            "cookie_analysis": _CookieAnalysisStrategy(),
+            "csrf": _CsrfStrategy(),
+            "negative_value": _NegativeValueStrategy(),
+            "integer_overflow": _IntegerOverflowStrategy(),
+            "price_manipulation": _PriceManipulationStrategy(),
+            "account_enumeration_timing": _AccountEnumerationTimingStrategy(),
+            "inventory_reservation": _InventoryReservationStrategy(),
+            "api_inventory": ApiInventoryStrategy(),
+            "api_doc_exposure": ApiDocExposureStrategy(),
+            "backup_file_exposure": BackupFileExposureStrategy(),
+            "security_headers": _SecurityHeadersStrategy(),
+            "cors_analysis": _CorsAnalysisStrategy(),
+            "tls_analysis": _TlsAnalysisStrategy(),
+            "limit_override_race": LimitOverrideRaceStrategy(),
+            "double_spend": DoubleSpendStrategy(),
+            "idempotency_bypass": IdempotencyBypassStrategy(),
+            "distributed_lock_evasion": DistributedLockEvasionStrategy(),
         }
 
     def _validate_strategy_registry(self) -> None:

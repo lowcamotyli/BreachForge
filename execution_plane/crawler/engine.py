@@ -14,6 +14,7 @@ from playwright.async_api import Request, Route, async_playwright
 
 from control_plane.auth_manager import SessionSnapshot
 from execution_plane.crawler.asset_map import AssetMap, AssetMapBuilder
+from execution_plane.crawler.js_endpoint_extractor import JsEndpointExtractor
 
 logger = structlog.get_logger(__name__)
 
@@ -62,6 +63,8 @@ class CrawlerReconEngine:
         self._scope_domains = [domain.lower().strip() for domain in scope_domains if domain.strip()]
         self._timeout_seconds = max(timeout_minutes, 1) * 60
         self._asset_map_builder = AssetMapBuilder()
+        self._js_extractor = JsEndpointExtractor()
+        self._js_secret_findings: list[dict[str, Any]] = []
 
     async def run(self) -> AssetMap:
         deadline = time.monotonic() + self._timeout_seconds
@@ -236,7 +239,36 @@ class CrawlerReconEngine:
             try:
                 response = await page.context.request.get(script_src, timeout=3000)
                 if response.ok:
-                    script_snippets.append(await response.text())
+                    js_content = await response.text()
+                    script_snippets.append(js_content)
+                    self._js_secret_findings.extend(
+                        self._js_extractor.extract_secrets(js_content=js_content, source_url=script_src)
+                    )
+                    if urlparse(script_src).path.lower().endswith(".js"):
+                        sourcemap_url = f"{script_src}.map"
+                        try:
+                            sourcemap_response = await page.context.request.get(sourcemap_url, timeout=5000)
+                        except Exception:
+                            sourcemap_response = None
+                        if sourcemap_response is not None and sourcemap_response.status == 200:
+                            route_hints = await self._js_extractor.extract_from_sourcemap(
+                                sourcemap_url=sourcemap_url,
+                                base_url=base_url,
+                            )
+                            for route_hint in route_hints:
+                                resolved_hint = urljoin(base_url, route_hint)
+                                if not self._is_in_scope(resolved_hint):
+                                    continue
+                                self._asset_map_builder.add_endpoint(
+                                    url=self._strip_query(resolved_hint),
+                                    method="GET",
+                                    in_scope=True,
+                                    auth_required=False,
+                                    parameters=self._extract_query_params(resolved_hint),
+                                    source="sourcemap",
+                                    observed_content_type=None,
+                                    example_response_code=None,
+                                )
             except Exception:
                 continue
 
@@ -543,6 +575,8 @@ async def _run_crawler_async(scan_id: str) -> None:
         to_dict_method = getattr(asset_map, "to_dict", None)
         if callable(to_dict_method):
             asset_map_dict = to_dict_method()
+            if isinstance(asset_map_dict, dict):
+                asset_map_dict["js_secret_findings"] = engine._js_secret_findings
         else:
             asset_map_dict = {
                 "target_url": target_url,
@@ -558,6 +592,7 @@ async def _run_crawler_async(scan_id: str) -> None:
                     }
                     for endpoint in asset_map.endpoints
                 ],
+                "js_secret_findings": engine._js_secret_findings,
             }
 
         async with AsyncSessionLocal() as db:

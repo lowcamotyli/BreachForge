@@ -38,10 +38,17 @@ _ATTACK_CLASS_SEQUENCE_PRIORITY: dict[str, int] = {
     "tenant_isolation": 1,
     "auth_bypass": 2,
     "privilege_escalation": 2,
+    "bfla": 2,
     "injection": 3,
     "rate_limit_abuse": 4,
     "misconfiguration": 5,
     "sensitive_exposure": 6,
+    "ssrf": 6,
+    "mass_assignment": 6,
+    "oauth_redirect": 6,
+    "oauth_state_csrf": 6,
+    "oauth_token_reuse": 6,
+    "excessive_exposure": 6,
     "workflow_abuse": 8,
 }
 _UNKNOWN_ATTACK_CLASS_PRIORITY = 7
@@ -71,9 +78,19 @@ class AttackPlanner:
         self._advisory_suggestions: list[dict[str, Any]] = []
         self.state = PlannerState.idle
 
-    def plan(self, context: ScanContext) -> list[AttackTask]:
+    def plan(self, context: ScanContext, unauth_mode: bool = False) -> list[AttackTask]:
         self.state = PlannerState.planning
-        all_tasks = self._generate_candidate_tasks(context)
+        rules = self.rules
+        if unauth_mode:
+            filtered_rules: list[AttackRule] = []
+            for rule in rules:
+                if getattr(rule, "requires_auth", False):
+                    logger.debug("unauth_mode: skipping requires_auth rule", rule=rule.name)
+                    continue
+                filtered_rules.append(rule)
+            rules = filtered_rules
+
+        all_tasks = self._generate_candidate_tasks(context, rules)
         if not all_tasks:
             self.state = PlannerState.idle
             return []
@@ -134,11 +151,12 @@ class AttackPlanner:
         ]
         return self._rank_tasks(graph=graph, tasks=filtered_tasks)
 
-    def _generate_candidate_tasks(self, context: ScanContext) -> list[AttackTask]:
+    def _generate_candidate_tasks(self, context: ScanContext, rules: list[AttackRule] | None = None) -> list[AttackTask]:
         all_tasks: list[AttackTask] = []
+        active_rules = rules or self.rules
         for endpoint in context.asset_map.endpoints:
             endpoint_tasks: list[AttackTask] = []
-            for rule in self.rules:
+            for rule in active_rules:
                 if not rule.matches(endpoint, context.asset_map):
                     continue
                 generated_tasks = rule.generate_tasks(endpoint, context)
@@ -426,6 +444,35 @@ class AttackPlanner:
             self._endpoint_returns_structured_data(endpoint) or self._asset_map_has_secret_modules(context.asset_map)
         ):
             reasons.append("heuristic:structured_or_secret_signal")
+
+        if playbook.attack_class == "ssrf" and self._endpoint_has_parameter_marker(
+            endpoint,
+            ["url", "uri", "endpoint", "callback", "redirect", "webhook", "src", "href", "fetch", "load", "file"],
+        ):
+            reasons.append("heuristic:ssrf_url_accepting_parameter")
+        if playbook.id == "mass_assignment_probe" and method in {"PUT", "PATCH"} and self._endpoint_returns_structured_data(
+            endpoint
+        ):
+            reasons.append("heuristic:structured_write_endpoint")
+        if playbook.id == "bfla_admin_function" and endpoint.auth_required and _contains_any(
+            endpoint.url_pattern,
+            ["/admin", "/internal", "/management", "/superuser", "/ops", "/system"],
+        ):
+            reasons.append("heuristic:admin_function_path")
+        if playbook.id == "bfla_http_verb" and endpoint.auth_required and method in {"DELETE", "PUT", "PATCH"}:
+            reasons.append("heuristic:restricted_mutating_verb")
+        if playbook.id == "excessive_data_exposure" and method == "GET" and self._endpoint_returns_structured_data(
+            endpoint
+        ):
+            reasons.append("heuristic:structured_read_endpoint")
+        if playbook.attack_class in {"oauth_redirect", "oauth_state_csrf", "oauth_token_reuse"} and (
+            _contains_any(endpoint.url_pattern, ["/oauth", "/authorize", "/authorization", "/token", "/logout", "/revoke"])
+            or self._endpoint_has_parameter_marker(
+                endpoint,
+                ["redirect_uri", "state", "response_type", "access_token", "refresh_token", "authorization"],
+            )
+        ):
+            reasons.append("heuristic:oauth_flow_marker")
         return reasons
 
     def _asset_map_playbook_signals(self, asset_map: AssetMap) -> set[str]:
@@ -630,9 +677,10 @@ class AttackPlanner:
             if module_info.name.startswith("_") or module_info.name == "base":
                 continue
             importlib.import_module(f"{rules_package.__name__}.{module_info.name}")
+        _rules_pkg = rules_package.__name__ + "."
         classes: list[type[AttackRule]] = []
         for subclass in _walk_subclasses(AttackRule):
-            if subclass.__module__ == base_rule_module.__name__:
+            if not subclass.__module__.startswith(_rules_pkg):
                 continue
             classes.append(subclass)
         classes.sort(key=lambda rule_class: (rule_class.__module__, rule_class.__name__))

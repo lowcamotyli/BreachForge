@@ -1,0 +1,80 @@
+{
+  "id": "unauth_misconfiguration_full",
+  "attack_class": "misconfiguration",
+  "preconditions": {
+    "auth_required": false,
+    "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    "in_scope_only": true,
+    "unauth_compatible": true
+  },
+  "steps": [
+    {
+      "id": "cors_and_headers_check",
+      "action": "observe_public_cors_and_security_headers",
+      "identity_selector": "anonymous",
+      "probe_template": {
+        "mode": "observe",
+        "template": "check_cors_and_security_headers_read_only",
+        "allowed_methods": ["GET", "HEAD", "OPTIONS"],
+        "variables": {
+          "checks": ["cors_policy", "security_headers"],
+          "read_only": true
+        }
+      },
+      "expected_signal": "public response exposes permissive CORS or missing security headers",
+      "validator": "misconfiguration_signal_validator",
+      "max_attempts": 1,
+      "observe_only": true
+    },
+    {
+      "id": "debug_and_verbose_errors_check",
+      "action": "observe_public_debug_and_verbose_error_surface",
+      "identity_selector": "anonymous",
+      "probe_template": {
+        "mode": "observe",
+        "template": "check_debug_endpoints_and_verbose_errors_read_only",
+        "allowed_methods": ["GET"],
+        "variables": {
+          "checks": ["debug_endpoints", "verbose_errors"],
+          "read_only": true
+        }
+      },
+      "expected_signal": "public endpoint exposes debug surface or verbose error detail",
+      "validator": "misconfiguration_signal_validator",
+      "max_attempts": 1,
+      "observe_only": true
+    },
+    {
+      "id": "dangerous_methods_check",
+      "action": "observe_public_dangerous_http_methods",
+      "identity_selector": "anonymous",
+      "probe_template": {
+        "mode": "observe",
+        "template": "check_allowed_methods_without_state_change",
+        "allowed_methods": ["OPTIONS"],
+        "variables": {
+          "checks": ["dangerous_methods"],
+          "candidate_methods": ["PUT", "PATCH", "DELETE"],
+          "read_only": true
+        }
+      },
+      "expected_signal": "public endpoint advertises dangerous HTTP methods",
+      "validator": "misconfiguration_signal_validator",
+      "max_attempts": 1,
+      "observe_only": true
+    }
+  ],
+  "validators": {
+    "misconfiguration_signal_validator": {
+      "signal": "unauthenticated_misconfiguration_observed"
+    }
+  },
+  "safety_budget": {
+    "max_requests": 3,
+    "max_requests_per_domain": 3,
+    "rate_limit_rps": 0.5,
+    "scope": "target_only",
+    "proof_gate": "default",
+    "read_only": true
+  }
+}

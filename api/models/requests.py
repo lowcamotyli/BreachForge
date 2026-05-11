@@ -15,7 +15,15 @@ class AuthContextCreate(BaseModel):
     login_recipe: dict[str, Any] | None = None
 
 
+class IdentityReference(BaseModel):
+    name: str
+    auth_context: AuthContextCreate
+    role_hint: str | None = None
+
+
 class ScanCreate(BaseModel):
     target_url: str = Field(min_length=1)
     allowed_domains: list[str] | None = None
-    auth_context: AuthContextCreate
+    unauth_mode: bool = False
+    auth_context: AuthContextCreate | None = None
+    identities: list[IdentityReference] | None = None

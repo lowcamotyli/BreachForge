@@ -1,0 +1,65 @@
+id: forced_browsing
+attack_class: sensitive_exposure
+preconditions:
+  methods:
+    - GET
+  source:
+    - asset_map
+    - word_hints
+  in_scope_only: true
+steps:
+  - id: observe_asset_map_paths
+    action: observe_asset_map_high_value_paths
+    identity_selector: current_user
+    probe_template:
+      mode: observe
+      template: select_high_value_paths_from_asset_map
+    expected_signal: in-scope high-value paths are present in discovered assets
+    max_attempts: 1
+    observe_only: true
+  - id: observe_word_hint_paths
+    action: observe_word_hint_path_candidates
+    identity_selector: current_user
+    probe_template:
+      mode: observe
+      template: select_in_scope_paths_from_word_hints
+    expected_signal: word hints identify bounded in-scope path candidates
+    max_attempts: 1
+    observe_only: true
+  - id: observe_anonymous_read_probe
+    action: observe_anonymous_read_probe
+    identity_selector: anonymous_user
+    probe_template:
+      mode: observe
+      template: compare_read_only_response_for_anonymous_identity
+    expected_signal: private or administrative path appears readable anonymously
+    max_attempts: 1
+    observe_only: true
+  - id: observe_low_privilege_read_probe
+    action: observe_low_privilege_read_probe
+    identity_selector: low_privilege_user
+    probe_template:
+      mode: observe
+      template: compare_read_only_response_for_low_privilege_identity
+    expected_signal: private or administrative path appears readable by low privilege identity
+    max_attempts: 1
+    observe_only: true
+  - id: classify_forced_browsing_signal
+    action: observe_forced_browsing_signal
+    identity_selector: current_user
+    probe_template:
+      mode: observe
+      template: classify_read_only_forced_browsing_signal
+    expected_signal: response metadata indicates unintended direct path access
+    max_attempts: 1
+    observe_only: true
+validators:
+  signal_validator:
+    signal: unintended_direct_path_access
+safety_budget:
+  max_requests: 5
+  scope: target_only
+  rate_limit_rps: 0.5
+  proof_gate: default
+  bounded_path_budget: true
+

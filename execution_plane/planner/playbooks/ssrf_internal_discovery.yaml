@@ -1,0 +1,63 @@
+id: ssrf_internal_discovery
+attack_class: ssrf
+preconditions:
+  methods: ["GET", "POST"]
+  parameter_name_contains_any: ["url", "endpoint", "callback", "redirect", "webhook", "src", "href", "fetch", "load"]
+steps:
+  - id: localhost_probe
+    action: send_ssrf_internal_get
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssrf_url_parameter
+      allowed_methods: ["GET"]
+      variables:
+        target: "http://localhost/"
+    expected_signal: internal target produces timing or response delta
+    validator: ssrf_timing_validator
+    max_attempts: 1
+  - id: loopback_probe
+    action: send_ssrf_internal_get
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssrf_url_parameter
+      allowed_methods: ["GET"]
+      variables:
+        target: "http://127.0.0.1/"
+    expected_signal: internal target produces timing or response delta
+    validator: ssrf_timing_validator
+    max_attempts: 1
+  - id: private_10_probe
+    action: send_ssrf_internal_get
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssrf_url_parameter
+      allowed_methods: ["GET"]
+      variables:
+        target: "http://10.0.0.1/"
+    expected_signal: internal target produces timing or response delta
+    validator: ssrf_timing_validator
+    max_attempts: 1
+  - id: private_192_probe
+    action: send_ssrf_internal_get
+    identity_selector: none
+    probe_template:
+      mode: bounded_probe
+      template: ssrf_url_parameter
+      allowed_methods: ["GET"]
+      variables:
+        target: "http://192.168.1.1/"
+    expected_signal: internal target produces timing or response delta
+    validator: ssrf_timing_validator
+    max_attempts: 1
+validators:
+  ssrf_timing_validator:
+    signal: timing_delta
+safety_budget:
+  max_requests: 4
+  max_attempts_per_step: 1
+  rate_limit_rps: 0.3
+  scope: current_endpoint
+  proof_gate: default

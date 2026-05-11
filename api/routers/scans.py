@@ -141,7 +141,11 @@ def _get_auth_bootstrap_queue() -> Queue:
 @router.post("", response_model=ScanResponse, status_code=status.HTTP_201_CREATED)
 async def create_scan(payload: ScanCreate, db: AsyncSession = Depends(get_db)) -> ScanResponse:
     domains = payload.allowed_domains if payload.allowed_domains else [urlparse(payload.target_url).hostname or payload.target_url]
-    target = Target(url=payload.target_url, name=payload.target_url, config={"allowed_domains": domains})
+    target = Target(
+        url=payload.target_url,
+        name=payload.target_url,
+        config={"allowed_domains": domains, "unauth_mode": payload.unauth_mode},
+    )
     db.add(target)
     await db.flush()
 
@@ -149,13 +153,20 @@ async def create_scan(payload: ScanCreate, db: AsyncSession = Depends(get_db)) -
     db.add(scan)
     await db.flush()
 
-    auth_context = AuthContext(
-        scan_id=scan.id,
-        type=payload.auth_context.type,
-        session_snapshot=_build_session_snapshot(payload, scan.id),
-        health={},
-    )
-    db.add(auth_context)
+    auth_context: AuthContext | None = None
+    if payload.auth_context is not None:
+        auth_context = AuthContext(
+            scan_id=scan.id,
+            type=payload.auth_context.type,
+            session_snapshot=_build_session_snapshot(payload, scan.id),
+            health={},
+        )
+        db.add(auth_context)
+    elif not payload.unauth_mode:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="auth_context is required when unauth_mode is False",
+        )
 
     scan.status = ScanStatus.running
     scan.phase = "auth_bootstrap"
@@ -164,15 +175,16 @@ async def create_scan(payload: ScanCreate, db: AsyncSession = Depends(get_db)) -
     await db.refresh(scan)
 
     try:
-        queue = _get_auth_bootstrap_queue()
-        queue.enqueue("control_plane.auth_manager.bootstrap_auth_context", str(scan.id), str(auth_context.id))
-        logger.info(
-            "scan_auth_bootstrap_enqueued",
-            scan_id=str(scan.id),
-            phase=scan.phase,
-            status=_status_value(scan.status),
-            queue=getattr(queue, "name", "auth_bootstrap"),
-        )
+        if auth_context is not None:
+            queue = _get_auth_bootstrap_queue()
+            queue.enqueue("control_plane.auth_manager.bootstrap_auth_context", str(scan.id), str(auth_context.id))
+            logger.info(
+                "scan_auth_bootstrap_enqueued",
+                scan_id=str(scan.id),
+                phase=scan.phase,
+                status=_status_value(scan.status),
+                queue=getattr(queue, "name", "auth_bootstrap"),
+            )
     except Exception as exc:
         logger.exception("auth_bootstrap_enqueue_failed", scan_id=str(scan.id), error=str(exc))
 

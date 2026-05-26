@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import gzip
 import json
+import os
 import re
 import uuid as _uuid_mod
 from datetime import UTC, datetime
@@ -11,7 +12,7 @@ from uuid import UUID
 
 import structlog
 from botocore.exceptions import BotoCoreError, ClientError
-from sqlalchemy import select
+from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -23,7 +24,7 @@ from control_plane.attack_chain_builder import (
     compute_chain_confidence,
     compute_chain_score,
 )
-from storage.db.models import Finding, ProofArtifact, Scan, Severity
+from storage.db.models import AuditEvent, AuditEventType, AttackTask, Finding, ProofArtifact, RawProbe, Scan, Severity
 from storage.evidence.store import EvidenceStore
 
 logger = structlog.get_logger(__name__)
@@ -32,6 +33,10 @@ REDACTED = "[REDACTED]"
 _SENSITIVE_KEY_PATTERN = re.compile(r"authorization|cookie|password|token|secret", re.IGNORECASE)
 _REQUEST_HEADER_SENSITIVE_KEYS: tuple[str, ...] = ("authorization", "cookie", "password", "token", "x-api-key")
 _SAFE_SECRET_METADATA_KEYS: tuple[str, ...] = ("secret_blast_radius", "secret_blast_radius_matrix")
+_SAFE_IDENTITY_KEYS: frozenset[str] = frozenset({"name", "role_hint", "tenant_hint", "identity_labels"})
+_IDENTITY_CREDENTIAL_KEYS: frozenset[str] = frozenset(
+    {"credentials", "cookies", "bearer_token", "password", "token", "secret", "auth_headers"}
+)
 _SENSITIVE_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\bbearer\s+[a-z0-9\-\._~\+/]+=*"),
     re.compile(r"(?i)\beyJ[a-z0-9\-_]+\.[a-z0-9\-_]+(?:\.[a-z0-9\-_]+)?"),
@@ -48,6 +53,17 @@ LEAK_SOURCE_GUIDANCE: dict[str, str] = {
     "response_body": "Sanitize API responses. Ensure secrets are not included in response payloads.",
     "unknown": "Review the endpoint response to identify and remove exposed secrets.",
 }
+BUSINESS_IMPACT_DESCRIPTIONS: dict[str, str] = {
+    "coupon_stacking": "Attacker can apply multiple discount codes to a single order, reducing revenue per transaction.",
+    "negative_quantity": "Attacker can manipulate cart totals to negative values, potentially receiving refunds or credits without valid purchases.",
+    "price_tampering": "Attacker can modify item prices at checkout, purchasing goods below cost or for free.",
+    "inventory_reservation_abuse": "Attacker can indefinitely hold inventory without purchasing, causing denial of stock to legitimate buyers.",
+    "approval_bypass": "Attacker can skip required approval steps in workflows, executing unauthorized state transitions.",
+    "double_spend": "Attacker can spend the same balance or coupon multiple times via concurrent requests.",
+    "bfla": "Attacker can perform administrative or privileged actions without proper authorization.",
+    "bola": "Attacker can access or modify other users data by manipulating object identifiers.",
+    "privilege_escalation": "Attacker can gain higher privilege level than intended, accessing restricted functionality.",
+}
 _UNTESTED_CLASS_DESCRIPTIONS: dict[str, str] = {
     "bola": "Tests object-level access control. Requires authenticated user to manipulate another user IDs.",
     "idor": "Tests object-level access control. Requires authenticated user to manipulate another user IDs.",
@@ -62,6 +78,9 @@ _UNTESTED_CLASS_DESCRIPTIONS: dict[str, str] = {
     "business_logic_advanced": "Tests advanced business logic. Requires auth to reach business endpoints.",
 }
 _DEFAULT_UNTESTED_REASON = "Requires authenticated session. Re-run with credentials for full coverage."
+_RACE_TIMELINE_CLASSES: frozenset[str] = frozenset(
+    {"double_spend", "limit_override_race", "inventory_reservation_abuse", "idempotency_bypass"}
+)
 
 
 class ReportingService:
@@ -92,9 +111,11 @@ class ReportingService:
         )
         findings = findings_result.scalars().all()
 
+        actions_performed = await self._actions_performed(scan_id)
+        skipped_blocked = await self._skipped_blocked(scan_id)
         report_findings: list[dict[str, Any]] = []
         for finding in findings:
-            metadata = copy.deepcopy(getattr(finding, "metadata", None))
+            metadata = copy.deepcopy(finding.extra_metadata) if isinstance(finding.extra_metadata, dict) else {}
             severity = self._severity_value(finding.severity)
             artifacts: list[dict[str, Any]] = []
             for artifact in finding.proof_artifacts:
@@ -107,47 +128,141 @@ class ReportingService:
                 artifacts=artifacts,
             )
 
-            report_findings.append(
-                {
-                    "id": str(finding.id),
-                    "title": finding.title,
-                    "severity": severity,
-                    "severity_factors": self._severity_factors_from_metadata(metadata),
-                    "remediation_priority": self._remediation_priority(severity, metadata),
-                    "attack_class": finding.attack_class,
-                    "description": finding.description,
-                    "repro_steps": finding.repro_steps,
-                    "fix_guidance": finding.fix_guidance,
-                    "affected_endpoint": finding.affected_endpoint.url_pattern,
-                    "proof_artifacts": artifacts,
-                    "attack_path": attack_path,
-                    "kill_chain": self._build_kill_chain(
-                        attack_class=finding.attack_class,
-                        endpoint_method=finding.affected_endpoint.method,
-                        endpoint_url=finding.affected_endpoint.url_pattern,
-                        finding_description=finding.description,
-                        artifacts=artifacts,
-                    ),
-                    "attacker_impact": self._build_attacker_impact(
-                        attack_class=finding.attack_class,
-                        endpoint_method=finding.affected_endpoint.method,
-                        endpoint_url=finding.affected_endpoint.url_pattern,
-                        artifacts=artifacts,
-                    ),
-                    "secret_blast_radius": self._build_secret_blast_radius_payload(
-                        self._extract_secret_blast_radius_matrix_from_metadata(metadata)
-                    ),
-                    "score_explanation": self._score_explanation_for_artifacts(artifacts),
-                    "metadata": metadata,
-                }
-            )
+            report_finding = {
+                "id": str(finding.id),
+                "title": finding.title,
+                "severity": severity,
+                "severity_factors": self._severity_factors_from_metadata(metadata),
+                "remediation_priority": self._remediation_priority(severity, metadata),
+                "attack_class": finding.attack_class,
+                "description": finding.description,
+                "business_impact": BUSINESS_IMPACT_DESCRIPTIONS.get(
+                    finding.attack_class,
+                    "Unauthorized access or manipulation of application resources.",
+                ),
+                "repro_steps": finding.repro_steps,
+                "fix_guidance": finding.fix_guidance,
+                "affected_endpoint": finding.affected_endpoint.url_pattern,
+                "proof_artifacts": artifacts,
+                "attack_path": attack_path,
+                "kill_chain": self._build_kill_chain(
+                    attack_class=finding.attack_class,
+                    endpoint_method=finding.affected_endpoint.method,
+                    endpoint_url=finding.affected_endpoint.url_pattern,
+                    finding_description=finding.description,
+                    artifacts=artifacts,
+                ),
+                "attacker_impact": self._build_attacker_impact(
+                    attack_class=finding.attack_class,
+                    endpoint_method=finding.affected_endpoint.method,
+                    endpoint_url=finding.affected_endpoint.url_pattern,
+                    artifacts=artifacts,
+                ),
+                "secret_blast_radius": self._build_secret_blast_radius_payload(
+                    self._extract_secret_blast_radius_matrix_from_metadata(metadata)
+                ),
+                "audit_event_ids": await self._audit_event_ids_for_finding(scan_id=scan_id, finding_id=finding.id),
+                "score_explanation": self._score_explanation_for_artifacts(artifacts),
+                "metadata": metadata,
+            }
+            identity_context = self._identity_context_from_artifacts(artifacts)
+            if identity_context:
+                report_finding["identity_context"] = identity_context
+            report_findings.append(report_finding)
 
         return {
             "scan_id": str(scan_id),
             "generated_at": datetime.now(UTC).isoformat(),
             "scan_config": scan.target.config if scan.target is not None else {},
+            "actions_performed": actions_performed,
+            "skipped_blocked": skipped_blocked,
             "findings": report_findings,
         }
+
+    async def _actions_performed(self, scan_id: UUID) -> dict[str, Any]:
+        empty = {
+            "total_requests_sent": 0,
+            "requests_by_attack_class": {},
+            "tasks_dispatched": 0,
+            "tasks_with_findings": 0,
+        }
+        try:
+            total_requests_result = await self._db.execute(
+                select(func.count(RawProbe.id)).join(AttackTask).where(AttackTask.scan_id == scan_id)
+            )
+            tasks_dispatched_result = await self._db.execute(
+                select(func.count(AttackTask.id)).where(AttackTask.scan_id == scan_id)
+            )
+            by_class_result = await self._db.execute(
+                select(AttackTask.attack_class, func.count(RawProbe.id))
+                .join(RawProbe, RawProbe.attack_task_id == AttackTask.id)
+                .where(AttackTask.scan_id == scan_id)
+                .group_by(AttackTask.attack_class)
+            )
+            tasks_with_findings_result = await self._db.execute(
+                select(func.count(distinct(ProofArtifact.attack_task_id)))
+                .join(AttackTask, AttackTask.id == ProofArtifact.attack_task_id)
+                .where(AttackTask.scan_id == scan_id, ProofArtifact.finding_id.is_not(None))
+            )
+        except Exception:
+            return empty
+
+        return {
+            "total_requests_sent": int(total_requests_result.scalar_one() or 0),
+            "requests_by_attack_class": {
+                str(attack_class): int(count or 0) for attack_class, count in by_class_result.all()
+            },
+            "tasks_dispatched": int(tasks_dispatched_result.scalar_one() or 0),
+            "tasks_with_findings": int(tasks_with_findings_result.scalar_one() or 0),
+        }
+
+    async def _skipped_blocked(self, scan_id: UUID) -> dict[str, Any]:
+        skipped_details: list[dict[str, str]] = []
+        redis_url = os.getenv("REDIS_URL")
+        if not redis_url:
+            return {"tasks_skipped": 0, "skipped_details": skipped_details}
+
+        try:
+            from redis.asyncio import Redis as AsyncRedis
+
+            redis_client = AsyncRedis.from_url(redis_url, decode_responses=True)
+            try:
+                raw_records = await redis_client.lrange(f"skipped_tasks:{scan_id}", 0, -1)
+            finally:
+                await redis_client.aclose()
+        except Exception:
+            return {"tasks_skipped": 0, "skipped_details": skipped_details}
+
+        for raw_record in raw_records:
+            try:
+                parsed = json.loads(raw_record)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            skipped_details.append(
+                {
+                    "task_id": str(parsed.get("task_id", "")),
+                    "reason": str(parsed.get("reason", "")),
+                    "attack_class": str(parsed.get("attack_class", "")),
+                }
+            )
+        return {"tasks_skipped": len(skipped_details), "skipped_details": skipped_details}
+
+    async def _audit_event_ids_for_finding(self, *, scan_id: UUID, finding_id: UUID) -> list[str]:
+        try:
+            result = await self._db.execute(
+                select(AuditEvent.id).where(
+                    AuditEvent.scan_id == scan_id,
+                    AuditEvent.event_type.in_(
+                        [AuditEventType.TASK_DISPATCHED, AuditEventType.FINDING_RECORDED]
+                    ),
+                    AuditEvent.details["finding_id"].as_string() == str(finding_id),
+                )
+            )
+        except Exception:
+            return []
+        return [str(event_id) for event_id in result.scalars().all()]
 
     async def assemble_chain_report(self, scan_id: UUID) -> dict[str, Any]:
         scan_result = await self._db.execute(select(Scan.id).where(Scan.id == scan_id))
@@ -167,7 +282,13 @@ class ReportingService:
 
         grouped_findings: dict[str, list[Finding]] = {}
         for finding in findings:
-            grouped_findings.setdefault(finding.attack_class, []).append(finding)
+            group_key = str(finding.attack_class)
+            metadata_raw = getattr(finding, "extra_metadata", None)
+            if isinstance(metadata_raw, dict):
+                race_group_id = metadata_raw.get("_race_group_id") or metadata_raw.get("race_group_id")
+                if isinstance(race_group_id, str) and race_group_id.strip():
+                    group_key = f"{group_key}:{race_group_id.strip()}"
+            grouped_findings.setdefault(group_key, []).append(finding)
 
         chains: list[AttackChain] = []
         for attack_class, group in grouped_findings.items():
@@ -193,6 +314,15 @@ class ReportingService:
                             if identity_id is None:
                                 continue
                             identity_set.add(str(identity_id))
+
+                artifacts = [
+                    self._artifact_payload(scan_id=scan_id, finding_id=finding.id, artifact=artifact)
+                    for artifact in finding.proof_artifacts
+                ]
+                identity_context = self._identity_context_from_artifacts(artifacts)
+                if identity_context is not None:
+                    for identity_label in identity_context["identities_used"]:
+                        identity_set.add(identity_label)
 
                 try:
                     confidence = float(confidence_raw)
@@ -348,6 +478,14 @@ class ReportingService:
                     "### Description",
                     str(finding.get("description", "")),
                     "",
+                    "## Business Impact",
+                    str(
+                        finding.get(
+                            "business_impact",
+                            "Unauthorized access or manipulation of application resources.",
+                        )
+                    ),
+                    "",
                     "### Reproduction Steps",
                     str(finding.get("repro_steps", "")),
                     "",
@@ -355,6 +493,9 @@ class ReportingService:
                     str(finding.get("fix_guidance", "")),
                 ]
             )
+            race_timeline_section = self._build_race_timeline(finding)
+            if race_timeline_section:
+                lines.extend(["", race_timeline_section])
             if leak_source_section:
                 lines.extend(["", leak_source_section])
             lines.extend(["", "### Attack Path"])
@@ -646,6 +787,48 @@ class ReportingService:
         except (ClientError, BotoCoreError, OSError, json.JSONDecodeError):
             logger.debug("evidence_payload_unavailable", key=key)
             return None
+
+    def _identity_context_from_artifacts(self, artifacts: list[dict[str, Any]]) -> dict[str, list[str]] | None:
+        identities_used: list[str] = []
+        seen: set[str] = set()
+        for artifact in artifacts:
+            for identity_data in self._identity_data_candidates(artifact):
+                redacted_identity = self._redact_identity_info(identity_data)
+                labels = redacted_identity.get("identity_labels")
+                if not isinstance(labels, list):
+                    continue
+                for label in labels:
+                    if not isinstance(label, str):
+                        continue
+                    label_text = label.strip()
+                    if not label_text or label_text in seen:
+                        continue
+                    seen.add(label_text)
+                    identities_used.append(label_text)
+
+        if not identities_used:
+            return None
+        return {"identities_used": identities_used}
+
+    def _identity_data_candidates(self, artifact: dict[str, Any]) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = [artifact]
+        for key in ("identity_context", "identity_info", "identity"):
+            value = artifact.get(key)
+            if isinstance(value, dict):
+                candidates.append(value)
+        return candidates
+
+    def _redact_identity_info(self, identity_data: dict[str, Any]) -> dict[str, Any]:
+        redacted: dict[str, Any] = {}
+        for key, value in identity_data.items():
+            key_text = str(key)
+            normalized_key = key_text.lower()
+            if normalized_key in _IDENTITY_CREDENTIAL_KEYS:
+                continue
+            if normalized_key not in _SAFE_IDENTITY_KEYS:
+                continue
+            redacted[normalized_key] = copy.deepcopy(value)
+        return redacted
 
     def _severity_value(self, severity: Severity | str) -> str:
         if isinstance(severity, Severity):
@@ -1312,6 +1495,70 @@ class ReportingService:
             "leak_source": metadata.get("leak_source") if isinstance(metadata, dict) else None,
             "remediation_priority": self._remediation_priority(str(finding.get("severity", "")), metadata),
         }
+
+    def _build_race_timeline(self, finding: dict[str, Any]) -> str:
+        attack_class = str(finding.get("attack_class", "")).strip().lower()
+        if attack_class not in _RACE_TIMELINE_CLASSES:
+            return ""
+        metadata = finding.get("metadata")
+        if not isinstance(metadata, dict):
+            return ""
+        race_group_raw = metadata.get("_race_group_id") or metadata.get("race_group_id")
+        if not isinstance(race_group_raw, str) or not race_group_raw.strip():
+            return ""
+        race_group_id = race_group_raw.strip()
+
+        proof_artifacts = finding.get("proof_artifacts")
+        if not isinstance(proof_artifacts, list) or not proof_artifacts:
+            return ""
+
+        rows: list[str] = []
+        row_index = 1
+        for artifact in proof_artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            response_raw = artifact.get("response")
+            response = self._redact_evidence(response_raw) if isinstance(response_raw, dict) else {}
+            request_raw = artifact.get("request")
+            request = self._redact_evidence(request_raw) if isinstance(request_raw, dict) else {}
+            timestamp_candidates = [
+                artifact.get("timestamp"),
+                response.get("timestamp"),
+                response.get("time"),
+                request.get("timestamp"),
+                request.get("time"),
+            ]
+            timestamp = "-"
+            for candidate in timestamp_candidates:
+                if isinstance(candidate, str) and candidate.strip():
+                    timestamp = self._truncate_markdown_cell(candidate.strip().replace("|", "/"), limit=40)
+                    break
+            status_value = response.get("status")
+            if status_value is None:
+                status_value = response.get("status_code")
+            status = "-" if status_value is None else self._truncate_markdown_cell(str(status_value), limit=12)
+            response_text_source = (
+                artifact.get("summary")
+                or response.get("body_excerpt")
+                or response.get("body")
+                or response.get("message")
+                or artifact.get("evidence_notes")
+                or "-"
+            )
+            response_text = self._truncate_markdown_cell(str(self._redact_value(response_text_source)).replace("|", "/"), limit=96)
+            rows.append(f"| {row_index} | {timestamp} | {status} | {response_text} |")
+            row_index += 1
+
+        if not rows:
+            return ""
+        return "\n".join(
+            [
+                f"**Race Timeline** (group: {race_group_id})",
+                "| # | Timestamp | Status | Response |",
+                "|---|---|---|---|",
+                *rows,
+            ]
+        )
 
     def _truncate_markdown_cell(self, value: str, limit: int) -> str:
         if len(value) <= limit:

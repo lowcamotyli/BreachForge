@@ -1,0 +1,53 @@
+id: coupon_stacking
+attack_class: coupon_stacking
+preconditions:
+  path_contains_any:
+    - coupon
+    - discount
+    - promo
+    - voucher
+    - code
+steps:
+  - id: apply_coupon_baseline
+    action: single_probe
+    identity_selector: current_user
+    probe_template:
+      mode: observe
+      template: apply_coupon_code
+      safe_fixture: true
+    observe_only: true
+    expected_signal: coupon accepted, discount applied on first use
+    max_attempts: 2
+  - id: apply_same_coupon_again
+    action: single_probe
+    identity_selector: current_user
+    probe_template:
+      mode: bounded_probe
+      template: apply_coupon_code
+      safe_fixture: true
+      probe_type: state_mutating
+    validator: coupon_stacking_validator
+    expected_signal: second application also succeeds
+    max_attempts: 2
+  - id: read_after_write_cart
+    action: read_probe
+    identity_selector: current_user
+    probe_template:
+      mode: observe
+      template: get_cart_state
+    observe_only: true
+    expected_signal: discount_applied_count > 1 OR total_price < expected_min
+    max_attempts: 1
+validators:
+  coupon_stacking_validator:
+    signal: discount_applied_multiple_times
+  state_diff_required: true
+safety_budget:
+  max_requests: 6
+  max_attempts_per_step: 2
+  scope: current_endpoint
+  rate_limit_rps: 1.0
+  proof_gate: default
+  safe_fixture_required: true
+  read_only: false
+  requires_enable_business_logic_mutations: true

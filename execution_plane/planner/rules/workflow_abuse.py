@@ -188,3 +188,113 @@ class WorkflowAbuse(AttackRule):
             return url_pattern
         normalized = url_pattern.rstrip("/")
         return f"{normalized}/{{resource_id}}"
+
+
+class ApprovalBypassRule(AttackRule):
+    requires_auth = False
+    attack_class = "approval_bypass"
+    name = "ApprovalBypassRule"
+    safe_mutation = True
+    observe_only = False
+
+    def matches(self, endpoint: Endpoint, asset_map: AssetMap) -> bool:
+        if not self._is_terminal_approval_step(endpoint):
+            return False
+        return bool(self._candidate_prerequisite_steps(endpoint, asset_map))
+
+    def generate_tasks(self, endpoint: Endpoint, context: ScanContext) -> list[AttackTask]:
+        prerequisites = self._candidate_prerequisite_steps(endpoint, context.asset_map)
+        if not prerequisites:
+            return []
+
+        read_after_url = self._resolve_read_after_url(endpoint.url_pattern)
+        tasks: list[AttackTask] = []
+        for prereq in prerequisites:
+            skip_attempt_payload = {
+                "probe_type": "approval_skip_attempt",
+                "safe_mutation": True,
+                "observe_only": False,
+                "required_step": {"method": prereq.method.upper(), "url": prereq.url_pattern},
+                "skipped_to_final_step": {"method": endpoint.method.upper(), "url": endpoint.url_pattern},
+                "state_transition_attempt": {
+                    "from_state": "draft",
+                    "to_state": "approved",
+                    "bypassing_state": "pending_approval",
+                },
+                "protected_resource_probe": {"method": "GET", "url": read_after_url, "requires_state": "approved"},
+            }
+            tasks.append(
+                AttackTask(
+                    scan_id=context.scan_id,
+                    endpoint_id=endpoint.id,
+                    attack_class=self.attack_class,
+                    target_parameter="workflow_approval",
+                    hypothesis=json.dumps(skip_attempt_payload, sort_keys=True),
+                )
+            )
+            read_after_payload = {
+                "probe_type": "approval_skip_read_after",
+                "safe_mutation": True,
+                "observe_only": False,
+                "read_after": True,
+                "check_state_path": read_after_url,
+                "expected_block_state": "pending_approval",
+                "unexpected_success_states": ["approved", "active", "completed"],
+            }
+            tasks.append(
+                AttackTask(
+                    scan_id=context.scan_id,
+                    endpoint_id=endpoint.id,
+                    attack_class=self.attack_class,
+                    target_parameter="workflow_state",
+                    hypothesis=json.dumps(read_after_payload, sort_keys=True),
+                )
+            )
+        return tasks
+
+    def expected_proof_signal(self) -> str:
+        return "Skipped approval steps allow direct terminal action or protected-resource access"
+
+    def _is_terminal_approval_step(self, endpoint: Endpoint) -> bool:
+        method = endpoint.method.upper()
+        if method not in {"POST", "PUT", "PATCH"}:
+            return False
+        lowered = endpoint.url_pattern.lower()
+        terminal_tokens = ("approve", "approval", "confirm", "complete", "activate", "finalize", "submit")
+        return any(token in lowered for token in terminal_tokens)
+
+    def _candidate_prerequisite_steps(self, endpoint: Endpoint, asset_map: AssetMap) -> list[Endpoint]:
+        resource_key = self._resource_key(endpoint.url_pattern)
+        candidates: list[Endpoint] = []
+        seen: set[str] = set()
+        prerequisite_tokens = ("review", "pending", "draft", "request", "submit", "start", "begin")
+        for candidate in asset_map.endpoints:
+            if candidate.id == endpoint.id:
+                continue
+            if self._resource_key(candidate.url_pattern) != resource_key:
+                continue
+            candidate_method = candidate.method.upper()
+            if candidate_method not in {"GET", "POST", "PUT", "PATCH"}:
+                continue
+            lowered = candidate.url_pattern.lower()
+            if not any(token in lowered for token in prerequisite_tokens):
+                continue
+            key = f"{candidate_method}:{candidate.url_pattern}"
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+        return candidates
+
+    def _resource_key(self, url_pattern: str) -> str:
+        parts = [segment for segment in url_pattern.strip("/").split("/") if segment and not segment.startswith("{")]
+        if not parts:
+            return "root"
+        if len(parts) == 1:
+            return parts[0]
+        return "/".join(parts[:2])
+
+    def _resolve_read_after_url(self, url_pattern: str) -> str:
+        if "{id}" in url_pattern or "{resource_id}" in url_pattern:
+            return url_pattern
+        return f"{url_pattern.rstrip('/')}/{{id}}"

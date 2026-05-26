@@ -14,7 +14,7 @@ from rq import Queue
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.models.requests import ScanCreate
+from api.models.requests import IdentityReference, ScanCreate
 from api.models.responses import ScanEventResponse, ScanResponse
 from storage.db.encryption import EnvelopeEncryption
 from storage.db.models import AssetMap, AttackTask, AuthContext, Endpoint, Finding, Scan, ScanStatus, Target
@@ -22,6 +22,7 @@ from storage.db.session import get_db
 
 logger = structlog.get_logger()
 router = APIRouter()
+REDIS_URL = "REDIS_URL"
 
 
 def _encrypt_snapshot_field(value: Any, scan_id: UUID) -> dict[str, str] | None:
@@ -38,11 +39,18 @@ def _encrypt_snapshot_field(value: Any, scan_id: UUID) -> dict[str, str] | None:
 
 
 def _build_session_snapshot(payload: ScanCreate, scan_id: UUID) -> dict[str, Any]:
+    auth_context = payload.auth_context
+    identities_payload: list[dict[str, Any]] = []
+    if getattr(payload, "identities", None):
+        for identity in payload.identities:
+            if isinstance(identity, IdentityReference):
+                identities_payload.append(identity.model_dump(mode="json"))
     return {
-        "credentials": _encrypt_snapshot_field(payload.auth_context.credentials, scan_id),
-        "cookies": _encrypt_snapshot_field(payload.auth_context.cookies, scan_id),
-        "bearer_token": _encrypt_snapshot_field(payload.auth_context.bearer_token, scan_id),
-        "login_recipe": payload.auth_context.login_recipe,
+        "credentials": _encrypt_snapshot_field(auth_context.credentials, scan_id) if auth_context is not None else None,
+        "cookies": _encrypt_snapshot_field(auth_context.cookies, scan_id) if auth_context is not None else None,
+        "bearer_token": _encrypt_snapshot_field(auth_context.bearer_token, scan_id) if auth_context is not None else None,
+        "login_recipe": auth_context.login_recipe if auth_context is not None else None,
+        "identities": identities_payload,
     }
 
 
@@ -130,11 +138,20 @@ async def _build_scan_debug_details(db: AsyncSession, scan_id: UUID, scan: Scan)
 
 
 def _get_auth_bootstrap_queue() -> Queue:
-    redis_url = os.getenv("REDIS_URL")
+    redis_url = os.getenv(REDIS_URL)
     if not redis_url:
         raise RuntimeError("REDIS_URL is not configured")
     connection = Redis.from_url(redis_url)
     queue_name = os.getenv("RQ_AUTH_QUEUE", "auth_bootstrap")
+    return Queue(name=queue_name, connection=connection)
+
+
+def _get_recon_queue() -> Queue:
+    redis_url = os.getenv(REDIS_URL)
+    if not redis_url:
+        raise RuntimeError("REDIS_URL is not configured")
+    connection = Redis.from_url(redis_url)
+    queue_name = os.getenv("RQ_RECON_QUEUE", "recon")
     return Queue(name=queue_name, connection=connection)
 
 
@@ -153,11 +170,13 @@ async def create_scan(payload: ScanCreate, db: AsyncSession = Depends(get_db)) -
     db.add(scan)
     await db.flush()
 
+    has_identities = bool(getattr(payload, "identities", None))
     auth_context: AuthContext | None = None
-    if payload.auth_context is not None:
+    if payload.auth_context is not None or has_identities:
+        auth_type = payload.auth_context.type if payload.auth_context is not None else "none"
         auth_context = AuthContext(
             scan_id=scan.id,
-            type=payload.auth_context.type,
+            type=auth_type,
             session_snapshot=_build_session_snapshot(payload, scan.id),
             health={},
         )
@@ -169,8 +188,11 @@ async def create_scan(payload: ScanCreate, db: AsyncSession = Depends(get_db)) -
         )
 
     scan.status = ScanStatus.running
-    scan.phase = "auth_bootstrap"
     scan.started_at = datetime.now(UTC)
+    if auth_context is not None:
+        scan.phase = "auth_bootstrap"
+    else:
+        scan.phase = "recon"
     await db.commit()
     await db.refresh(scan)
 
@@ -185,8 +207,22 @@ async def create_scan(payload: ScanCreate, db: AsyncSession = Depends(get_db)) -
                 status=_status_value(scan.status),
                 queue=getattr(queue, "name", "auth_bootstrap"),
             )
+        else:
+            queue = _get_recon_queue()
+            queue.enqueue("execution_plane.crawler.engine.run_crawler", str(scan.id))
+            logger.info(
+                "scan_recon_enqueued",
+                scan_id=str(scan.id),
+                phase=scan.phase,
+                status=_status_value(scan.status),
+                queue=getattr(queue, "name", "recon"),
+            )
     except Exception as exc:
-        logger.exception("auth_bootstrap_enqueue_failed", scan_id=str(scan.id), error=str(exc))
+        scan.status = ScanStatus.failed
+        scan.phase = "failed:enqueue"
+        await db.commit()
+        logger.exception("scan_enqueue_failed", scan_id=str(scan.id), error=str(exc))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Failed to enqueue scan") from exc
 
     return _to_scan_response(scan)
 
@@ -200,6 +236,16 @@ async def get_scan(scan_id: UUID, db: AsyncSession = Depends(get_db)) -> ScanRes
     debug_details = await _build_scan_debug_details(db=db, scan_id=scan_id, scan=scan)
     logger.info("scan_status_polled", **debug_details)
     return _to_scan_response(scan)
+
+
+@router.post("/{scan_id}/kill", status_code=status.HTTP_204_NO_CONTENT)
+async def kill_scan(scan_id: UUID) -> None:
+    redis_url = os.getenv(REDIS_URL)
+    if not redis_url:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="REDIS_URL is not configured")
+    connection = Redis.from_url(redis_url)
+    connection.setex(f"kill:{scan_id}", 86400, "1")
+    return None
 
 
 @router.get("/{scan_id}/events", response_model=list[ScanEventResponse])

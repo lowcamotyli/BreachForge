@@ -46,6 +46,44 @@ redis.call('PEXPIRE', key, ttl_ms)
 return allowed
 """
 
+_RACE_BURST_SCRIPT = """
+local key = KEYS[1]
+local now_ms = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local capacity = tonumber(ARGV[3])
+local request_count = tonumber(ARGV[4])
+
+local values = redis.call('HMGET', key, 'tokens', 'ts')
+local tokens = tonumber(values[1])
+local ts = tonumber(values[2])
+
+if tokens == nil then
+  tokens = capacity
+end
+
+if ts == nil then
+  ts = now_ms
+end
+
+local elapsed = math.max(0, now_ms - ts) / 1000.0
+local refilled = elapsed * refill_rate
+if refilled > 0 then
+  tokens = math.min(capacity, tokens + refilled)
+end
+
+local allowed = 0
+if tokens >= request_count then
+  tokens = tokens - request_count
+  allowed = 1
+end
+
+redis.call('HSET', key, 'tokens', tokens, 'ts', now_ms)
+local ttl_ms = math.ceil((capacity / refill_rate) * 2000)
+redis.call('PEXPIRE', key, ttl_ms)
+
+return allowed
+"""
+
 
 @dataclass(slots=True)
 class DomainRateLimiter:
@@ -61,6 +99,7 @@ class DomainRateLimiter:
     DEFAULT_RPS = 150.0 / 60.0
     DEFAULT_WORKER_RPS = 30.0 / 60.0
     PRODUCTION_SAFE_RPS = 1.0
+    RACE_MAX_BURST: int = 20
     MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
     def __init__(
@@ -122,6 +161,29 @@ class DomainRateLimiter:
             return False
 
         return bool(allowed)
+
+    def acquire_race_burst(self, scan_id: str, domain: str, request_count: int) -> bool:
+        if request_count > self.RACE_MAX_BURST:
+            return False
+
+        key = f"rate:{scan_id}:{domain}:race_burst"
+        capacity = float(self.RACE_MAX_BURST)
+        now_ms = int(time.time() * 1000)
+
+        try:
+            allowed = self.redis_client.eval(
+                _RACE_BURST_SCRIPT,
+                1,
+                key,
+                now_ms,
+                self.rate_limit_rps,
+                capacity,
+                request_count,
+            )
+            return bool(allowed)
+        except Exception:
+            logger.exception("rate_limiter_race_burst_error", key=key)
+            return False
 
 
 def _read_bool_env(name: str, default: bool = False) -> bool:

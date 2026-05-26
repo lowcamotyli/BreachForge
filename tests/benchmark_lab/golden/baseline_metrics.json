@@ -1,0 +1,13 @@
+{
+  "lab_version": "1.0.0",
+  "mode": "quick",
+  "coverage": 0.0,
+  "tp": 0,
+  "fp": 0,
+  "fn": 7,
+  "time_to_proof_avg": 0.0,
+  "unsafe_block_count": 0,
+  "findings_count": 0,
+  "ground_truth_count": 7,
+  "note": "Baseline before scan integration - zero detections expected"
+}

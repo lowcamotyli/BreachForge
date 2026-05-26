@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from uuid import uuid4
 
 from execution_plane.planner.rules.base import AssetMap, AttackRule, ScanContext
 from storage.db.models import AttackTask, Endpoint
 
 _LIMIT_TOKENS: frozenset[str] = frozenset({"limit", "max_per_user", "one_per_account", "quota", "balance"})
 _DOUBLE_SPEND_TOKENS: frozenset[str] = frozenset({"transfer", "withdraw", "debit", "purchase", "checkout", "redeem"})
+_INVENTORY_TOKENS: frozenset[str] = frozenset({"reserve", "hold", "stock", "inventory", "allocation", "slot"})
 _IDEMPOTENCY_HEADER: str = "idempotency-key"
 _IDEMPOTENCY_PARAM: str = "idempotency_key"
 
@@ -24,6 +26,7 @@ class RaceAdvancedRule(AttackRule):
         return bool(
             self.detect_limit_override_candidates(endpoint)
             or self.detect_double_spend_candidates(endpoint)
+            or self.detect_inventory_reservation_candidates(endpoint)
             or self.detect_idempotency_bypass_candidates(endpoint)
         )
 
@@ -34,6 +37,7 @@ class RaceAdvancedRule(AttackRule):
         candidates: list[dict[str, Any]] = []
         candidates.extend(self.detect_limit_override_candidates(endpoint))
         candidates.extend(self.detect_double_spend_candidates(endpoint))
+        candidates.extend(self.detect_inventory_reservation_candidates(endpoint))
         candidates.extend(self.detect_idempotency_bypass_candidates(endpoint))
 
         tasks: list[AttackTask] = []
@@ -52,6 +56,7 @@ class RaceAdvancedRule(AttackRule):
                 "priority": float(candidate["priority"]),
                 "rationale": str(candidate["rationale"]),
                 "method": endpoint.method.upper(),
+                "_race_group_id": str(uuid4()),
             }
             tasks.append(
                 AttackTask(
@@ -113,6 +118,22 @@ class RaceAdvancedRule(AttackRule):
                 "priority": 0.95,
                 "rationale": "Detected idempotency key marker in request metadata; races can expose weak key-lock semantics.",
                 "target_parameter": target,
+            }
+        ]
+
+    def detect_inventory_reservation_candidates(self, endpoint: Endpoint) -> list[dict[str, Any]]:
+        path_matches = [token for token in _INVENTORY_TOKENS if token in endpoint.url_pattern.lower()]
+        param_matches = self._matching_parameter_tokens(endpoint=endpoint, tokens=_INVENTORY_TOKENS)
+        if not path_matches and not param_matches:
+            return []
+        token = (path_matches + param_matches)[0]
+        return [
+            {
+                "endpoint": endpoint.url_pattern,
+                "attack_class": "inventory_reservation_abuse",
+                "priority": 0.96,
+                "rationale": f"Detected reservation token '{token}' in path/parameters; race on hold/stock allocation may over-reserve inventory.",
+                "target_parameter": token,
             }
         ]
 

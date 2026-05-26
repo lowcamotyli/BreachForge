@@ -10,6 +10,7 @@ from execution_plane.validator.strategies.race_advanced import (
     DistributedLockEvasionStrategy,
     DoubleSpendStrategy,
     IdempotencyBypassStrategy,
+    InventoryReservationStrategy,
     LimitOverrideRaceStrategy,
 )
 from storage.db.models import ProofArtifact, RawProbe
@@ -209,3 +210,33 @@ def test_mutating_advanced_race_strategy_requires_safe_fixture(
     )
 
     assert strategy.validate(probe, None) is None
+
+
+def test_inventory_reservation_strategy_detects_overallocation() -> None:
+    probe = _probe(
+        request={"reproduced": True},
+        response={
+            "status_code": 200,
+            "accepted_count": 3,
+            "available_stock": 1,
+            "final_state": {"reserved": 3},
+        },
+    )
+
+    artifact = InventoryReservationStrategy().validate(probe, None)
+
+    assert isinstance(artifact, ProofArtifact)
+    assert artifact.confidence_score >= 0.85
+
+
+def test_race_strategy_rejects_status_only_probe() -> None:
+    probe = _probe(
+        request={"reproduced": True},
+        response={
+            "status_code": 200,
+            "accepted_count": 2,
+            "allowed_limit": 1,
+        },
+    )
+
+    assert LimitOverrideRaceStrategy().validate(probe, None) is None

@@ -23,7 +23,8 @@ class EnvelopeEncryption:
         if not self._master_key_id:
             raise RuntimeError("KMS_MASTER_KEY_ID is required")
 
-    def encrypt_credential(self, plaintext: str, scan_id: UUID) -> EncryptedBlob:
+    def encrypt_credential(self, plaintext: str, scan_id: UUID, identity_name: str | None = None) -> EncryptedBlob:
+        _ = identity_name
         response = self._kms.generate_data_key(
             KeyId=self._master_key_id,
             KeySpec="AES_256",
@@ -41,7 +42,8 @@ class EnvelopeEncryption:
             ciphertext=ciphertext.decode("ascii"),
         )
 
-    def decrypt_credential(self, blob: EncryptedBlob, scan_id: UUID) -> str:
+    def decrypt_credential(self, blob: EncryptedBlob, scan_id: UUID, identity_name: str | None = None) -> str:
+        _ = identity_name
         encrypted_data_key = base64.b64decode(blob.encrypted_data_key.encode("ascii"))
         response = self._kms.decrypt(
             CiphertextBlob=encrypted_data_key,

@@ -18,7 +18,7 @@ from playwright.async_api import Page, async_playwright
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from api.models.requests import AuthContextCreate
+from api.models.requests import AuthContextCreate, IdentityReference
 from storage.db.models import AuthContext, Scan, ScanStatus
 
 try:
@@ -28,6 +28,9 @@ except ImportError:
     EnvelopeEncryption = None  # type: ignore[assignment,misc]
 
 AUTH_HEALTH_CHECK_INTERVAL_S = int(os.getenv("AUTH_HEALTH_CHECK_INTERVAL_S", "300"))
+MAX_IMPORTED_COOKIES = 500
+MAX_STORAGE_KEYS = 200
+MAX_STORAGE_VALUE_BYTES = 4096
 
 REDACTED_FIELDS = {"authorization", "cookie", "password", "token"}
 
@@ -100,7 +103,7 @@ class SessionSnapshot:
 class BrowserSessionImporter:
     async def import_from_browser(self, url: str, wait_seconds: int = 5) -> SessionSnapshot:
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=False)
+            browser = await playwright.chromium.launch(headless=True)
             context = await browser.new_context()
             page = await context.new_page()
 
@@ -108,6 +111,7 @@ class BrowserSessionImporter:
             await page.wait_for_timeout(max(wait_seconds, 0) * 1000)
 
             cookies_raw = await context.cookies()
+            cookies_raw = cookies_raw[:MAX_IMPORTED_COOKIES]
             local_storage_raw = await page.evaluate(
                 """
                 () => {
@@ -122,6 +126,8 @@ class BrowserSessionImporter:
                 }
                 """
             )
+            if isinstance(local_storage_raw, dict):
+                local_storage_raw = dict(list(local_storage_raw.items())[:MAX_STORAGE_KEYS])
             session_storage_raw = await page.evaluate(
                 """
                 () => {
@@ -136,6 +142,8 @@ class BrowserSessionImporter:
                 }
                 """
             )
+            if isinstance(session_storage_raw, dict):
+                session_storage_raw = dict(list(session_storage_raw.items())[:MAX_STORAGE_KEYS])
 
             await browser.close()
 
@@ -150,12 +158,14 @@ class BrowserSessionImporter:
         if isinstance(local_storage_raw, dict):
             for key, value in local_storage_raw.items():
                 if isinstance(key, str) and isinstance(value, str):
+                    value = value[:MAX_STORAGE_VALUE_BYTES] if isinstance(value, str) else value
                     local_storage[key] = value
 
         session_storage: dict[str, str] = {}
         if isinstance(session_storage_raw, dict):
             for key, value in session_storage_raw.items():
                 if isinstance(key, str) and isinstance(value, str):
+                    value = value[:MAX_STORAGE_VALUE_BYTES] if isinstance(value, str) else value
                     session_storage[key] = value
 
         has_auth_token = any(
@@ -187,7 +197,7 @@ class BrowserSessionImporter:
         results: dict[str, bool | str] = {}
         unauthorized_count = 0
 
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, max_redirects=5) as client:
             for endpoint in test_endpoints:
                 try:
                     response = await client.get(endpoint, cookies=cookies)
@@ -222,6 +232,9 @@ class IdentityContext:
     auth_headers: dict[str, str]
     csrf_tokens: dict[str, str]
     captured_at: datetime
+    name: str = ""
+    tenant_hint: str | None = None
+    auth_state: str = "active"
     expires_at: datetime | None = None
     active: bool = True
 
@@ -254,7 +267,8 @@ class AuthManager:
         self._lock = asyncio.Lock()
         self._active = True
         self._session_snapshot: SessionSnapshot | None = None
-        self._identity_contexts: dict[IdentityRole, IdentityContext] = {}
+        self._identity_contexts: dict[IdentityRole | str, IdentityContext] = {}
+        self._named_identities: dict[str, IdentityContext] = {}
         self._auth_type: str = "none"
         self._auth_input: AuthContextCreate | None = None
         self._health_task: asyncio.Task[None] | None = None
@@ -320,6 +334,10 @@ class AuthManager:
                 identity.cookies = []
                 identity.auth_headers = {}
                 identity.csrf_tokens = {}
+            for identity in self._named_identities.values():
+                identity.cookies = []
+                identity.auth_headers = {}
+                identity.csrf_tokens = {}
             if self._auth_input is not None:
                 self._auth_input.credentials = None
                 self._auth_input.cookies = None
@@ -359,8 +377,6 @@ class AuthManager:
     async def get_identity_context(self, scan_id: UUID, role: IdentityRole | str) -> IdentityContext:
         if scan_id != self._scan_id:
             raise ValueError("Scan ID mismatch for requested identity context")
-
-        requested_role = self._coerce_identity_role(role)
         async with self._lock:
             if self._session_snapshot is None:
                 raise RuntimeError("Session snapshot is not initialized")
@@ -368,9 +384,17 @@ class AuthManager:
             if not self._identity_contexts:
                 self._identity_contexts = self._build_identity_contexts(self._session_snapshot)
 
-            identity_context = self._identity_contexts.get(requested_role)
+            identity_context: IdentityContext | None = None
+            if isinstance(role, IdentityRole):
+                identity_context = self._identity_contexts.get(role)
+            else:
+                with contextlib.suppress(ValueError):
+                    resolved_role = self._coerce_identity_role(role)
+                    identity_context = self._identity_contexts.get(resolved_role)
+                if identity_context is None:
+                    identity_context = self._named_identities.get(role)
             if identity_context is None:
-                raise RuntimeError(f"Identity context is not initialized for role={requested_role.value}")
+                raise RuntimeError(f"Identity context is not initialized for role={role}")
             return deepcopy(identity_context)
 
     async def list_active_identities(self, scan_id: UUID) -> list[IdentityContext]:
@@ -386,7 +410,91 @@ class AuthManager:
 
             self._ensure_minimum_active_identities()
             active = [deepcopy(identity) for identity in self._identity_contexts.values() if identity.active]
+            for identity in self._named_identities.values():
+                if identity.auth_state == "active":
+                    active.append(deepcopy(identity))
             return active
+
+    async def bootstrap_identities(self, identities: list[IdentityReference]) -> IdentityMatrix:
+        matrix: IdentityMatrix = {}
+        for identity in identities:
+            auth_context = identity.auth_context
+            if auth_context.type == "session":
+                snapshot = self._from_cookies(auth_context)
+            elif auth_context.type == "token":
+                snapshot = self._from_bearer(auth_context)
+            elif auth_context.type == "credential":
+                snapshot = await self._playwright_login(auth_context)
+            elif auth_context.type == "none":
+                snapshot = self._empty_snapshot()
+            else:
+                continue
+
+            role = IdentityRole.user
+            if identity.role_hint is not None:
+                with contextlib.suppress(ValueError):
+                    role = IdentityRole(identity.role_hint)
+
+            context = IdentityContext(
+                scan_id=self._scan_id,
+                role=role,
+                cookies=deepcopy(snapshot.cookies) if isinstance(snapshot.cookies, list) else [],
+                auth_headers=deepcopy(snapshot.auth_headers),
+                csrf_tokens=deepcopy(snapshot.csrf_tokens),
+                captured_at=snapshot.captured_at,
+                name=identity.name,
+                tenant_hint=identity.tenant_hint,
+                auth_state="active",
+                expires_at=snapshot.expires_at,
+                active=True,
+            )
+            async with self._lock:
+                self._named_identities[identity.name] = context
+                self._identity_contexts[identity.name] = context
+
+            matrix[identity.name] = IdentityProfile(
+                name=identity.name,
+                role=context.role.value,
+                tenant=identity.tenant_hint,
+                auth_state="active",
+                privilege_hint=identity.role_hint,
+                session_ref=identity.name,
+            )
+        return matrix
+
+    async def per_identity_health_check(self) -> dict[str, bool]:
+        async with self._lock:
+            named_identities = {name: deepcopy(identity) for name, identity in self._named_identities.items()}
+
+        results: dict[str, bool] = {}
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, max_redirects=5) as client:
+            for identity_name, identity in named_identities.items():
+                headers = deepcopy(identity.auth_headers)
+                cookie_header = "; ".join(
+                    f"{cookie.get('name', '')}={cookie.get('value', '')}" for cookie in identity.cookies if cookie.get("name")
+                )
+                if cookie_header:
+                    headers["Cookie"] = cookie_header
+                headers.update(identity.csrf_tokens)
+
+                is_healthy = False
+                if self._authenticated_probe_url:
+                    try:
+                        response = await client.head(self._authenticated_probe_url, headers=headers)
+                        if response.status_code == 405:
+                            response = await client.get(self._authenticated_probe_url, headers=headers)
+                        is_healthy = response.status_code not in {401, 403} and response.status_code < 500
+                    except httpx.HTTPError:
+                        is_healthy = False
+                results[identity_name] = is_healthy
+
+                if not is_healthy:
+                    async with self._lock:
+                        live_identity = self._named_identities.get(identity_name)
+                        if live_identity is not None:
+                            live_identity.auth_state = "expired"
+                            live_identity.active = False
+        return results
 
     async def _set_snapshot(self, snapshot: SessionSnapshot, auth_input: AuthContextCreate) -> None:
         async with self._lock:
@@ -554,7 +662,7 @@ class AuthManager:
 
         headers = self._build_probe_headers(snapshot)
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, max_redirects=5) as client:
                 response = await client.get(self._authenticated_probe_url, headers=headers)
         except httpx.HTTPError:
             return False
@@ -924,10 +1032,23 @@ async def _bootstrap_auth_context_async(scan_id: str, auth_context_id: str | Non
 
     snapshot = auth_context.session_snapshot if isinstance(auth_context.session_snapshot, dict) else {}
     auth_input = _build_auth_input_from_snapshot(auth_context.type, snapshot, scan_uuid)
+    raw_identities = snapshot.get("identities")
+    identity_references: list[IdentityReference] = []
+    if isinstance(raw_identities, list):
+        for raw_identity in raw_identities:
+            if not isinstance(raw_identity, dict):
+                continue
+            with contextlib.suppress(Exception):
+                identity_references.append(IdentityReference.model_validate(raw_identity))
 
     manager = AuthManager(scan_uuid, AsyncSessionLocal, default_pause_scan)
     try:
-        await manager.bootstrap(auth_input)
+        if auth_input.type != "none":
+            await manager.bootstrap(auth_input)
+        if identity_references:
+            await manager.bootstrap_identities(identity_references)
+        elif auth_input.type == "none":
+            await manager.bootstrap(auth_input)
     finally:
         await manager.close()
 

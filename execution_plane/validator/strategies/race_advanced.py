@@ -50,6 +50,8 @@ class LimitOverrideRaceStrategy(ValidationStrategy):
         )
         if confidence < self._MIN_PROOF_CONFIDENCE_THRESHOLD:
             return None
+        if not _requires_final_state_proof(attack_probe):
+            return None
 
         return ProofArtifact(
             attack_task_id=attack_probe.attack_task_id,
@@ -106,6 +108,8 @@ class DoubleSpendStrategy(ValidationStrategy):
             single_burst_cap=self._SINGLE_BURST_CONFIDENCE_CAP,
         )
         if confidence < self._MIN_PROOF_CONFIDENCE_THRESHOLD:
+            return None
+        if not _requires_final_state_proof(attack_probe):
             return None
 
         first_compact = _compact(first_response)
@@ -168,6 +172,8 @@ class IdempotencyBypassStrategy(ValidationStrategy):
         )
         if confidence < self._MIN_PROOF_CONFIDENCE_THRESHOLD:
             return None
+        if not _requires_final_state_proof(attack_probe):
+            return None
 
         return ProofArtifact(
             attack_task_id=attack_probe.attack_task_id,
@@ -225,6 +231,8 @@ class DistributedLockEvasionStrategy(ValidationStrategy):
         )
         if confidence < self._MIN_PROOF_CONFIDENCE_THRESHOLD:
             return None
+        if not _requires_final_state_proof(attack_probe):
+            return None
 
         return ProofArtifact(
             attack_task_id=attack_probe.attack_task_id,
@@ -236,6 +244,58 @@ class DistributedLockEvasionStrategy(ValidationStrategy):
             evidence_notes=(
                 "probe_type=race_concurrent, "
                 f"cycles={cycles}, reserved_count={reserved_count}, inventory_limit={inventory_limit}"
+            ),
+        )
+
+
+class InventoryReservationStrategy(ValidationStrategy):
+    _MIN_PROOF_CONFIDENCE_THRESHOLD = 0.85
+    _BASELINE_CONFIDENCE = 0.87
+    _OVERALLOCATION_CONFIDENCE = 0.90
+
+    def expected_attack_class(self) -> str:
+        return "inventory_reservation_abuse"
+
+    def expected_proof_type(self) -> str:
+        return "reproduction"
+
+    def validate(self, attack_probe: RawProbe, control_probe: RawProbe | None) -> ProofArtifact | None:
+        del control_probe
+        response = attack_probe.response
+
+        accepted_count = _to_int(_get_value(response, "accepted_count"), default=0)
+        available_stock = _to_int(_get_value(response, "available_stock"), default=0)
+        over_allocated = accepted_count > available_stock
+
+        responses = _get_value(response, "responses")
+        multi_success = False
+        if isinstance(responses, list):
+            success_count = 0
+            for resp in responses:
+                if _is_success(resp):
+                    success_count += 1
+            multi_success = success_count > 1
+
+        if not over_allocated and not multi_success:
+            return None
+
+        confidence = self._OVERALLOCATION_CONFIDENCE if over_allocated else self._BASELINE_CONFIDENCE
+        if confidence < self._MIN_PROOF_CONFIDENCE_THRESHOLD:
+            return None
+        if not _requires_final_state_proof(attack_probe):
+            return None
+
+        return ProofArtifact(
+            attack_task_id=attack_probe.attack_task_id,
+            proof_type=self.expected_proof_type(),
+            confidence_score=confidence,
+            attack_probe_id=attack_probe.id,
+            control_probe_id=None,
+            summary="Inventory reservation abuse race: concurrent reservations exceeded available stock guarantees",
+            evidence_notes=(
+                "probe_type=race_concurrent, "
+                f"accepted_count={accepted_count}, available_stock={available_stock}, "
+                f"multi_success={multi_success}"
             ),
         )
 
@@ -343,3 +403,16 @@ def _to_float(value: Any, default: float) -> float:
         except ValueError:
             return default
     return default
+
+
+def _requires_final_state_proof(probe: RawProbe) -> bool:
+    response = getattr(probe, "response", None)
+    if not isinstance(response, dict):
+        return True
+    if response.get("status_code") is None:
+        return True
+    state_diff = getattr(probe, "state_diff_data", {}) or {}
+    if not isinstance(state_diff, dict):
+        state_diff = {}
+    final_state = state_diff.get("final_state") or response.get("final_state")
+    return final_state is not None

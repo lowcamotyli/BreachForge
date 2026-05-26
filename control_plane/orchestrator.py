@@ -15,11 +15,49 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from control_plane.auth_manager import purge_scan_credentials
-from storage.db.models import AssetMap, AuthContext, Endpoint, Scan, ScanStatus, Target
+from storage.db.models import AssetMap, AuditEvent, AuditEventType, AuthContext, Endpoint, Scan, ScanStatus, Target
 
 logger = structlog.get_logger(__name__)
 
 REDACTED_FIELDS = {"authorization", "cookie", "password", "token"}
+AUDIT_REDACT_PATTERNS = ("authorization", "cookie", "password", "token", "secret", "bearer")
+
+
+def _strip_audit_details(details: dict[str, Any]) -> dict[str, Any]:
+    def _scrub(value: Any) -> Any:
+        if isinstance(value, dict):
+            scrubbed: dict[str, Any] = {}
+            for key, nested_value in value.items():
+                key_text = str(key)
+                lowered = key_text.lower()
+                if any(pattern in lowered for pattern in AUDIT_REDACT_PATTERNS):
+                    scrubbed[key_text] = "[REDACTED]"
+                else:
+                    scrubbed[key_text] = _scrub(nested_value)
+            return scrubbed
+        if isinstance(value, list):
+            return [_scrub(item) for item in value]
+        return value
+
+    return _scrub(dict(details))
+
+
+async def log_audit_event(
+    session: AsyncSession,
+    scan_id: UUID,
+    event_type: AuditEventType,
+    actor: str = "system",
+    details: dict[str, Any] | None = None,
+) -> None:
+    sanitized_details = _strip_audit_details(details) if isinstance(details, dict) else None
+    session.add(
+        AuditEvent(
+            scan_id=scan_id,
+            event_type=event_type,
+            actor=actor,
+            details=sanitized_details,
+        )
+    )
 
 
 class ReportingService(Protocol):

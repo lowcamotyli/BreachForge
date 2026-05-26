@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from control_plane.auth_manager import SessionSnapshot
+from api.models.requests import ScanPolicy
 from storage.db.models import AttackTask, AttackTaskStatus, Endpoint, Scan, ScanStatus, Target
 
 ATTACK_WORKER_PATH = PROJECT_ROOT / "execution_plane/workers/attack_worker.py"
@@ -361,3 +362,118 @@ async def test_safe_secret_replay_blocks_mutating_methods(monkeypatch: pytest.Mo
         )
 
     redis_client.xadd.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_policy_blocks_mutating(monkeypatch: pytest.MonkeyPatch) -> None:
+    redis_client = MagicMock()
+    rate_limiter = _FakeRateLimiter(allow=True)
+
+    async def _to_thread_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    class _ForbiddenAsyncClient:
+        def __init__(self, **kwargs) -> None:
+            raise AssertionError("HTTP client should not be constructed when policy blocks")
+
+    monkeypatch.setattr(attack_worker_module.asyncio, "to_thread", _to_thread_inline)
+    monkeypatch.setattr(attack_worker_module.httpx, "AsyncClient", _ForbiddenAsyncClient)
+    worker = AttackWorker(redis_client=redis_client, rate_limiter=rate_limiter)
+    task = _build_task()
+    session = _build_session(task.scan_id)
+
+    result = await worker.execute(task, session, policy=ScanPolicy(mutating_allowed=False))
+
+    assert result is None
+    redis_client.xadd.assert_not_called()
+    assert rate_limiter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_policy_allows_mutating(monkeypatch: pytest.MonkeyPatch) -> None:
+    call_order: list[str] = []
+    redis_client = MagicMock()
+    redis_client.xadd.return_value = "1-0"
+    rate_limiter = _FakeRateLimiter(allow=True)
+
+    async def _to_thread_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(attack_worker_module.asyncio, "to_thread", _to_thread_inline)
+    monkeypatch.setattr(
+        attack_worker_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: _FakeAsyncClient(call_order=call_order, **kwargs),
+    )
+    worker = AttackWorker(redis_client=redis_client, rate_limiter=rate_limiter)
+    task = _build_task()
+    session = _build_session(task.scan_id)
+
+    result = await worker.execute(task, session, policy=ScanPolicy(mutating_allowed=True))
+
+    assert result is not None
+    assert call_order == ["http_send"]
+    redis_client.xadd.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_blocks_execute(monkeypatch: pytest.MonkeyPatch) -> None:
+    evidence_redis = MagicMock()
+    evidence_redis.xadd.return_value = "1-0"
+    kill_redis = MagicMock()
+    kill_redis.get.side_effect = ["1", None]
+    rate_limiter = _FakeRateLimiter(allow=True)
+
+    async def _to_thread_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    class _ForbiddenAsyncClient:
+        def __init__(self, **kwargs) -> None:
+            raise AssertionError("HTTP client should not be constructed when kill switch is set")
+
+    monkeypatch.setattr(attack_worker_module.asyncio, "to_thread", _to_thread_inline)
+    monkeypatch.setattr(attack_worker_module.httpx, "AsyncClient", _ForbiddenAsyncClient)
+    worker = AttackWorker(
+        redis_client=evidence_redis,
+        kill_switch_redis=kill_redis,
+        rate_limiter=rate_limiter,
+    )
+    task = _build_task()
+    session = _build_session(task.scan_id)
+
+    result = await worker.execute(task, session)
+
+    assert result is None
+    evidence_redis.xadd.assert_not_called()
+    assert rate_limiter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_global_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    evidence_redis = MagicMock()
+    kill_redis = MagicMock()
+    kill_redis.get.side_effect = [None, "1"]
+    rate_limiter = _FakeRateLimiter(allow=True)
+
+    async def _to_thread_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    class _ForbiddenAsyncClient:
+        def __init__(self, **kwargs) -> None:
+            raise AssertionError("HTTP client should not be constructed when global kill switch is set")
+
+    monkeypatch.setattr(attack_worker_module.asyncio, "to_thread", _to_thread_inline)
+    monkeypatch.setattr(attack_worker_module.httpx, "AsyncClient", _ForbiddenAsyncClient)
+    worker = AttackWorker(
+        redis_client=evidence_redis,
+        kill_switch_redis=kill_redis,
+        rate_limiter=rate_limiter,
+    )
+    task = _build_task()
+    session = _build_session(task.scan_id)
+
+    result = await worker.execute(task, session)
+
+    assert result is None
+    evidence_redis.xadd.assert_not_called()
+    assert rate_limiter.calls == []

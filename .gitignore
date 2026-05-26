@@ -20,3 +20,6 @@ build/
 coverage/
 
 *.log
+
+mac-migration/
+mac-migration.zip

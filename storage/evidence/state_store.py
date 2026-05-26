@@ -35,6 +35,24 @@ class StateStore:
         latest_version = max(step_snapshots)
         return step_snapshots[latest_version]
 
+    def get_before_after(
+        self, scan_id: str, step_id: str
+    ) -> tuple[StateSnapshot | None, StateSnapshot | None]:
+        scan_snapshots = self._snapshots.get(scan_id)
+        if scan_snapshots is None:
+            return (None, None)
+
+        step_snapshots = scan_snapshots.get(step_id)
+        if not step_snapshots:
+            return (None, None)
+
+        if len(step_snapshots) == 1:
+            snap = next(iter(step_snapshots.values()))
+            return (snap, snap)
+
+        latest_version = max(step_snapshots)
+        return (step_snapshots.get(1), step_snapshots[latest_version])
+
     def list_versions(self, scan_id: str) -> list[int]:
         scan_snapshots = self._snapshots.get(scan_id)
         if scan_snapshots is None:

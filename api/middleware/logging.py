@@ -12,7 +12,7 @@ REDACTED = "[REDACTED]"
 
 class CredentialStripper:
     _SENSITIVE_KEY_PATTERN = re.compile(
-        r"authorization|cookie|password|token|secret|key",
+        r"authorization|cookie|password|token|secret|bearer|key",
         re.IGNORECASE,
     )
 
@@ -41,6 +41,10 @@ class CredentialStripper:
         if isinstance(value, list):
             return [self._redact_value(item) for item in value]
         return value
+
+
+def redact_for_audit(details: dict[str, Any]) -> dict[str, Any]:
+    return CredentialStripper()._redact_mapping(details)
 
 
 class ScanIdProcessor:

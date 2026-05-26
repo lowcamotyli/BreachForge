@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from execution_plane.validator.secret_intelligence import PrivilegeFingerprint, PrivilegeLevel
 from storage.db.models import AttackTask, Endpoint, Finding, ProofArtifact, RawProbe, Severity
 
 
@@ -208,7 +209,7 @@ async def test_secret_blast_radius_matrix_is_recorded_for_new_finding() -> None:
     finding = await scorer.score(artifact=artifact, endpoint=endpoint)
     assert finding is not None
 
-    metadata = getattr(finding, "metadata", None)
+    metadata = getattr(finding, "extra_metadata", None)
     assert isinstance(metadata, dict)
     matrix = metadata.get("secret_blast_radius_matrix")
     assert isinstance(matrix, list)
@@ -283,7 +284,7 @@ async def test_secret_blast_radius_matrix_appends_for_duplicate_finding_and_reje
         repro_steps="step",
         fix_guidance="fix",
     )
-    existing_finding.metadata = {"secret_blast_radius_matrix": [{"endpoint": "/seed"}]}
+    existing_finding.extra_metadata = {"secret_blast_radius_matrix": [{"endpoint": "/seed"}]}
 
     scorer = FindingScorer(db=_DbStub())
 
@@ -294,7 +295,7 @@ async def test_secret_blast_radius_matrix_appends_for_duplicate_finding_and_reje
     finding = await scorer.score(artifact=artifact, endpoint=endpoint)
     assert finding is None
 
-    metadata = getattr(existing_finding, "metadata", None)
+    metadata = getattr(existing_finding, "extra_metadata", None)
     assert isinstance(metadata, dict)
     matrix = metadata.get("secret_blast_radius_matrix")
     assert isinstance(matrix, list)
@@ -316,7 +317,7 @@ async def test_severity_upgrade_critical_with_correlator() -> None:
     )
 
     assert finding.severity is Severity.critical
-    metadata = getattr(finding, "metadata", None)
+    metadata = getattr(finding, "extra_metadata", None)
     assert isinstance(metadata, dict)
     assert metadata["severity_factors"] == [
         {
@@ -345,7 +346,7 @@ async def test_severity_upgrade_high_blast_radius() -> None:
     )
 
     assert finding.severity is Severity.high
-    metadata = getattr(finding, "metadata", None)
+    metadata = getattr(finding, "extra_metadata", None)
     assert isinstance(metadata, dict)
     assert metadata["severity_factors"] == [
         {
@@ -370,7 +371,7 @@ async def test_noise_guard_no_upgrade_cors_alone() -> None:
     )
 
     assert finding.severity is Severity.medium
-    metadata = getattr(finding, "metadata", None)
+    metadata = getattr(finding, "extra_metadata", None)
     assert isinstance(metadata, dict)
     assert "severity_factors" not in metadata
 
@@ -385,6 +386,62 @@ async def test_regression_non_secret_finding_unchanged() -> None:
     )
 
     assert finding.severity is Severity.medium
-    metadata = getattr(finding, "metadata", None)
+    metadata = getattr(finding, "extra_metadata", None)
     assert isinstance(metadata, dict)
     assert "severity_factors" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_metadata_persists_all_three_fields_after_score() -> None:
+    sys.modules.setdefault("storage.db.session", SimpleNamespace(AsyncSessionLocal=lambda: None))
+    from control_plane.finding_scorer import FindingScorer
+
+    endpoint = Endpoint(
+        id=uuid4(), asset_map_id=uuid4(), url_pattern="/api/account/99",
+        method="get", auth_required=True, parameters=[],
+        observed_content_type=None, example_response_code=200,
+    )
+    attack_task = AttackTask(
+        id=uuid4(), scan_id=uuid4(), endpoint_id=endpoint.id,
+        attack_class="sensitive_exposure", target_parameter="Authorization",
+        hypothesis="leaks credentials", priority_score=0.9,
+        prerequisites=None, step_order=1,
+    )
+    artifact = ProofArtifact(
+        id=uuid4(), attack_task_id=attack_task.id, finding_id=None,
+        proof_type="response_diff", confidence_score=0.95,
+        attack_probe_id=uuid4(), control_probe_id=None,
+        identity_role="attacker", state_diff=None,
+        summary="Sensitive material exposed",
+        evidence_notes="leak_source=debug_endpoint; leak_source_confidence=0.9",
+    )
+    artifact.attack_task = attack_task
+
+    privilege_fp = PrivilegeFingerprint(
+        observed_access_level=PrivilegeLevel.user,
+        inferred_level=PrivilegeLevel.unknown,
+        confidence=0.7,
+        evidence_endpoints=["/api/account"],
+        hints=[],
+    )
+
+    scorer = FindingScorer(db=_DbStub(), proof_threshold=0.85)
+
+    async def _no_duplicate(*, scan_id: object, fingerprint: tuple[str, str, str]) -> None:
+        return None
+
+    scorer._find_duplicate = _no_duplicate  # type: ignore[method-assign]
+    finding = await scorer.score(artifact=artifact, endpoint=endpoint, privilege_fingerprint=privilege_fp)
+    assert finding is not None
+
+    metadata = finding.extra_metadata
+    assert isinstance(metadata, dict)
+    assert "privilege_fingerprint" in metadata
+    fp = metadata["privilege_fingerprint"]
+    assert isinstance(fp, dict)
+    assert fp["observed_access_level"] == "user"
+    assert "chain_root_cause" in metadata
+    assert isinstance(metadata["chain_root_cause"], str) and len(metadata["chain_root_cause"]) > 0
+    assert "leak_source" in metadata
+    assert metadata["leak_source"]["type"] == "debug_endpoint"
+    assert abs(metadata["leak_source"]["confidence"] - 0.9) < 1e-9

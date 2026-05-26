@@ -12,6 +12,9 @@ from storage.db.models import ProofArtifact, RawProbe
 class NegativeValueStrategy(ValidationStrategy):
     _THRESHOLD = 0.90
 
+    def requires_state_effect(self) -> bool:
+        return True
+
     def expected_attack_class(self) -> str:
         return "negative_value"
 
@@ -60,6 +63,9 @@ class IntegerOverflowStrategy(ValidationStrategy):
         "exceeds maximum",
     )
 
+    def requires_state_effect(self) -> bool:
+        return True
+
     def expected_attack_class(self) -> str:
         return "integer_overflow"
 
@@ -102,6 +108,9 @@ class IntegerOverflowStrategy(ValidationStrategy):
 
 class PriceManipulationStrategy(ValidationStrategy):
     _THRESHOLD = 0.88
+
+    def requires_state_effect(self) -> bool:
+        return True
 
     def expected_attack_class(self) -> str:
         return "price_manipulation"
@@ -208,6 +217,9 @@ class AccountEnumerationTimingStrategy(ValidationStrategy):
 class InventoryReservationStrategy(ValidationStrategy):
     _THRESHOLD = 0.87
 
+    def requires_state_effect(self) -> bool:
+        return True
+
     def expected_attack_class(self) -> str:
         return "inventory_reservation"
 
@@ -238,6 +250,187 @@ class InventoryReservationStrategy(ValidationStrategy):
             control_probe_id=None,
             summary="Inventory reservation exploit: item reserved multiple cycles without inventory decrement",
             evidence_notes=f"cycle_count={cycles}, inventory_decremented=False, endpoint={endpoint}",
+        )
+
+
+class CouponStackingValidator(ValidationStrategy):
+    _THRESHOLD = 0.85
+
+    def requires_state_effect(self) -> bool:
+        return True
+
+    def expected_attack_class(self) -> str:
+        return "coupon_stacking"
+
+    def expected_proof_type(self) -> str:
+        return "differential"
+
+    def validate(self, attack_probe: RawProbe, control_probe: RawProbe | None) -> ProofArtifact | None:
+        del control_probe
+        response_body = _extract_response_body(attack_probe.response)
+        state_diff = _extract_state_diff(attack_probe, response_body)
+        discount_count = _to_float(_get_value(state_diff, "discount_applied"))
+        final_price = _to_float(_get_value(state_diff, "final_price"))
+        expected_min_price = _to_float(_get_value(state_diff, "expected_min_price"))
+        valid = (discount_count is not None and discount_count > 1) or (
+            final_price is not None and expected_min_price is not None and final_price < expected_min_price
+        )
+        if not valid:
+            return None
+
+        confidence = 0.88
+        confidence, note = _enforce_high_confidence_state_diff(attack_probe, state_diff, confidence)
+        if confidence < self._THRESHOLD:
+            return None
+
+        evidence_notes = (
+            f"discount_applied={discount_count}, final_price={final_price}, expected_min_price={expected_min_price}"
+        )
+        if note is not None:
+            evidence_notes = f"{evidence_notes}, note={note}"
+        return ProofArtifact(
+            attack_task_id=attack_probe.attack_task_id,
+            proof_type=self.expected_proof_type(),
+            confidence_score=confidence,
+            attack_probe_id=attack_probe.id,
+            control_probe_id=None,
+            state_diff=state_diff,
+            summary="Coupon stacking accepted: repeated or chained coupon usage produced unauthorized discount behavior",
+            evidence_notes=evidence_notes,
+        )
+
+
+class NegativeQuantityValidator(ValidationStrategy):
+    _THRESHOLD = 0.85
+
+    def requires_state_effect(self) -> bool:
+        return True
+
+    def expected_attack_class(self) -> str:
+        return "negative_quantity"
+
+    def expected_proof_type(self) -> str:
+        return "differential"
+
+    def validate(self, attack_probe: RawProbe, control_probe: RawProbe | None) -> ProofArtifact | None:
+        del control_probe
+        response_body = _extract_response_body(attack_probe.response)
+        state_diff = _extract_state_diff(attack_probe, response_body)
+        total_amount = _to_float(_get_value(response_body, "total_amount"))
+        if total_amount is None:
+            total_amount = _to_float(_get_value(state_diff, "total_amount"))
+        inventory_impact = _to_float(_get_value(state_diff, "inventory_impact"))
+        valid = (total_amount is not None and total_amount <= 0) or (inventory_impact is not None and inventory_impact < 0)
+        if not valid:
+            return None
+
+        confidence = 0.86
+        confidence, note = _enforce_high_confidence_state_diff(attack_probe, state_diff, confidence)
+        if confidence < self._THRESHOLD:
+            return None
+
+        evidence_notes = f"total_amount={total_amount}, inventory_impact={inventory_impact}"
+        if note is not None:
+            evidence_notes = f"{evidence_notes}, note={note}"
+        return ProofArtifact(
+            attack_task_id=attack_probe.attack_task_id,
+            proof_type=self.expected_proof_type(),
+            confidence_score=confidence,
+            attack_probe_id=attack_probe.id,
+            control_probe_id=None,
+            state_diff=state_diff,
+            summary="Negative quantity accepted: cart/order totals or inventory state moved into invalid range",
+            evidence_notes=evidence_notes,
+        )
+
+
+class PriceTamperingValidator(ValidationStrategy):
+    _THRESHOLD = 0.85
+
+    def requires_state_effect(self) -> bool:
+        return True
+
+    def expected_attack_class(self) -> str:
+        return "price_tampering"
+
+    def expected_proof_type(self) -> str:
+        return "differential"
+
+    def validate(self, attack_probe: RawProbe, control_probe: RawProbe | None) -> ProofArtifact | None:
+        del control_probe
+        response_body = _extract_response_body(attack_probe.response)
+        state_diff = _extract_state_diff(attack_probe, response_body)
+        original_price = _to_float(_get_value(state_diff, "original_price"))
+        final_price = _to_float(_get_value(state_diff, "final_price"))
+        if original_price is None or final_price is None:
+            return None
+        if not (final_price != original_price and final_price < 0.01):
+            return None
+
+        confidence = 0.90
+        confidence, note = _enforce_high_confidence_state_diff(attack_probe, state_diff, confidence)
+        if confidence < self._THRESHOLD:
+            return None
+
+        evidence_notes = f"original_price={original_price}, final_price={final_price}"
+        if note is not None:
+            evidence_notes = f"{evidence_notes}, note={note}"
+        return ProofArtifact(
+            attack_task_id=attack_probe.attack_task_id,
+            proof_type=self.expected_proof_type(),
+            confidence_score=confidence,
+            attack_probe_id=attack_probe.id,
+            control_probe_id=None,
+            state_diff=state_diff,
+            summary="Price tampering accepted: final persisted price diverged from original and dropped below minimum boundary",
+            evidence_notes=evidence_notes,
+        )
+
+
+class InventoryReservationAbuseValidator(ValidationStrategy):
+    _THRESHOLD = 0.85
+
+    def requires_state_effect(self) -> bool:
+        return True
+
+    def expected_attack_class(self) -> str:
+        return "inventory_reservation_abuse"
+
+    def expected_proof_type(self) -> str:
+        return "reproduction"
+
+    def validate(self, attack_probe: RawProbe, control_probe: RawProbe | None) -> ProofArtifact | None:
+        del control_probe
+        response_body = _extract_response_body(attack_probe.response)
+        state_diff = _extract_state_diff(attack_probe, response_body)
+        inventory_count_before = _to_float(_get_value(state_diff, "inventory_count_before"))
+        inventory_count_after = _to_float(_get_value(state_diff, "inventory_count_after"))
+        order_completed = _is_true(_get_value(state_diff, "order_completed"))
+        if inventory_count_before is None or inventory_count_after is None:
+            return None
+        if not (inventory_count_after < inventory_count_before and not order_completed):
+            return None
+
+        confidence = 0.87
+        confidence, note = _enforce_high_confidence_state_diff(attack_probe, state_diff, confidence)
+        if confidence < self._THRESHOLD:
+            return None
+
+        evidence_notes = (
+            f"inventory_count_before={inventory_count_before}, inventory_count_after={inventory_count_after}, "
+            f"order_completed={order_completed}"
+        )
+        if note is not None:
+            evidence_notes = f"{evidence_notes}, note={note}"
+        return ProofArtifact(
+            attack_task_id=attack_probe.attack_task_id,
+            proof_type=self.expected_proof_type(),
+            confidence_score=confidence,
+            attack_probe_id=attack_probe.id,
+            control_probe_id=None,
+            state_diff=state_diff,
+            summary="Inventory reservation abuse: stock decreased after hold/reserve flow without completed purchase",
+            evidence_notes=evidence_notes,
         )
 
 
@@ -347,3 +540,64 @@ def _is_true(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() == "true"
     return False
+
+
+def _to_float(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _extract_state_diff(attack_probe: RawProbe, response_body: Any) -> dict[str, Any]:
+    request_state = attack_probe.request.get("state_diff")
+    if isinstance(request_state, dict):
+        return request_state
+    parsed_body = _parse_body(attack_probe)
+    body_state = _get_value(parsed_body, "state_diff")
+    if isinstance(body_state, dict):
+        return body_state
+    response_state = _get_value(response_body, "state_diff")
+    if isinstance(response_state, dict):
+        return response_state
+    return {}
+
+
+def _extract_requested_confidence(attack_probe: RawProbe) -> float | None:
+    parsed_body = _parse_body(attack_probe)
+    for key in ("requested_confidence", "min_confidence", "confidence_target", "confidence_score"):
+        in_request = _to_float(attack_probe.request.get(key))
+        if in_request is not None:
+            return in_request
+        in_body = _to_float(_get_value(parsed_body, key))
+        if in_body is not None:
+            return in_body
+    return None
+
+
+def _enforce_high_confidence_state_diff(
+    attack_probe: RawProbe,
+    state_diff: dict[str, Any],
+    confidence: float,
+) -> tuple[float, str | None]:
+    requested_confidence = _extract_requested_confidence(attack_probe)
+    if requested_confidence is not None and requested_confidence >= 0.85 and not state_diff:
+        return min(confidence, 0.75), "state_diff required for high confidence"
+    return confidence, None
+
+
+BUSINESS_LOGIC_ADVANCED_VALIDATOR_REGISTRY: dict[str, type[ValidationStrategy]] = {
+    "negative_value": NegativeValueStrategy,
+    "integer_overflow": IntegerOverflowStrategy,
+    "price_manipulation": PriceManipulationStrategy,
+    "account_enumeration_timing": AccountEnumerationTimingStrategy,
+    "inventory_reservation": InventoryReservationStrategy,
+    "coupon_stacking": CouponStackingValidator,
+    "negative_quantity": NegativeQuantityValidator,
+    "price_tampering": PriceTamperingValidator,
+    "inventory_reservation_abuse": InventoryReservationAbuseValidator,
+}

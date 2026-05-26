@@ -81,6 +81,7 @@ from execution_plane.validator.strategies.race_advanced import (
     DistributedLockEvasionStrategy,
 )
 from execution_plane.validator.state_diff import compute_diff
+from execution_plane.planner.decision_log import FeedbackPayload, TaskOutcome
 from storage.db.models import AttackTask, ProofArtifact, RawProbe
 from storage.db.session import AsyncSessionLocal
 from storage.evidence.store import EvidenceStore
@@ -98,6 +99,7 @@ logger = structlog.get_logger(__name__)
 
 DEFAULT_PROOF_CONFIDENCE_THRESHOLD = float(os.getenv("DEFAULT_PROOF_CONFIDENCE_THRESHOLD", "0.85"))
 LOW_CONFIDENCE_STORE_THRESHOLD = 0.50
+_FORBIDDEN_IDENTITY_LABEL_TOKENS: tuple[str, ...] = ("token", "cookie", "bearer", "authorization", "password", "secret")
 SUPPORTED_ATTACK_CLASSES: set[str] = {
     "bola",
     "tenant_isolation",
@@ -409,6 +411,12 @@ class ExploitValidator:
         self._probe_cache: dict[str, RawProbe] = {}
         self._probe_cache_order: list[str] = []
         self._max_probe_cache_size = 5000
+        self._feedback_buffer: list[FeedbackPayload] = []
+
+    def drain_feedback(self) -> list[FeedbackPayload]:
+        drained = self._feedback_buffer
+        self._feedback_buffer = []
+        return drained
 
     async def run(self, scan_id: UUID | str) -> None:
         stream_key = self._stream_key(scan_id)
@@ -452,6 +460,11 @@ class ExploitValidator:
 
     async def _process_message(self, scan_id: UUID | str, stream_message_id: str, payload: dict[str, str]) -> None:
         attack_probe = self._probe_from_stream_payload(payload=payload, stream_message_id=stream_message_id)
+        before_snap, after_snap = self._extract_state_snapshots_from_payload(
+            payload=payload,
+            scan_id=scan_id,
+            attack_task_id=attack_probe.attack_task_id,
+        )
 
         attack_task = await self._load_attack_task(attack_probe.attack_task_id)
         if attack_task is None:
@@ -482,7 +495,30 @@ class ExploitValidator:
             return
 
         control_probe = self._resolve_control_probe(attack_probe)
-        artifact = await self.validate(strategy=strategy, attack_probe=attack_probe, control_probe=control_probe)
+        artifact = await self.validate(
+            strategy=strategy,
+            attack_probe=attack_probe,
+            control_probe=control_probe,
+            before_snapshot=before_snap,
+            after_snapshot=after_snap,
+        )
+        if artifact is not None and strategy.requires_state_effect():
+            state_diff_data = artifact.state_diff
+            has_meaningful_diff = (
+                state_diff_data is not None
+                and isinstance(state_diff_data, dict)
+                and any(bool(value) for value in state_diff_data.values())
+            )
+            if not has_meaningful_diff:
+                artifact.confidence_score = min(artifact.confidence_score, 0.60)
+                artifact.evidence_notes = (artifact.evidence_notes or "") + "; state_effect_required=no_diff_found"
+        artifact = await self._apply_differential_proof_gate(
+            attack_task=attack_task,
+            strategy=strategy,
+            attack_probe=attack_probe,
+            control_probe=control_probe,
+            artifact=artifact,
+        )
         estimated_confidence = self._estimate_confidence(
             strategy=strategy,
             attack_probe=attack_probe,
@@ -507,6 +543,13 @@ class ExploitValidator:
                     attack_task_id=str(attack_task.id),
                     confidence=estimated_confidence,
                 )
+            self._emit_feedback_payload(
+                scan_id=scan_id,
+                attack_task=attack_task,
+                attack_probe=attack_probe,
+                artifact=None,
+                confidence=estimated_confidence,
+            )
             return
 
         if artifact.confidence_score < self._proof_threshold:
@@ -519,7 +562,22 @@ class ExploitValidator:
                     attack_task_id=str(attack_task.id),
                     confidence=artifact.confidence_score,
                 )
+            self._emit_feedback_payload(
+                scan_id=scan_id,
+                attack_task=attack_task,
+                attack_probe=attack_probe,
+                artifact=artifact,
+                confidence=artifact.confidence_score,
+            )
             return
+
+        self._emit_feedback_payload(
+            scan_id=scan_id,
+            attack_task=attack_task,
+            attack_probe=attack_probe,
+            artifact=artifact,
+            confidence=artifact.confidence_score,
+        )
 
         finding_id = artifact.finding_id or uuid4()
         artifact.finding_id = finding_id
@@ -545,6 +603,7 @@ class ExploitValidator:
                 "summary": artifact.summary,
                 "evidence_notes": artifact.evidence_notes,
                 "identity_role": artifact.identity_role,
+                "identity_labels": getattr(artifact, "identity_labels", []),
                 "state_diff": artifact.state_diff,
                 "artifact_key": artifact_key,
                 "probe_key": probe_key,
@@ -600,6 +659,83 @@ class ExploitValidator:
 
         return artifact
 
+    async def _apply_differential_proof_gate(
+        self,
+        attack_task: AttackTask,
+        strategy: ValidationStrategy,
+        attack_probe: RawProbe,
+        control_probe: RawProbe | None,
+        artifact: ProofArtifact | None,
+    ) -> ProofArtifact | None:
+        hypothesis = self._parse_hypothesis_config(attack_task.hypothesis)
+        if not bool(hypothesis.get("differential_probe")):
+            return artifact
+
+        attacker_identity = self._sanitize_identity_label(hypothesis.get("identity_selector"))
+        owner_identity = self._sanitize_identity_label(hypothesis.get("owner_identity"))
+
+        probes: list[tuple[RawProbe, str | None]] = [(attack_probe, attacker_identity)]
+        if control_probe is not None:
+            control_task = await self._load_attack_task(control_probe.attack_task_id)
+            control_hypothesis = self._parse_hypothesis_config(control_task.hypothesis) if control_task is not None else {}
+            control_identity = self._sanitize_identity_label(control_hypothesis.get("identity_selector"))
+            probes.append((control_probe, control_identity))
+            if owner_identity is None and control_identity != attacker_identity:
+                owner_identity = control_identity
+
+        attacker_probe = self._probe_for_identity(probes, attacker_identity)
+        owner_probe = self._probe_for_identity(probes, owner_identity)
+        identity_labels = [label for label in (attacker_identity, owner_identity) if isinstance(label, str)]
+
+        if attacker_probe is None or owner_probe is None:
+            return self._downgrade_or_attach_identity_labels(
+                artifact=artifact,
+                confidence=0.20,
+                identity_labels=identity_labels,
+                notes="differential_probe=missing_pair",
+            )
+
+        attacker_status = self._extract_status_from_probe(attack_probe=attacker_probe)
+        owner_status = self._extract_status_from_probe(attack_probe=owner_probe)
+        attacker_body = self._normalize_probe_body(attacker_probe)
+        owner_body = self._normalize_probe_body(owner_probe)
+
+        same_body = attacker_body == owner_body
+        attacker_is_denied = attacker_status in {401, 403}
+        owner_is_success = owner_status == 200
+        both_success = attacker_status == 200 and owner_status == 200
+
+        if both_success and same_body:
+            finding = artifact or ProofArtifact(
+                attack_task_id=attack_probe.attack_task_id,
+                finding_id=uuid5(NAMESPACE_URL, f"differential:{attack_task.id}:{owner_identity}:{attacker_identity}"),
+                proof_type=strategy.expected_proof_type(),
+                confidence_score=max(self._proof_threshold, 0.90),
+                attack_probe_id=attack_probe.id,
+                control_probe_id=control_probe.id if control_probe is not None else None,
+                summary="Differential proof indicates unauthorized identity-level access parity.",
+                evidence_notes="differential_probe=confirmed; attacker_owner_response_parity=true",
+            )
+            finding.confidence_score = max(finding.confidence_score, self._proof_threshold, 0.90)
+            self._set_identity_labels(finding, identity_labels)
+            finding.evidence_notes = f"{finding.evidence_notes}; identity_labels={','.join(identity_labels)}"
+            return finding
+
+        if attacker_is_denied and owner_is_success:
+            return self._downgrade_or_attach_identity_labels(
+                artifact=artifact,
+                confidence=0.10,
+                identity_labels=identity_labels,
+                notes="differential_probe=access_control_enforced",
+            )
+
+        return self._downgrade_or_attach_identity_labels(
+            artifact=artifact,
+            confidence=min(self._proof_threshold - 0.01, 0.84),
+            identity_labels=identity_labels,
+            notes="differential_probe=inconclusive",
+        )
+
     async def _load_attack_task(self, attack_task_id: UUID) -> AttackTask | None:
         async with AsyncSessionLocal() as session:
             return await self._select_attack_task(session, attack_task_id)
@@ -643,6 +779,45 @@ class ExploitValidator:
 
         self._remember_probe(probe)
         return probe
+
+    def _extract_state_snapshots_from_payload(
+        self,
+        payload: dict[str, str],
+        scan_id: UUID | str,
+        attack_task_id: UUID,
+    ) -> tuple[StateSnapshot | None, StateSnapshot | None]:
+        try:
+            state_evidence_raw = payload.get("state_evidence")
+            if not state_evidence_raw:
+                return None, None
+
+            state_evidence = json.loads(state_evidence_raw)
+            if not isinstance(state_evidence, dict):
+                return None, None
+
+            before_dict = state_evidence.get("before")
+            after_dict = state_evidence.get("after")
+            if not isinstance(before_dict, dict) or not isinstance(after_dict, dict):
+                return None, None
+
+            timestamp = datetime.now(UTC)
+            before_snapshot = StateSnapshot(
+                scan_id=str(scan_id),
+                step_id=str(attack_task_id),
+                timestamp=timestamp,
+                state_dict=before_dict,
+                version=1,
+            )
+            after_snapshot = StateSnapshot(
+                scan_id=str(scan_id),
+                step_id=str(attack_task_id),
+                timestamp=timestamp,
+                state_dict=after_dict,
+                version=2,
+            )
+            return before_snapshot, after_snapshot
+        except Exception:
+            return None, None
 
     def _resolve_control_probe(self, attack_probe: RawProbe) -> RawProbe | None:
         if attack_probe.control_probe_id is not None:
@@ -779,6 +954,134 @@ class ExploitValidator:
         if not stream_message_id:
             return uuid4()
         return uuid5(NAMESPACE_URL, f"evidence-stream:{stream_message_id}")
+
+    def _parse_hypothesis_config(self, raw_hypothesis: str | None) -> dict[str, Any]:
+        if not raw_hypothesis:
+            return {}
+        try:
+            parsed = json.loads(raw_hypothesis)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _probe_for_identity(self, probes: list[tuple[RawProbe, str | None]], identity_name: str | None) -> RawProbe | None:
+        for probe, selector in probes:
+            if selector == identity_name:
+                return probe
+        return None
+
+    def _extract_status_from_probe(self, attack_probe: RawProbe) -> int | None:
+        status_raw = attack_probe.response.get("status")
+        return status_raw if isinstance(status_raw, int) else None
+
+    def _normalize_probe_body(self, attack_probe: RawProbe) -> str:
+        body = attack_probe.response.get("body")
+        if isinstance(body, str):
+            return body.strip()
+        if isinstance(body, (dict, list)):
+            return json.dumps(body, sort_keys=True, separators=(",", ":"))
+        if body is None:
+            return ""
+        return str(body).strip()
+
+    def _sanitize_identity_label(self, raw_label: object) -> str | None:
+        if not isinstance(raw_label, str):
+            return None
+        stripped = raw_label.strip()
+        if not stripped:
+            return None
+        lowered = stripped.lower()
+        for token in _FORBIDDEN_IDENTITY_LABEL_TOKENS:
+            if token in lowered:
+                return None
+        return stripped
+
+    def _set_identity_labels(self, artifact: ProofArtifact, identity_labels: list[str]) -> None:
+        setattr(artifact, "identity_labels", identity_labels)
+
+    def _downgrade_or_attach_identity_labels(
+        self,
+        artifact: ProofArtifact | None,
+        confidence: float,
+        identity_labels: list[str],
+        notes: str,
+    ) -> ProofArtifact | None:
+        if artifact is None:
+            return None
+        artifact.confidence_score = min(artifact.confidence_score, confidence)
+        self._set_identity_labels(artifact, identity_labels)
+        artifact.evidence_notes = f"{artifact.evidence_notes}; {notes}; identity_labels={','.join(identity_labels)}"
+        return artifact
+
+    def _emit_feedback_payload(
+        self,
+        scan_id: UUID | str,
+        attack_task: AttackTask,
+        attack_probe: RawProbe,
+        artifact: ProofArtifact | None,
+        confidence: float,
+    ) -> None:
+        outcome = self._feedback_outcome(artifact=artifact, attack_probe=attack_probe, confidence=confidence)
+        should_emit = confidence >= self._low_confidence_threshold or outcome in {
+            TaskOutcome.blocked,
+            TaskOutcome.unsafe_blocked,
+        }
+        if not should_emit:
+            return
+
+        endpoint = str(attack_task.endpoint_id)
+
+        parent_evidence_ref = str(artifact.id) if artifact is not None and artifact.id is not None else None
+        finding_class = attack_task.attack_class
+        self._feedback_buffer.append(
+            FeedbackPayload(
+                outcome=outcome,
+                scan_id=str(scan_id),
+                task_id=str(attack_task.id),
+                endpoint=endpoint,
+                finding_class=finding_class,
+                confidence=float(confidence),
+                follow_up_hints=self._follow_up_hints_for_finding_class(finding_class),
+                parent_evidence_ref=parent_evidence_ref,
+            )
+        )
+
+    def _feedback_outcome(
+        self,
+        artifact: ProofArtifact | None,
+        attack_probe: RawProbe,
+        confidence: float,
+    ) -> TaskOutcome:
+        if artifact is not None:
+            if confidence >= self._proof_threshold:
+                return TaskOutcome.success
+            if confidence >= self._low_confidence_threshold:
+                return TaskOutcome.interesting
+
+        response_status = self._extract_status_from_probe(attack_probe=attack_probe)
+        notes = (artifact.evidence_notes if artifact is not None else "").lower()
+        if response_status == 403 or "blocked" in notes or "forbidden" in notes:
+            return TaskOutcome.blocked
+        if "unsafe" in notes:
+            return TaskOutcome.unsafe_blocked
+        if confidence >= self._low_confidence_threshold:
+            return TaskOutcome.needs_followup
+        return TaskOutcome.no_signal
+
+    def _follow_up_hints_for_finding_class(self, finding_class: str) -> list[str]:
+        lowered = finding_class.lower()
+        hints: list[str] = []
+        if lowered == "sensitive_exposure":
+            hints.extend(["replay_with_token", "blast_radius_map"])
+        if lowered.startswith("graphql"):
+            hints.extend(["schema_introspection_fields", "depth_probe"])
+        if "bfla" in lowered:
+            hints.extend(["bfla_follow_up", "privilege_drift"])
+        deduped: list[str] = []
+        for hint in hints:
+            if hint not in deduped:
+                deduped.append(hint)
+        return deduped
 
     def _stream_key(self, scan_id: UUID | str) -> str:
         return f"evidence:{scan_id}"

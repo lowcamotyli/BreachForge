@@ -49,9 +49,19 @@ S1 (Infra+Schema) -> S2 (AuthManager) -> S3 (Crawler) ----->
                                                                                          |
                     S42 (Advanced Race/Concurrency) -> S43 (OOB Callback Infrastructure)
                                                                                          |
-                    S44 (Pre-Auth Recon Pack: HAR/OpenAPI/session import) -> S45 (Unauth Scan Mode)
+                                                            S44 (Pre-Auth Recon Pack: HAR/OpenAPI/session import) -> S45 (Unauth Scan Mode)
                                                                                          |
-                    S46 (Unauth Mode Core: chirurgiczne zmiany dispatcher/worker/planner)
+                    S46 (Unauth Mode Core: chirurgiczne zmiany dispatcher/worker/planner) -> S47 (Runtime Wiring)
+                                                                                         |
+                    S48 (Finding Metadata Persistence) -> S49 (Session Import Hardening) -> S50 (Multi-Identity Matrix)
+                                                                                         |
+                    S51 (State Model Differential) -> S52 (Adaptive Replanning) -> S53 (Business Logic Pack)
+                                                                                         |
+                    S54 (Race Engine v2) -> S55 (Benchmark Lab) -> S56 (Operator Safety)
+                                                                                         |
+                    S57 (Full Benchmark Scan Loop) -> S58 (Benchmark Detection Lift) -> S59 (Multi-Lab Coverage)
+                                                                                         |
+                    S60 (Operator-Grade Auth/Discovery) -> S61 (Autonomous Stateful Loop) -> S62 (Scale/Reliability Gates)
 ```
 
 ## Sprinty
@@ -104,6 +114,22 @@ S1 (Infra+Schema) -> S2 (AuthManager) -> S3 (Crawler) ----->
 | Sprint 44 | Pre-Auth Recon Pack: browser session import (bez hasła), HAR import, OpenAPI/Postman/Insomnia import, JS sourcemap mining, public baseline differential, secret-to-impact bez credentials. | [sprint-44-preauth-recon-pack.md](./sprint-44-preauth-recon-pack.md) |
 | Sprint 45 | Unauth Scan Mode: `unauth_mode: true` flag, requires_auth matrix dla wszystkich rules, wordlist-guided forced browsing, unauth injection na publicznych formach, JS secret scanner. | [sprint-45-unauth-scan-mode.md](./sprint-45-unauth-scan-mode.md) |
 | Sprint 46 | Unauth Mode Core Integration: chirurgiczne zmiany dispatcher.py (L121), attack_worker.py (L166-169), 8 rules z requires_auth=False, anonymous identity selector, 5 playbookow unauth-native. | [sprint-46-unauth-mode-core.md](./sprint-46-unauth-mode-core.md) |
+| Sprint 47 | Runtime Wiring Stabilization: podpiecie recon routera, packaging execution_plane, lazy DB init, unauth scan API lifecycle i crawler bez AuthContext. | [sprint-47-runtime-wiring-stabilization.md](./sprint-47-runtime-wiring-stabilization.md) |
+| Sprint 48 | Finding Metadata Persistence: trwale metadata findingow, Alembic migration, scorer/reporting consistency i reload regression. | [sprint-48-finding-metadata-persistence.md](./sprint-48-finding-metadata-persistence.md) |
+| Sprint 49 | Session Import Hardening: SSRF guardrails, headless/timeout limits, TTL session store i audit bez sekretow. | [sprint-49-session-import-hardening.md](./sprint-49-session-import-hardening.md) |
+| Sprint 50 | Multi-Identity Auth Matrix: realne sesje user/admin/tenant, identity-aware worker, planner i validator differential. | [sprint-50-multi-identity-auth-matrix.md](./sprint-50-multi-identity-auth-matrix.md) |
+| Sprint 51 | State Model And Differential Engine: formalny state snapshot, read-after-write verifier i structural comparators. | [sprint-51-state-model-differential-engine.md](./sprint-51-state-model-differential-engine.md) |
+| Sprint 52 | Adaptive Replanning v1: runtime outcome contract, feedback queue, bounded follow-up tasks i trzy adaptive scenarios. | [sprint-52-adaptive-replanning-v1.md](./sprint-52-adaptive-replanning-v1.md) |
+| Sprint 53 | Business Logic Attack Pack: coupon/negative/price/inventory/approval abuse z state-proof guardrails. | [sprint-53-business-logic-attack-pack.md](./sprint-53-business-logic-attack-pack.md) |
+| Sprint 54 | Race And Concurrency Engine v2: barrier start, race evidence grouping, rate-limit integration i final state reconciliation. | [sprint-54-race-concurrency-engine-v2.md](./sprint-54-race-concurrency-engine-v2.md) |
+| Sprint 55 | Realistic Benchmark Lab: vulnerable SaaS lab, ground truth manifest, benchmark runner i metrics TP/FP/FN. | [sprint-55-realistic-benchmark-lab.md](./sprint-55-realistic-benchmark-lab.md) |
+| Sprint 56 | Operator Safety And Auditability: formal scan policy, kill switch, immutable audit log i transparent reporting. | [sprint-56-operator-safety-auditability.md](./sprint-56-operator-safety-auditability.md) |
+| Sprint 57 | Full Benchmark Scan Loop: `--full` uruchamia realny lokalny scan, zbiera findings i liczy TP/FP/FN bez placeholdera. | [sprint-57-full-benchmark-scan-loop.md](./sprint-57-full-benchmark-scan-loop.md) |
+| Sprint 58 | Benchmark Detection Lift: podniesienie labu z 0/7 do minimum 5/7 TP przy 0 FP i proof artifacts. | [sprint-58-benchmark-detection-lift.md](./sprint-58-benchmark-detection-lift.md) |
+| Sprint 59 | Multi-Lab Coverage Suite: wiele realistycznych labow i coverage per attack class/discovery. | [sprint-59-multi-lab-coverage-suite.md](./sprint-59-multi-lab-coverage-suite.md) |
+| Sprint 60 | Operator Grade Auth And Discovery: auth reliability, discovery completeness i jawne blind spots. | [sprint-60-operator-grade-auth-discovery.md](./sprint-60-operator-grade-auth-discovery.md) |
+| Sprint 61 | Autonomous Stateful Attack Loop: bounded replanning, stateful proof paths i adaptive benchmark scenarios. | [sprint-61-autonomous-stateful-attack-loop.md](./sprint-61-autonomous-stateful-attack-loop.md) |
+| Sprint 62 | Scale Reliability And Quality Gates: duza powierzchnia, failure injection, evidence consistency i release scorecard. | [sprint-62-scale-reliability-quality-gates.md](./sprint-62-scale-reliability-quality-gates.md) |
 
 ---
 

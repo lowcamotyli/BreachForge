@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 
 from execution_plane.planner.rules.base import AssetMap, AttackRule, ScanContext
@@ -22,10 +23,36 @@ class BolaBidirectional(AttackRule):
             and bool(self._id_parameters(endpoint))
         )
 
-    def generate_tasks(self, endpoint: Endpoint, context: ScanContext) -> list[AttackTask]:
+    def generate_tasks(
+        self,
+        endpoint: Endpoint,
+        context: ScanContext,
+        identity_pairs: list[tuple[str, str]] | None = None,
+    ) -> list[AttackTask]:
         hypothesis = "Substitute another users resource ID to confirm unauthorized access"
         tasks: list[AttackTask] = []
+        differential_pairs = identity_pairs or []
         for parameter in self._id_parameters(endpoint):
+            if differential_pairs:
+                for owner_name, attacker_name in differential_pairs:
+                    tasks.append(
+                        AttackTask(
+                            scan_id=context.scan_id,
+                            endpoint_id=endpoint.id,
+                            attack_class=self.attack_class,
+                            target_parameter=parameter,
+                            hypothesis=json.dumps(
+                                {
+                                    "hypothesis": hypothesis,
+                                    "identity_selector": attacker_name,
+                                    "owner_identity": owner_name,
+                                    "differential_probe": True,
+                                },
+                                sort_keys=True,
+                            ),
+                        )
+                    )
+                continue
             tasks.append(
                 AttackTask(
                     scan_id=context.scan_id,

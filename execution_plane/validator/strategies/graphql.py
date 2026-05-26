@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any
 
+from execution_plane.planner.decision_log import FeedbackPayload
 from execution_plane.validator.strategies.base import ValidationStrategy
 from storage.db.models import ProofArtifact, RawProbe
 
@@ -22,7 +23,107 @@ _SUGGESTION_RE = re.compile(r"did you mean", re.IGNORECASE)
 _FIELD_NAME_RE = re.compile(r"\"([a-zA-Z_][a-zA-Z0-9_]*)\"")
 
 
-class GraphqlIntrospectionStrategy(ValidationStrategy):
+class GraphqlAdaptiveFollowupMixin:
+    def validate_adaptive_followup(self, feedback: FeedbackPayload, probe_result: dict) -> ProofArtifact | None:
+        follow_up_hints = set(feedback.follow_up_hints)
+
+        if "schema_driven_field_probe" in follow_up_hints:
+            field_count = self._schema_field_count(probe_result)
+            if field_count > 0:
+                confidence_score = self._schema_field_confidence(field_count)
+                return self._adaptive_artifact(
+                    feedback=feedback,
+                    probe_result=probe_result,
+                    confidence_score=confidence_score,
+                    summary="GraphQL adaptive schema field probe found schema fields.",
+                    evidence_notes=(
+                        "probe_type=graphql_schema_driven_field_probe; "
+                        f"schema_fields={field_count}; parent_evidence_ref={feedback.parent_evidence_ref}"
+                    ),
+                )
+
+        if "depth_exhaustion_probe" in follow_up_hints and self._has_depth_limit_signal(probe_result):
+            return self._adaptive_artifact(
+                feedback=feedback,
+                probe_result=probe_result,
+                confidence_score=0.75,
+                summary="GraphQL adaptive depth probe found depth limit signal.",
+                evidence_notes=(
+                    "probe_type=graphql_depth_exhaustion_probe; depth_limit_signal=true; "
+                    f"parent_evidence_ref={feedback.parent_evidence_ref}"
+                ),
+            )
+
+        return None
+
+    def _schema_field_count(self, value: Any) -> int:
+        if isinstance(value, dict):
+            field_count = 0
+            for key, item in value.items():
+                if key == "fields":
+                    field_count += self._schema_entry_count(item)
+                elif key == "types":
+                    nested_count = self._schema_field_count(item)
+                    field_count += nested_count if nested_count > 0 else self._schema_entry_count(item)
+                else:
+                    field_count += self._schema_field_count(item)
+            return field_count
+        if isinstance(value, list):
+            return sum(self._schema_field_count(item) for item in value)
+        return 0
+
+    def _schema_entry_count(self, value: Any) -> int:
+        if isinstance(value, list):
+            return len(value)
+        if isinstance(value, dict):
+            return len(value)
+        return 1 if value else 0
+
+    def _schema_field_confidence(self, field_count: int) -> float:
+        if field_count >= 10:
+            return 0.87
+        if field_count >= 5:
+            return 0.75
+        return 0.6
+
+    def _has_depth_limit_signal(self, probe_result: dict) -> bool:
+        errors = probe_result.get("errors")
+        if errors is None:
+            return False
+        error_text = self._adaptive_to_text(errors).lower()
+        return "maxdepth" in error_text or "depth" in error_text
+
+    def _adaptive_artifact(
+        self,
+        feedback: FeedbackPayload,
+        probe_result: dict,
+        confidence_score: float,
+        summary: str,
+        evidence_notes: str,
+    ) -> ProofArtifact:
+        artifact = ProofArtifact(
+            attack_task_id=probe_result.get("attack_task_id", feedback.task_id),
+            proof_type=self.expected_proof_type(),
+            confidence_score=confidence_score,
+            attack_probe_id=probe_result.get("attack_probe_id", probe_result.get("probe_id", probe_result.get("id"))),
+            control_probe_id=probe_result.get("control_probe_id"),
+            summary=summary,
+            evidence_notes=evidence_notes,
+        )
+        artifact.parent_evidence_ref = feedback.parent_evidence_ref
+        return artifact
+
+    def _adaptive_to_text(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+        if value is None:
+            return ""
+        return str(value)
+
+
+class GraphqlIntrospectionStrategy(GraphqlAdaptiveFollowupMixin, ValidationStrategy):
     def validate(self, attack_probe: RawProbe, control_probe: RawProbe | None) -> ProofArtifact | None:
         primary_probe, secondary_probe = self._ordered_probes_for_introspection(attack_probe, control_probe)
         for probe in (primary_probe, secondary_probe):
@@ -87,7 +188,7 @@ class GraphqlIntrospectionStrategy(ValidationStrategy):
         return str(value)
 
 
-class GraphqlBatchStrategy(ValidationStrategy):
+class GraphqlBatchStrategy(GraphqlAdaptiveFollowupMixin, ValidationStrategy):
     _THROTTLE_STATUSES = {429, 503}
 
     def validate(self, attack_probe: RawProbe, control_probe: RawProbe | None) -> ProofArtifact | None:
@@ -146,7 +247,7 @@ class GraphqlBatchStrategy(ValidationStrategy):
         return None
 
 
-class GraphqlFieldSuggestionStrategy(ValidationStrategy):
+class GraphqlFieldSuggestionStrategy(GraphqlAdaptiveFollowupMixin, ValidationStrategy):
     def validate(self, attack_probe: RawProbe, control_probe: RawProbe | None) -> ProofArtifact | None:
         body = self._to_text(attack_probe.response.get("body"))
         errors = self._to_text(attack_probe.response.get("errors"))
@@ -215,7 +316,7 @@ class GraphqlFieldSuggestionStrategy(ValidationStrategy):
         return str(value)
 
 
-class GraphqlDepthStrategy(ValidationStrategy):
+class GraphqlDepthStrategy(GraphqlAdaptiveFollowupMixin, ValidationStrategy):
     _TIMEOUT_STATUSES = {408, 504}
     _TIMEOUT_MARKERS: tuple[str, ...] = (
         "timeout",

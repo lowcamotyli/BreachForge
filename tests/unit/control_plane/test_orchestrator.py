@@ -7,8 +7,8 @@ from uuid import uuid4
 import pytest
 
 import control_plane.orchestrator as orchestrator_module
-from control_plane.orchestrator import ScanConfig, ScanOrchestrator
-from storage.db.models import ScanStatus
+from control_plane.orchestrator import ScanConfig, ScanOrchestrator, log_audit_event
+from storage.db.models import AuditEvent, AuditEventType, ScanStatus
 
 
 class _QueueStub:
@@ -83,3 +83,52 @@ async def test_pause_scan_sets_paused_status(monkeypatch: pytest.MonkeyPatch) ->
         status=ScanStatus.paused,
         phase="paused:auth_expired",
     )
+
+
+@pytest.mark.asyncio
+async def test_log_audit_event_strips_credentials() -> None:
+    captured: list[AuditEvent] = []
+
+    class _SessionStub:
+        def add(self, obj: object) -> None:
+            assert isinstance(obj, AuditEvent)
+            captured.append(obj)
+
+        async def commit(self) -> None:
+            return None
+
+    session = _SessionStub()
+    scan_id = uuid4()
+    await log_audit_event(
+        session=session,  # type: ignore[arg-type]
+        scan_id=scan_id,
+        event_type=AuditEventType.POLICY_VIOLATION,
+        details={"authorization": "Bearer secret-token", "nested": {"cookie": "abc", "ok": "1"}},
+    )
+
+    assert len(captured) == 1
+    assert captured[0].details == {"authorization": "[REDACTED]", "nested": {"cookie": "[REDACTED]", "ok": "1"}}
+
+
+@pytest.mark.asyncio
+async def test_log_audit_event_no_commit() -> None:
+    captured: list[AuditEvent] = []
+
+    class _SessionStub:
+        def __init__(self) -> None:
+            self.commit = AsyncMock()
+
+        def add(self, obj: object) -> None:
+            assert isinstance(obj, AuditEvent)
+            captured.append(obj)
+
+    session = _SessionStub()
+    await log_audit_event(
+        session=session,  # type: ignore[arg-type]
+        scan_id=uuid4(),
+        event_type=AuditEventType.SCAN_CREATED,
+        details={"ok": "value"},
+    )
+
+    assert len(captured) == 1
+    session.commit.assert_not_called()

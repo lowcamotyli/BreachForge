@@ -504,7 +504,6 @@ async def _run_crawler_async(scan_id: str) -> None:
     from sqlalchemy import select
     from sqlalchemy.orm import selectinload
 
-    from control_plane.auth_manager import AuthManager, default_pause_scan
     from control_plane.orchestrator import ScanOrchestrator
     from control_plane.reporting import ReportingService
     from storage.db.models import AssetMap as AssetMapRecord
@@ -534,13 +533,21 @@ async def _run_crawler_async(scan_id: str) -> None:
                 raise LookupError(f"Invalid target relation for scan: {scan_id}")
 
             auth_context = scan.auth_context
-            if auth_context is None:
-                raise LookupError(f"Auth context not found for scan: {scan_id}")
-            if not isinstance(auth_context, AuthContext):
-                raise LookupError(f"Invalid auth context relation for scan: {scan_id}")
-
             target_url = target.url
             target_config = target.config if isinstance(target.config, dict) else {}
+            unauth_mode = bool(target_config.get("unauth_mode"))
+
+            if auth_context is None:
+                if not unauth_mode:
+                    raise LookupError(f"Auth context not found for scan: {scan_id}")
+                snapshot_payload: dict[str, object] = {}
+                auth_type = "none"
+            else:
+                if not isinstance(auth_context, AuthContext):
+                    raise LookupError(f"Invalid auth context relation for scan: {scan_id}")
+                snapshot_payload = auth_context.session_snapshot if isinstance(auth_context.session_snapshot, dict) else {}
+                auth_type = auth_context.type
+
             raw_domains = target_config.get("allowed_domains")
             scope_domains = (
                 [domain for domain in raw_domains if isinstance(domain, str) and domain.strip()]
@@ -552,18 +559,19 @@ async def _run_crawler_async(scan_id: str) -> None:
                 if isinstance(parsed_target_host, str) and parsed_target_host:
                     scope_domains = [parsed_target_host]
 
-            snapshot_payload = auth_context.session_snapshot if isinstance(auth_context.session_snapshot, dict) else {}
-            auth_type = auth_context.type
+        if auth_type == "none":
+            session_snapshot = SessionSnapshot(scan_id=scan_uuid, cookies=[], auth_headers={}, csrf_tokens={})
+        else:
+            from control_plane.auth_manager import AuthManager, default_pause_scan
+            from control_plane.auth_manager import _build_auth_input_from_snapshot
 
-        from control_plane.auth_manager import _build_auth_input_from_snapshot
-
-        auth_manager = AuthManager(scan_uuid, AsyncSessionLocal, default_pause_scan)
-        try:
-            auth_input = _build_auth_input_from_snapshot(auth_type, snapshot_payload, scan_uuid)
-            await auth_manager.bootstrap(auth_input)
-            session_snapshot = await auth_manager.get_session_snapshot(scan_uuid)
-        finally:
-            await auth_manager.close()
+            auth_manager = AuthManager(scan_uuid, AsyncSessionLocal, default_pause_scan)
+            try:
+                auth_input = _build_auth_input_from_snapshot(auth_type, snapshot_payload, scan_uuid)
+                await auth_manager.bootstrap(auth_input)
+                session_snapshot = await auth_manager.get_session_snapshot(scan_uuid)
+            finally:
+                await auth_manager.close()
 
         engine = CrawlerReconEngine(
             session_snapshot=session_snapshot,

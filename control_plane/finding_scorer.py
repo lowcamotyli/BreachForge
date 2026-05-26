@@ -145,6 +145,7 @@ class FindingScorer:
         if duplicate is not None:
             artifact.finding = duplicate
             artifact.finding_id = duplicate.id
+            self._attach_follow_up_hints_metadata(finding=duplicate, artifact=artifact)
             self._attach_privilege_fingerprint_metadata(
                 finding=duplicate,
                 privilege_fingerprint=privilege_fingerprint,
@@ -167,25 +168,20 @@ class FindingScorer:
             affected_endpoint_id=endpoint.id,
             repro_steps=self._build_repro_steps(attack_task=attack_task, endpoint=endpoint),
             fix_guidance=self._fix_guidance_for(attack_class=attack_task.attack_class),
-            metadata={
+            extra_metadata={
                 "privilege_fingerprint": _build_privilege_fingerprint_entry(privilege_fingerprint),
             },
         )
 
+        self._attach_follow_up_hints_metadata(finding=finding, artifact=artifact)
         artifact.finding = finding
         self._record_secret_blast_radius_matrix(artifact=artifact, finding=finding, endpoint=endpoint)
         self._attach_leak_source_metadata(finding=finding, artifact=artifact)
         self._apply_secret_exposure_correlation(finding=finding, artifact=artifact)
         chain_root_cause = self._chain_root_cause_id([str(fingerprint)])
-        extra_metadata_raw = getattr(finding, "extra_metadata", None)
-        if isinstance(extra_metadata_raw, dict):
-            extra_metadata_raw["chain_root_cause"] = chain_root_cause
-            finding.extra_metadata = extra_metadata_raw
-        elif hasattr(finding, "metadata"):
-            metadata_raw = getattr(finding, "metadata", None)
-            metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
-            metadata["chain_root_cause"] = chain_root_cause
-            finding.metadata = metadata
+        metadata = _finding_metadata(finding)
+        metadata["chain_root_cause"] = chain_root_cause
+        finding.extra_metadata = metadata
         self._db.add(finding)
         return finding
 
@@ -288,6 +284,10 @@ class FindingScorer:
 
     def _build_scoring_output(self, artifact: ProofArtifact) -> dict[str, Any]:
         confidence = float(artifact.confidence_score)
+        follow_up_hints = self._follow_up_hints_for_finding(
+            attack_class=getattr(getattr(artifact, "attack_task", None), "attack_class", ""),
+            artifact=artifact,
+        )
         score_components = self._score_components_from_artifact(artifact=artifact)
         if score_components is not None:
             try:
@@ -303,6 +303,7 @@ class FindingScorer:
                     "score_version": "v2",
                     "exploitability_score": v2_score.total,
                     "score_explanation": v2_score.explanation,
+                    "follow_up_hints": follow_up_hints,
                 }
             except ValueError:
                 pass
@@ -312,7 +313,47 @@ class FindingScorer:
             "score_version": "v1",
             "exploitability_score": confidence,
             "score_explanation": f"conf={confidence:.2f}",
+            "follow_up_hints": follow_up_hints,
         }
+
+    def _attach_follow_up_hints_metadata(self, finding: Finding, artifact: ProofArtifact) -> None:
+        follow_up_hints = self._follow_up_hints_for_finding(attack_class=finding.attack_class, artifact=artifact)
+        if not follow_up_hints:
+            return
+        metadata = _finding_metadata(finding)
+        metadata["follow_up_hints"] = follow_up_hints
+        finding.extra_metadata = metadata
+
+    def _follow_up_hints_for_finding(self, attack_class: str, artifact: ProofArtifact) -> list[str]:
+        lowered_attack_class = attack_class.lower()
+        hints: list[str] = []
+        if lowered_attack_class in {"sensitive_exposure", "secret_exposure"}:
+            hints.extend(["replay_with_token", "blast_radius_map"])
+        if lowered_attack_class == "graphql_introspection":
+            hints.extend(["schema_driven_field_probe", "depth_exhaustion_probe"])
+        response_has_403_signal = self._artifact_has_403_signal(artifact=artifact)
+        if "bfla" in lowered_attack_class or response_has_403_signal:
+            hints.extend(["bfla_follow_up", "privilege_drift_probe"])
+        deduped: list[str] = []
+        for hint in hints:
+            if hint not in deduped:
+                deduped.append(hint)
+        return deduped
+
+    def _artifact_has_403_signal(self, artifact: ProofArtifact) -> bool:
+        attack_probe = getattr(artifact, "attack_probe", None)
+        response_payload = getattr(attack_probe, "response", None) if attack_probe is not None else None
+        if isinstance(response_payload, dict):
+            status = response_payload.get("status")
+            if status == 403:
+                return True
+            try:
+                if status is not None and int(status) == 403:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        evidence_notes = str(getattr(artifact, "evidence_notes", "")).lower()
+        return "403" in evidence_notes or "forbidden" in evidence_notes
 
     def _score_components_from_artifact(self, artifact: ProofArtifact) -> dict[str, float] | None:
         impact = getattr(artifact, "_score_impact", None)
@@ -368,12 +409,7 @@ class FindingScorer:
             endpoint_method = getattr(endpoint, "method", None)
             matrix_entry["method"] = str(endpoint_method).upper() if endpoint_method is not None else None
 
-        metadata_raw = getattr(finding, "metadata", None)
-        metadata: dict[str, Any]
-        if isinstance(metadata_raw, dict):
-            metadata = metadata_raw
-        else:
-            metadata = {}
+        metadata = _finding_metadata(finding)
         matrix_raw = metadata.get("secret_blast_radius_matrix")
         matrix: list[dict[str, Any]]
         if isinstance(matrix_raw, list):
@@ -382,21 +418,16 @@ class FindingScorer:
             matrix = []
             metadata["secret_blast_radius_matrix"] = matrix
         matrix.append(matrix_entry)
-        finding.metadata = metadata
+        finding.extra_metadata = metadata
 
     def _attach_privilege_fingerprint_metadata(
         self,
         finding: Finding,
         privilege_fingerprint: PrivilegeFingerprint | None,
     ) -> None:
-        metadata_raw = getattr(finding, "metadata", None)
-        metadata: dict[str, Any]
-        if isinstance(metadata_raw, dict):
-            metadata = metadata_raw
-        else:
-            metadata = {}
+        metadata = _finding_metadata(finding)
         metadata["privilege_fingerprint"] = _build_privilege_fingerprint_entry(privilege_fingerprint)
-        finding.metadata = metadata
+        finding.extra_metadata = metadata
 
     def _parse_leak_source_from_notes(self, evidence_notes: str | None) -> dict[str, Any] | None:
         if not isinstance(evidence_notes, str) or not evidence_notes.strip():
@@ -432,14 +463,9 @@ class FindingScorer:
         if leak_source_metadata is None:
             return
 
-        metadata_raw = getattr(finding, "metadata", None)
-        metadata: dict[str, Any]
-        if isinstance(metadata_raw, dict):
-            metadata = metadata_raw
-        else:
-            metadata = {}
+        metadata = _finding_metadata(finding)
         metadata["leak_source"] = leak_source_metadata
-        finding.metadata = metadata
+        finding.extra_metadata = metadata
 
     def _probe_type_for_artifact(self, artifact: ProofArtifact) -> str | None:
         direct_probe_type = getattr(artifact, "probe_type", None)
@@ -487,13 +513,13 @@ class FindingScorer:
             return
 
         finding.severity = upgrade
-        metadata = _metadata_dict(getattr(finding, "metadata", None))
+        metadata = _finding_metadata(finding)
         metadata["severity_factors"] = [
             {"source": factor.source, "confidence": factor.confidence, "description": factor.description}
             for factor in result.severity_factors
         ]
         metadata["severity_explanation"] = "; ".join(factor.description for factor in result.severity_factors)
-        finding.metadata = metadata
+        finding.extra_metadata = metadata
 
     def _is_secret_exposure_finding(self, finding: Finding, artifact: ProofArtifact) -> bool:
         if finding.attack_class == "sensitive_exposure":
@@ -503,7 +529,7 @@ class FindingScorer:
         return any(token in evidence_notes for token in ("secret", "credential", "api_key", "token"))
 
     def _secret_correlation_signals(self, finding: Finding, artifact: ProofArtifact) -> dict[str, Any]:
-        metadata = _metadata_dict(getattr(finding, "metadata", None))
+        metadata = _finding_metadata(finding)
         artifact_metadata = _metadata_dict(getattr(artifact, "metadata", None))
         evidence_metadata = _parse_evidence_notes_metadata(getattr(artifact, "evidence_notes", None))
         sources = (metadata, artifact_metadata, evidence_metadata)
@@ -611,6 +637,10 @@ def _metadata_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _finding_metadata(finding: Finding) -> dict[str, Any]:
+    return _metadata_dict(finding.extra_metadata)
 
 
 def _parse_evidence_notes_metadata(evidence_notes: str | None) -> dict[str, str]:

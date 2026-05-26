@@ -10,6 +10,9 @@ _MIN_PROOF_CONFIDENCE_THRESHOLD = 0.85
 
 
 class WorkflowAbuseStrategy(ValidationStrategy):
+    def requires_state_effect(self) -> bool:
+        return True
+
     def validate(self, attack_probe: RawProbe, control_probe: RawProbe | None) -> ProofArtifact | None:
         evidence_chain = self._extract_chain_steps_from_evidence_notes(attack_probe)
         request_chain = evidence_chain or self._extract_request_chain(attack_probe)
@@ -271,3 +274,115 @@ class WorkflowAbuseStrategy(ValidationStrategy):
                 return json.dumps(value, separators=(",", ":"))
             return str(value)
         return ""
+
+
+class ApprovalBypassValidator(ValidationStrategy):
+    _SUCCESS_CONFIDENCE = 0.91
+    _NO_STATE_DIFF_CAP = 0.75
+
+    def requires_state_effect(self) -> bool:
+        return True
+
+    def expected_proof_type(self) -> str:
+        return "differential"
+
+    def expected_attack_class(self) -> str:
+        return "approval_bypass"
+
+    def validate(self, attack_probe: RawProbe, control_probe: RawProbe | None) -> ProofArtifact | None:
+        response = attack_probe.response
+        request = attack_probe.request
+        state_diff = self._extract_state_diff(response)
+
+        bypass_by_state = self._state_diff_confirms_bypass(state_diff)
+        bypass_by_terminal_success = self._terminal_step_succeeded_without_prereq(request, response)
+        if not bypass_by_state and not bypass_by_terminal_success:
+            return None
+
+        confidence = self._SUCCESS_CONFIDENCE
+        if state_diff is None:
+            confidence = min(confidence, self._NO_STATE_DIFF_CAP)
+
+        summary = "Approval bypass detected: workflow terminal action accepted without required prior approval steps"
+        evidence = {
+            "bypass_by_state": bypass_by_state,
+            "bypass_by_terminal_success": bypass_by_terminal_success,
+            "state_diff_present": state_diff is not None,
+            "status": response.get("status") or response.get("status_code"),
+        }
+        return ProofArtifact(
+            attack_task_id=attack_probe.attack_task_id,
+            proof_type=self.expected_proof_type(),
+            confidence_score=confidence,
+            attack_probe_id=attack_probe.id,
+            control_probe_id=getattr(control_probe, "id", None),
+            state_diff=state_diff,
+            summary=summary,
+            evidence_notes=json.dumps(evidence, sort_keys=True),
+        )
+
+    def _extract_state_diff(self, response: dict[str, Any]) -> dict[str, Any] | None:
+        direct = response.get("state_diff")
+        if isinstance(direct, dict):
+            return direct
+
+        for key in ("diff", "workflow_diff"):
+            candidate = response.get(key)
+            if isinstance(candidate, dict):
+                return candidate
+
+        body = response.get("body")
+        parsed_body: Any = None
+        if isinstance(body, str):
+            try:
+                parsed_body = json.loads(body)
+            except (TypeError, ValueError):
+                parsed_body = None
+        elif isinstance(body, dict):
+            parsed_body = body
+
+        if isinstance(parsed_body, dict):
+            candidate = parsed_body.get("state_diff")
+            if isinstance(candidate, dict):
+                return candidate
+        return None
+
+    def _state_diff_confirms_bypass(self, state_diff: dict[str, Any] | None) -> bool:
+        if state_diff is None:
+            return False
+        serialized = json.dumps(state_diff, sort_keys=True).lower()
+        has_target_state = any(token in serialized for token in ("approved", "active", "completed"))
+        has_missing_intermediate = any(
+            token in serialized for token in ("missing_intermediate", "skipped_state", "pending_approval")
+        )
+        if has_target_state and has_missing_intermediate:
+            return True
+
+        before_state = str(state_diff.get("before") or state_diff.get("from") or "").lower()
+        after_state = str(state_diff.get("after") or state_diff.get("to") or "").lower()
+        if before_state in {"draft", "created"} and after_state in {"approved", "active", "completed"}:
+            path = str(state_diff.get("path") or state_diff.get("transition_path") or "").lower()
+            if "pending" not in path and "review" not in path:
+                return True
+        return False
+
+    def _terminal_step_succeeded_without_prereq(self, request: dict[str, Any], response: dict[str, Any]) -> bool:
+        status = response.get("status") or response.get("status_code")
+        success = isinstance(status, int) and 200 <= status < 300
+        if not success:
+            return False
+
+        request_text = json.dumps(request, sort_keys=True).lower()
+        url = str(request.get("url") or "").lower()
+        terminal = any(token in url for token in ("approve", "confirm", "complete", "activate"))
+        prereq_expected = any(
+            token in request_text
+            for token in ("required_step", "prerequisite", "review", "pending", "pending_approval", "workflow_approval")
+        )
+        return terminal and prereq_expected
+
+
+WORKFLOW_ABUSE_STRATEGY_REGISTRY: dict[str, ValidationStrategy] = {
+    "workflow_abuse": WorkflowAbuseStrategy(),
+    "approval_bypass": ApprovalBypassValidator(),
+}

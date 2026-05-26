@@ -7,7 +7,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, JSON, String, Text, func
-from sqlalchemy.dialects.postgresql import UUID as PGUUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -35,6 +35,17 @@ class AttackTaskStatus(str, enum.Enum):
     running = "running"
     done = "done"
     failed = "failed"
+
+
+class AuditEventType(enum.StrEnum):
+    SCAN_CREATED = "SCAN_CREATED"
+    SCAN_STARTED = "SCAN_STARTED"
+    SCAN_KILLED = "SCAN_KILLED"
+    TASK_DISPATCHED = "TASK_DISPATCHED"
+    TASK_SKIPPED = "TASK_SKIPPED"
+    FINDING_RECORDED = "FINDING_RECORDED"
+    AUTH_FAILED = "AUTH_FAILED"
+    POLICY_VIOLATION = "POLICY_VIOLATION"
 
 
 class Target(Base):
@@ -251,6 +262,7 @@ class Finding(Base):
     affected_endpoint_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("endpoints.id"), nullable=False)
     repro_steps: Mapped[str] = mapped_column(Text, nullable=False)
     fix_guidance: Mapped[str] = mapped_column(Text, nullable=False)
+    extra_metadata: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, nullable=False, default=dict)
     deduplicated_from: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True), ForeignKey("findings.id"), nullable=True)
 
     scan: Mapped[Scan] = relationship(back_populates="findings")
@@ -272,3 +284,17 @@ class AttackPath(Base):
     impact_description: Mapped[str] = mapped_column(Text, nullable=False)
 
     scan: Mapped[Scan] = relationship(back_populates="attack_paths")
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    scan_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("scans.id"), nullable=False)
+    event_type: Mapped[AuditEventType] = mapped_column(
+        Enum(AuditEventType, name="audit_event_type", native_enum=False),
+        nullable=False,
+    )
+    actor: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

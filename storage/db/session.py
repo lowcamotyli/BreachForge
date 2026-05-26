@@ -15,12 +15,28 @@ def _normalize_database_url(url: str) -> str:
     return url
 
 
-DATABASE_URL = _normalize_database_url(os.environ["DATABASE_URL"])
+_session_factory: async_sessionmaker[AsyncSession] | None = None
 
-engine = create_async_engine(DATABASE_URL, future=True, poolclass=NullPool)
-AsyncSessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+
+def _get_session_factory() -> async_sessionmaker[AsyncSession]:
+    global _session_factory
+    if _session_factory is None:
+        raw_url = os.getenv("DATABASE_URL")
+        if not raw_url:
+            raise RuntimeError("DATABASE_URL is required")
+        _session_factory = async_sessionmaker(
+            bind=create_async_engine(_normalize_database_url(raw_url), future=True, poolclass=NullPool),
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+    return _session_factory
+
+
+def AsyncSessionLocal() -> AsyncSession:
+    """Lazy wrapper kept for workers that call AsyncSessionLocal() directly."""
+    return _get_session_factory()()
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with AsyncSessionLocal() as session:
+    async with _get_session_factory()() as session:
         yield session

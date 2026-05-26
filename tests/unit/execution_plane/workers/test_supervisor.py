@@ -4,7 +4,8 @@ import importlib.util
 from pathlib import Path
 import sys
 from types import ModuleType
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 
@@ -157,3 +158,82 @@ def test_terminate_worker_joins_even_when_process_not_alive() -> None:
 
     assert process.join_calls == 1
     assert "attack-0" not in supervisor._workers
+
+
+@pytest.mark.asyncio
+async def test_run_race_window_uses_barrier_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    redis_client = MagicMock()
+    supervisor = WorkerSupervisor(queues=["attack"], redis_client=redis_client)
+    scan = MagicMock(spec=supervisor_module.Scan)
+    scan.id = uuid4()
+    session = MagicMock(spec=supervisor_module.SessionSnapshot)
+    tasks = []
+    for _ in range(2):
+        task = MagicMock(spec=supervisor_module.AttackTask)
+        task.scan_id = scan.id
+        task.hypothesis = '{"endpoint": "https://api.example.test/race"}'
+        tasks.append(task)
+
+    worker = MagicMock()
+    worker.execute.side_effect = [MagicMock(name="coroutine-1"), MagicMock(name="coroutine-2")]
+    monkeypatch.setattr(supervisor_module, "AttackWorker", MagicMock(return_value=worker))
+    raw_probes = [MagicMock(spec=supervisor_module.RawProbe), MagicMock(spec=supervisor_module.RawProbe)]
+    executor = MagicMock()
+    executor.execute_race_group = AsyncMock(return_value=raw_probes)
+    monkeypatch.setattr(supervisor_module, "BarrierRaceExecutor", MagicMock(return_value=executor))
+
+    probes = await supervisor.run_race_window(tasks, session, scan)
+
+    executor.execute_race_group.assert_awaited_once()
+    assert len(probes) == 2
+    assert all(isinstance(probe, supervisor_module.RawProbe) for probe in probes)
+
+
+@pytest.mark.asyncio
+async def test_run_race_window_rejects_cross_scan_tasks() -> None:
+    redis_client = MagicMock()
+    supervisor = WorkerSupervisor(queues=["attack"], redis_client=redis_client)
+    scan = MagicMock(spec=supervisor_module.Scan)
+    scan.id = uuid4()
+    session = MagicMock(spec=supervisor_module.SessionSnapshot)
+    first_task = MagicMock(spec=supervisor_module.AttackTask)
+    first_task.scan_id = scan.id
+    second_task = MagicMock(spec=supervisor_module.AttackTask)
+    second_task.scan_id = uuid4()
+
+    with pytest.raises(WorkerGuardrailViolation):
+        await supervisor.run_race_window([first_task, second_task], session, scan)
+
+
+@pytest.mark.asyncio
+async def test_run_race_window_passes_race_group_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    redis_client = MagicMock()
+    supervisor = WorkerSupervisor(queues=["attack"], redis_client=redis_client)
+    scan = MagicMock(spec=supervisor_module.Scan)
+    scan.id = uuid4()
+    session = MagicMock(spec=supervisor_module.SessionSnapshot)
+    task = MagicMock(spec=supervisor_module.AttackTask)
+    task.scan_id = scan.id
+    task.hypothesis = '{"endpoint": "https://api.example.test/race"}'
+    race_group_id = uuid4()
+
+    worker = MagicMock()
+    worker.execute.return_value = MagicMock(name="coroutine")
+    monkeypatch.setattr(supervisor_module, "AttackWorker", MagicMock(return_value=worker))
+    executor = MagicMock()
+    executor.execute_race_group = AsyncMock(return_value=[MagicMock(spec=supervisor_module.RawProbe)])
+    monkeypatch.setattr(supervisor_module, "BarrierRaceExecutor", MagicMock(return_value=executor))
+
+    await supervisor.run_race_window([task], session, scan, race_group_id=race_group_id)
+
+    assert executor.execute_race_group.await_args.kwargs["race_group_id"] == race_group_id
+
+
+@pytest.mark.asyncio
+async def test_run_race_window_returns_empty_for_no_tasks() -> None:
+    redis_client = MagicMock()
+    supervisor = WorkerSupervisor(queues=["attack"], redis_client=redis_client)
+    scan = MagicMock(spec=supervisor_module.Scan)
+    session = MagicMock(spec=supervisor_module.SessionSnapshot)
+
+    assert await supervisor.run_race_window([], session, scan) == []

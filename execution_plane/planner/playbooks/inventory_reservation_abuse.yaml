@@ -1,0 +1,44 @@
+id: inventory_reservation_abuse
+attack_class: inventory_reservation_abuse
+preconditions:
+  path_contains_any:
+    - cart
+    - reserve
+    - hold
+    - inventory
+    - stock
+    - item
+steps:
+  - id: add_to_cart_without_purchase
+    action: single_probe
+    identity_selector: current_user
+    probe_template:
+      mode: bounded_probe
+      template: add_item_to_cart
+      safe_fixture: true
+      probe_type: state_mutating
+    validator: inventory_reservation_abuse_validator
+    expected_signal: item reserved in cart without completing purchase
+    max_attempts: 2
+  - id: check_inventory_state
+    action: read_probe
+    identity_selector: current_user
+    probe_template:
+      mode: observe
+      template: get_inventory_count
+    observe_only: true
+    expected_signal: inventory_count decreased without order_completed
+    max_attempts: 1
+validators:
+  inventory_reservation_abuse_validator:
+    signal: inventory_decremented_without_purchase
+  state_diff_required: true
+safety_budget:
+  max_requests: 4
+  max_attempts_per_step: 2
+  scope: current_endpoint
+  rate_limit_rps: 0.5
+  proof_gate: default
+  safe_fixture_required: true
+  read_only: false
+  requires_enable_business_logic_mutations: true

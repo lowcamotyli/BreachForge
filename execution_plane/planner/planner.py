@@ -2,31 +2,51 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import hashlib
 import importlib
+import inspect
 import json
+import os
 import pkgutil
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 from uuid import UUID
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from api.models.requests import ScanPolicy
 from control_plane.codex_analyst import CodexAnalyst
 from execution_plane.planner.rules.base import AssetMap, AttackRule, ScanContext
 from execution_plane.planner.rules import base as base_rule_module
 from execution_plane.planner.attack_graph import AttackGraph
-from execution_plane.planner.decision_log import DecisionLog, DecisionLogger
+from execution_plane.planner.decision_log import DecisionLog, DecisionLogger, FeedbackPayload, TaskOutcome
 from execution_plane.planner.path_ranker import PathRanker
 from execution_plane.planner.payload_registry import PayloadRegistry
 from execution_plane.planner.playbook_loader import load_builtin_playbooks
 from execution_plane.planner.playbooks import AttackPlaybook, PlaybookStep, assert_no_secret_like_data
 from storage.db.models import AttackTask, Endpoint, Scan
 
+if TYPE_CHECKING:
+    from control_plane.auth_manager import IdentityContext
+
 MAX_TASKS_PER_ENDPOINT = 50
+MAX_REPLAN_ROUNDS = 5
+MAX_REPLAN_TASKS_PER_JOB = 10
 _IDOR_CLASSES: set[str] = {"bola", "tenant_isolation"}
 _STATE_CHANGING_METHODS: set[str] = {"POST", "PUT", "DELETE"}
+_POLICY_MUTATING_METHODS: set[str] = {"POST", "PUT", "PATCH", "DELETE"}
+_READ_AFTER_WRITE_METHODS: set[str] = {"POST", "PUT", "PATCH"}
+_READ_AFTER_WRITE_ATTACK_CLASSES: set[str] = {
+    "workflow_abuse",
+    "bola",
+    "tenant_isolation",
+    "privilege_escalation",
+    "mass_assignment",
+    "business_logic",
+}
 _STRUCTURED_CONTENT_MARKERS: tuple[str, ...] = ("application/json", "+json", "application/problem+json")
 _OWNERSHIP_IDENTIFIERS: set[str] = {"owner_id", "user_id", "account_id", "org_id"}
 _PRIVILEGE_IDENTIFIERS: set[str] = {"role", "scope", "permission", "user_id", "account_id", "org_id"}
@@ -66,8 +86,9 @@ class PlannerState(str, enum.Enum):
 
 
 class AttackPlanner:
-    def __init__(self, max_tasks_per_endpoint: int = MAX_TASKS_PER_ENDPOINT) -> None:
+    def __init__(self, max_tasks_per_endpoint: int = MAX_TASKS_PER_ENDPOINT, production_safe_mode: bool = False) -> None:
         self.max_tasks_per_endpoint = max_tasks_per_endpoint
+        self.production_safe_mode = production_safe_mode
         self.rules: list[AttackRule] = [rule_class() for rule_class in self._discover_rule_classes()]
         self.path_ranker = PathRanker()
         self.payload_registry = PayloadRegistry()
@@ -78,7 +99,12 @@ class AttackPlanner:
         self._advisory_suggestions: list[dict[str, Any]] = []
         self.state = PlannerState.idle
 
-    def plan(self, context: ScanContext, unauth_mode: bool = False) -> list[AttackTask]:
+    def plan(
+        self,
+        context: ScanContext,
+        unauth_mode: bool = False,
+        identity_matrix: dict[str, IdentityContext] | None = None,
+    ) -> list[AttackTask]:
         self.state = PlannerState.planning
         rules = self.rules
         if unauth_mode:
@@ -90,7 +116,7 @@ class AttackPlanner:
                 filtered_rules.append(rule)
             rules = filtered_rules
 
-        all_tasks = self._generate_candidate_tasks(context, rules)
+        all_tasks = self._generate_candidate_tasks(context, rules, identity_matrix=identity_matrix)
         if not all_tasks:
             self.state = PlannerState.idle
             return []
@@ -151,7 +177,12 @@ class AttackPlanner:
         ]
         return self._rank_tasks(graph=graph, tasks=filtered_tasks)
 
-    def _generate_candidate_tasks(self, context: ScanContext, rules: list[AttackRule] | None = None) -> list[AttackTask]:
+    def _generate_candidate_tasks(
+        self,
+        context: ScanContext,
+        rules: list[AttackRule] | None = None,
+        identity_matrix: dict[str, IdentityContext] | None = None,
+    ) -> list[AttackTask]:
         all_tasks: list[AttackTask] = []
         active_rules = rules or self.rules
         for endpoint in context.asset_map.endpoints:
@@ -159,8 +190,14 @@ class AttackPlanner:
             for rule in active_rules:
                 if not rule.matches(endpoint, context.asset_map):
                     continue
-                generated_tasks = rule.generate_tasks(endpoint, context)
+                generated_tasks = self._generate_rule_tasks(
+                    rule=rule,
+                    endpoint=endpoint,
+                    context=context,
+                    identity_matrix=identity_matrix,
+                )
                 for task in generated_tasks:
+                    self._apply_read_after_write_plan(task=task, endpoint=endpoint)
                     self._enrich_task_with_payloads(task=task, endpoint=endpoint)
                     task.priority_score = self._score_task(task, endpoint)
                 endpoint_tasks.extend(generated_tasks)
@@ -169,6 +206,162 @@ class AttackPlanner:
             all_tasks.extend(endpoint_tasks[: self.max_tasks_per_endpoint])
         all_tasks.sort(key=lambda task: task.priority_score, reverse=True)
         return self._sequence_tasks(all_tasks)
+
+    def _generate_rule_tasks(
+        self,
+        *,
+        rule: AttackRule,
+        endpoint: Endpoint,
+        context: ScanContext,
+        identity_matrix: dict[str, IdentityContext] | None,
+    ) -> list[AttackTask]:
+        identity_pairs = self._identity_pairs_for_rule(rule=rule, identity_matrix=identity_matrix)
+        parameters = inspect.signature(rule.generate_tasks).parameters
+        if "identity_pairs" in parameters:
+            generated = rule.generate_tasks(endpoint, context, identity_pairs=identity_pairs)
+        else:
+            generated = rule.generate_tasks(endpoint, context)
+        if not identity_pairs or rule.attack_class not in {"bola", "tenant_isolation", "privilege_escalation"}:
+            return generated
+        return self._expand_differential_pairs(generated)
+
+    def _identity_pairs_for_rule(
+        self,
+        *,
+        rule: AttackRule,
+        identity_matrix: dict[str, IdentityContext] | None,
+    ) -> list[tuple[str, str]] | None:
+        if rule.attack_class not in {"bola", "tenant_isolation", "privilege_escalation"}:
+            return None
+        if not identity_matrix or len(identity_matrix) < 2:
+            return None
+
+        identities: list[tuple[str, IdentityContext]] = []
+        for index, (identity_name, identity_context) in enumerate(identity_matrix.items()):
+            candidate_name = identity_name.strip() or identity_context.name.strip() or f"identity_{index + 1}"
+            identities.append((candidate_name, identity_context))
+        if len(identities) < 2:
+            return None
+
+        if rule.attack_class == "bola":
+            owner_name = identities[0][0]
+            return [(owner_name, attacker_name) for attacker_name, _ in identities[1:]]
+
+        if rule.attack_class == "tenant_isolation":
+            pairs: list[tuple[str, str]] = []
+            for owner_name, owner_context in identities:
+                owner_tenant = (owner_context.tenant_hint or "").strip().lower()
+                if not owner_tenant:
+                    continue
+                for attacker_name, attacker_context in identities:
+                    if owner_name == attacker_name:
+                        continue
+                    attacker_tenant = (attacker_context.tenant_hint or "").strip().lower()
+                    if not attacker_tenant or attacker_tenant == owner_tenant:
+                        continue
+                    pairs.append((owner_name, attacker_name))
+            return pairs or None
+
+        high_privilege_names: list[str] = []
+        low_privilege_names: list[str] = []
+        for identity_name, identity_context in identities:
+            raw_role = getattr(identity_context.role, "value", identity_context.role)
+            role_hint = str(raw_role).strip().lower()
+            if role_hint in {"admin", "superuser"}:
+                high_privilege_names.append(identity_name)
+            else:
+                low_privilege_names.append(identity_name)
+        if not high_privilege_names or not low_privilege_names:
+            return None
+        return [(owner_name, attacker_name) for owner_name in high_privilege_names for attacker_name in low_privilege_names]
+
+    def _expand_differential_pairs(self, tasks: list[AttackTask]) -> list[AttackTask]:
+        paired_tasks: list[AttackTask] = []
+        for attacker_task in tasks:
+            attacker_hypothesis = self._parse_hypothesis_config(attacker_task.hypothesis)
+            owner_identity = str(attacker_hypothesis.get("owner_identity") or "").strip()
+            attacker_identity = str(attacker_hypothesis.get("identity_selector") or "").strip()
+            is_differential_probe = bool(attacker_hypothesis.get("differential_probe"))
+            if not (owner_identity and attacker_identity and is_differential_probe):
+                paired_tasks.append(attacker_task)
+                continue
+
+            owner_hypothesis = dict(attacker_hypothesis)
+            owner_hypothesis["identity_selector"] = owner_identity
+            owner_hypothesis["owner_identity"] = owner_identity
+            owner_task = AttackTask(
+                scan_id=attacker_task.scan_id,
+                endpoint_id=attacker_task.endpoint_id,
+                attack_class=attacker_task.attack_class,
+                target_parameter=attacker_task.target_parameter,
+                hypothesis=json.dumps(owner_hypothesis, sort_keys=True),
+            )
+            paired_tasks.append(owner_task)
+            paired_tasks.append(attacker_task)
+        return paired_tasks
+
+    def _parse_hypothesis_config(self, hypothesis: str) -> dict[str, Any]:
+        try:
+            parsed = json.loads(hypothesis)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {"hypothesis": hypothesis}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"hypothesis": hypothesis}
+
+    def _build_read_after_write_chain(
+        self,
+        mutation_step: dict[str, Any],
+        endpoint_url: str,
+        extract_field: str | None = None,
+    ) -> list[dict[str, Any]]:
+        mutation_step_payload = dict(mutation_step)
+        follow_up_url = endpoint_url
+        if extract_field:
+            mutation_step_payload["extract"] = {extract_field: "id"}
+            follow_up_url = f"{endpoint_url.rstrip('/')}/{{{extract_field}}}"
+        follow_up_step = {
+            "method": "GET",
+            "url_pattern": follow_up_url,
+            "probe_type": "read_after_write",
+            "extract": None,
+        }
+        return [mutation_step_payload, follow_up_step]
+
+    def _should_plan_read_after_write(self, attack_class: str, method: str) -> bool:
+        return method.upper() in _READ_AFTER_WRITE_METHODS and attack_class in _READ_AFTER_WRITE_ATTACK_CLASSES
+
+    def _apply_read_after_write_plan(self, *, task: AttackTask, endpoint: Endpoint) -> None:
+        method = endpoint.method.upper()
+        if not self._should_plan_read_after_write(task.attack_class, method):
+            return
+
+        hypothesis_config = self._parse_hypothesis_config(task.hypothesis)
+        if "chain_steps" in hypothesis_config:
+            return
+
+        mutation_step: dict[str, Any] = {
+            "method": method,
+            "url_pattern": endpoint.url_pattern,
+            "probe_type": "mutation",
+            "extract": None,
+        }
+
+        extract_field: str | None = None
+        if method == "POST":
+            extract_field = "item_id"
+
+        chain_steps = self._build_read_after_write_chain(
+            mutation_step=mutation_step,
+            endpoint_url=endpoint.url_pattern,
+            extract_field=extract_field,
+        )
+        if getattr(self, "production_safe_mode", False):
+            chain_steps = chain_steps[1:]
+
+        hypothesis_config["chain_steps"] = chain_steps
+        hypothesis_config["read_after_write"] = True
+        task.hypothesis = json.dumps(hypothesis_config, sort_keys=True)
 
     def _build_attack_graph(self, *, context: ScanContext, tasks: list[AttackTask]) -> AttackGraph:
         graph = AttackGraph(scan_id=str(context.scan_id))
@@ -706,9 +899,237 @@ def _contains_any(value: str, needles: list[str]) -> bool:
     return any(needle.lower() in lowered for needle in needles)
 
 
+def filter_tasks_by_policy(tasks: list[AttackTask], policy: ScanPolicy) -> tuple[list[AttackTask], list[dict]]:
+    allowed_tasks: list[AttackTask] = []
+    skipped_records: list[dict] = []
+    allowed_domains = {domain.strip().lower() for domain in policy.allowed_domains if domain.strip()}
+
+    for task in tasks:
+        endpoint = getattr(task, "endpoint", None)
+        method = str(getattr(endpoint, "method", "") or "").upper()
+        url = str(getattr(endpoint, "url_pattern", "") or "")
+
+        if method in _POLICY_MUTATING_METHODS and not policy.mutating_allowed:
+            skipped_records.append(_skipped_task_record(task, f"mutating method {method} blocked by policy"))
+            continue
+
+        parsed_url = urlparse(url)
+        hostname = (parsed_url.hostname or "").lower()
+        if allowed_domains and hostname and hostname not in allowed_domains:
+            skipped_records.append(_skipped_task_record(task, f"domain {hostname} blocked by policy"))
+            continue
+
+        allowed_tasks.append(task)
+
+    return allowed_tasks, skipped_records
+
+
+def _skipped_task_record(task: AttackTask, reason: str) -> dict[str, str]:
+    return {
+        "task_id": str(task.id),
+        "reason": reason,
+        "attack_class": str(task.attack_class),
+    }
+
+
 def plan_attack(scan_id: str, asset_map: dict[str, Any]) -> None:
     """RQ-callable entrypoint for attack planning."""
     asyncio.run(_plan_attack_async(scan_id=scan_id, asset_map=asset_map))
+
+
+def _feedback_payload_from_dict(feedback_payload_dict: dict[str, Any]) -> FeedbackPayload:
+    outcome_raw = feedback_payload_dict.get("outcome", TaskOutcome.no_signal.value)
+    try:
+        outcome = TaskOutcome(str(outcome_raw))
+    except ValueError:
+        outcome = TaskOutcome.no_signal
+    return FeedbackPayload(
+        outcome=outcome,
+        scan_id=str(feedback_payload_dict.get("scan_id", "")),
+        task_id=str(feedback_payload_dict.get("task_id", "")),
+        endpoint=str(feedback_payload_dict.get("endpoint", "")),
+        finding_class=str(feedback_payload_dict.get("finding_class", "")),
+        confidence=float(feedback_payload_dict.get("confidence", 0.0)),
+        follow_up_hints=[str(hint) for hint in feedback_payload_dict.get("follow_up_hints", []) if isinstance(hint, str)],
+        parent_evidence_ref=(
+            str(feedback_payload_dict["parent_evidence_ref"])
+            if feedback_payload_dict.get("parent_evidence_ref") is not None
+            else None
+        ),
+        metadata=feedback_payload_dict.get("metadata", {}) if isinstance(feedback_payload_dict.get("metadata"), dict) else {},
+    )
+
+
+def _select_followup_playbook(feedback: FeedbackPayload) -> str | None:
+    hints = {hint.strip().lower() for hint in feedback.follow_up_hints if isinstance(hint, str)}
+    finding_class = feedback.finding_class.strip().lower()
+    outcome = getattr(feedback.outcome, "value", str(feedback.outcome)).strip().lower()
+
+    if finding_class in {"sensitive_exposure", "secret_exposure"} and "replay_with_token" in hints:
+        return "sensitive_exposure_adaptive_followup"
+    if finding_class == "graphql_introspection" and "schema_driven_field_probe" in hints:
+        return "graphql_schema_driven_probe"
+    if outcome == TaskOutcome.blocked.value and "bfla_follow_up" in hints:
+        return "bfla_role_switch"
+    if outcome == TaskOutcome.needs_followup.value:
+        normalized = finding_class or "generic"
+        return f"{normalized}_followup"
+    return None
+
+
+def _followup_task_fingerprint(
+    scan_id: str,
+    endpoint_id: str,
+    attack_class: str,
+    hypothesis_fragment: str,
+) -> str:
+    joined = "|".join(
+        (
+            str(scan_id).strip(),
+            str(endpoint_id).strip(),
+            str(attack_class).strip().lower(),
+            str(hypothesis_fragment).strip(),
+        )
+    )
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+async def _check_replan_budget(scan_id: str, redis_client: Any) -> bool:
+    rounds_key = f"replan:rounds:{scan_id}"
+    rounds = await redis_client.incr(rounds_key)
+    if rounds == 1:
+        await redis_client.expire(rounds_key, 86400)
+    return rounds <= MAX_REPLAN_ROUNDS
+
+
+async def replan_attack(scan_id: str, feedback_payload_dict: dict[str, Any]) -> None:
+    from redis.asyncio import Redis as AsyncRedis
+    from sqlalchemy.orm import selectinload
+    from storage.db.session import AsyncSessionLocal
+
+    feedback = _feedback_payload_from_dict(feedback_payload_dict)
+    playbook_id = _select_followup_playbook(feedback)
+    if not playbook_id:
+        logger.info("replan_no_matching_playbook", scan_id=scan_id, finding_class=feedback.finding_class)
+        return
+
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        logger.warning("replan_redis_url_missing", scan_id=scan_id)
+        return
+
+    redis_client = AsyncRedis.from_url(redis_url, decode_responses=True)
+    try:
+        budget_ok = await _check_replan_budget(scan_id, redis_client)
+        if not budget_ok:
+            logger.info("replan_budget_exhausted", scan_id=scan_id)
+            return
+
+        scan_uuid = UUID(scan_id)
+        task_uuid = UUID(feedback.task_id)
+        async with AsyncSessionLocal() as session:
+            source_task_result = await session.execute(
+                select(AttackTask)
+                .where(AttackTask.id == task_uuid, AttackTask.scan_id == scan_uuid)
+                .options(selectinload(AttackTask.endpoint))
+            )
+            source_task = source_task_result.scalar_one_or_none()
+            if source_task is None or source_task.endpoint is None:
+                logger.warning("replan_source_task_or_endpoint_missing", scan_id=scan_id, task_id=feedback.task_id)
+                return
+
+            scan_record = await _load_scan_with_asset_map(session=session, scan_id=scan_uuid)
+            if scan_record is None or scan_record.asset_map is None:
+                logger.warning("replan_scan_or_asset_map_missing", scan_id=scan_id)
+                return
+
+            from storage.db.models import ScanStatus as _ScanStatus
+            if scan_record.status not in {_ScanStatus.running, _ScanStatus.created}:
+                logger.info("replan_scan_not_active", scan_id=scan_id, status=str(scan_record.status))
+                return
+
+            planner = AttackPlanner()
+            selected_playbook = next((playbook for playbook in planner.playbooks if playbook.id == playbook_id), None)
+            if selected_playbook is None:
+                logger.warning("replan_playbook_not_found", scan_id=scan_id, playbook_id=playbook_id)
+                return
+
+            target_url = _resolve_target_url(asset_map={}, scan=scan_record)
+            context = ScanContext(scan_id=scan_uuid, target_url=target_url, asset_map=scan_record.asset_map)
+            candidate_tasks = planner._tasks_from_playbook(
+                playbook=selected_playbook,
+                endpoint=source_task.endpoint,
+                context=context,
+                selection_reason="adaptive_replan",
+            )
+
+            dedup_key = f"replan:dedup:{scan_id}"
+            created_count = 0
+            for task in candidate_tasks[:MAX_REPLAN_TASKS_PER_JOB]:
+                hypothesis_payload = planner._parse_hypothesis_config(task.hypothesis)
+                if feedback.parent_evidence_ref is not None:
+                    hypothesis_payload["parent_evidence_ref"] = feedback.parent_evidence_ref
+                    task.hypothesis = json.dumps(hypothesis_payload, sort_keys=True)
+                task.parent_evidence_ref = feedback.parent_evidence_ref
+
+                hypothesis_fragment = str(hypothesis_payload.get("step_id") or hypothesis_payload.get("probe_type") or task.hypothesis)
+                fingerprint = _followup_task_fingerprint(
+                    scan_id=scan_id,
+                    endpoint_id=str(task.endpoint_id),
+                    attack_class=task.attack_class,
+                    hypothesis_fragment=hypothesis_fragment,
+                )
+                already_exists = await redis_client.sismember(dedup_key, fingerprint)
+                if already_exists:
+                    continue
+                await redis_client.sadd(dedup_key, fingerprint)
+                await redis_client.expire(dedup_key, 86400)
+                session.add(task)
+                created_count += 1
+
+            if created_count > 0:
+                await session.commit()
+            logger.info(
+                "replan_attack_tasks_created",
+                scan_id=scan_id,
+                playbook_id=playbook_id,
+                created_count=created_count,
+            )
+    except Exception as exc:
+        logger.exception("replan_attack_failed", scan_id=scan_id)
+    finally:
+        await redis_client.aclose()
+
+
+def rq_enqueue_replan(scan_id: str, feedback: FeedbackPayload | dict[str, Any]) -> None:
+    from redis import Redis
+    from rq import Queue as RQueue
+
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        logger.warning("rq_enqueue_replan_redis_url_missing", scan_id=scan_id)
+        return
+
+    feedback_payload_dict: dict[str, Any]
+    if isinstance(feedback, FeedbackPayload):
+        feedback_payload_dict = {
+            "outcome": getattr(feedback.outcome, "value", str(feedback.outcome)),
+            "scan_id": feedback.scan_id,
+            "task_id": feedback.task_id,
+            "endpoint": feedback.endpoint,
+            "finding_class": feedback.finding_class,
+            "confidence": feedback.confidence,
+            "follow_up_hints": feedback.follow_up_hints,
+            "parent_evidence_ref": feedback.parent_evidence_ref,
+            "metadata": feedback.metadata,
+        }
+    else:
+        feedback_payload_dict = feedback
+
+    queue_name = os.getenv("RQ_ATTACK_QUEUE", "attack_planning")
+    queue = RQueue(name=queue_name, connection=Redis.from_url(redis_url))
+    queue.enqueue("execution_plane.planner.planner.replan_attack", scan_id, feedback_payload_dict)
+    logger.info("rq_replan_enqueued", scan_id=scan_id, queue=queue_name)
 
 
 async def _plan_attack_async(scan_id: str, asset_map: dict[str, Any]) -> None:
@@ -727,6 +1148,13 @@ async def _plan_attack_async(scan_id: str, asset_map: dict[str, Any]) -> None:
 
         planner = AttackPlanner()
         tasks = planner.plan(scan_context)
+        endpoint_by_id = {endpoint.id: endpoint for endpoint in endpoints}
+        for task in tasks:
+            endpoint = endpoint_by_id.get(task.endpoint_id)
+            if endpoint is not None:
+                task.endpoint = endpoint
+        policy = _policy_from_scan(scan_record)
+        tasks, skipped_records = filter_tasks_by_policy(tasks, policy)
         session.add_all(tasks)
         await session.commit()
         try:
@@ -736,6 +1164,7 @@ async def _plan_attack_async(scan_id: str, asset_map: dict[str, Any]) -> None:
             _redis_url = os.getenv("REDIS_URL")
             if _redis_url:
                 _conn = Redis.from_url(_redis_url)
+                _store_skipped_task_records(_conn, scan_id, skipped_records)
                 _q = RQueue(name=os.getenv("RQ_ATTACK_QUEUE", "attack_planning"), connection=_conn)
                 _q.enqueue("execution_plane.workers.dispatcher.dispatch_attack_tasks", scan_id)
                 logger.info("attack_dispatch_enqueued", scan_id=scan_id, task_count=len(tasks))
@@ -763,3 +1192,24 @@ def _resolve_target_url(*, asset_map: dict[str, Any], scan: Scan) -> str:
     if scan.target is not None and isinstance(scan.target.url, str):
         return scan.target.url
     return ""
+
+
+def _policy_from_scan(scan: Scan) -> ScanPolicy:
+    config = scan.target.config if scan.target is not None and isinstance(scan.target.config, dict) else {}
+    raw_policy = config.get("policy")
+    if isinstance(raw_policy, ScanPolicy):
+        return raw_policy
+    if isinstance(raw_policy, dict):
+        return ScanPolicy(**raw_policy)
+    allowed_domains = config.get("allowed_domains")
+    if isinstance(allowed_domains, list):
+        return ScanPolicy(allowed_domains=[str(domain) for domain in allowed_domains if domain])
+    return ScanPolicy()
+
+
+def _store_skipped_task_records(redis_client: Any, scan_id: str, skipped_records: list[dict]) -> None:
+    if not skipped_records:
+        return
+    key = f"skipped_tasks:{scan_id}"
+    for record in skipped_records:
+        redis_client.rpush(key, json.dumps(record, sort_keys=True))

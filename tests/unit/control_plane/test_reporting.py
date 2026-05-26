@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from uuid import uuid4
 
+import pytest
 from control_plane.reporting import ReportingService
 
 
@@ -54,6 +56,33 @@ def test_redact_report_redacts_sensitive_value_patterns() -> None:
     assert response["json"]["message"] == "[REDACTED]"
     assert response["json"]["nested"][0] == "safe-value"
     assert response["json"]["nested"][1] == "[REDACTED]"
+
+
+def test_redact_identity_info_keeps_only_safe_identity_fields() -> None:
+    service = ReportingService(db=None)
+    identity_info = {
+        "name": "current_user",
+        "role_hint": "user",
+        "tenant_hint": "tenant-a",
+        "identity_labels": ["current_user", "alternate_user"],
+        "credentials": {"username": "alice", "password": "secret"},
+        "cookies": [{"name": "sid", "value": "secret"}],
+        "bearer_token": "secret-token",
+        "password": "secret",
+        "token": "secret-token",
+        "secret": "secret",
+        "auth_headers": {"Authorization": "Bearer secret"},
+        "extra": "ignored",
+    }
+
+    redacted = service._redact_identity_info(identity_info)
+
+    assert redacted == {
+        "name": "current_user",
+        "role_hint": "user",
+        "tenant_hint": "tenant-a",
+        "identity_labels": ["current_user", "alternate_user"],
+    }
 
 
 def test_redact_evidence_redacts_request_headers() -> None:
@@ -975,3 +1004,276 @@ def test_render_markdown_backward_compat_no_crash_on_none_metadata() -> None:
     }
     result = service.render_markdown({"scan_id": "s1", "findings": [old_finding], "generated_at": "2026-04-26T00:00:00"})
     assert "Executive Summary" in result
+
+
+def test_extra_metadata_is_separate_from_orm_metadata_class() -> None:
+    from storage.db.models import Finding, Severity
+    import sqlalchemy as sa
+
+    endpoint_id = uuid4()
+    finding = Finding(
+        id=uuid4(), scan_id=uuid4(),
+        title="Sensitive exposure", description="desc",
+        severity=Severity.high, attack_class="sensitive_exposure",
+        affected_endpoint_id=endpoint_id,
+        repro_steps="steps", fix_guidance="fix",
+    )
+    matrix = [{"endpoint": "/api/secret", "method": "GET", "status": 200,
+               "content_type": "application/json", "response_size": 100, "auth_accepted": True}]
+    finding.extra_metadata = {"secret_blast_radius_matrix": matrix}
+    assert finding.extra_metadata == {"secret_blast_radius_matrix": matrix}
+    assert not (isinstance(finding.metadata, dict) and "secret_blast_radius_matrix" in finding.metadata)
+
+
+@pytest.mark.asyncio
+async def test_assemble_report_propagates_extra_metadata_to_output() -> None:
+    from unittest.mock import AsyncMock, MagicMock
+    from storage.db.models import Finding, Severity, Scan, Target, Endpoint
+    from control_plane.reporting import ReportingService
+
+    scan_id = uuid4()
+    target = Target(id=uuid4(), url="https://example.com", name="test", config={})
+    scan = Scan(id=scan_id, target_id=target.id, status="complete")
+    scan.target = target
+
+    endpoint = Endpoint(
+        id=uuid4(), asset_map_id=uuid4(), url_pattern="/api/data",
+        method="GET", auth_required=True, parameters=[],
+    )
+    finding = Finding(
+        id=uuid4(), scan_id=scan_id,
+        title="Sensitive exposure", description="desc",
+        severity=Severity.high, attack_class="sensitive_exposure",
+        affected_endpoint_id=endpoint.id,
+        repro_steps="steps", fix_guidance="fix",
+    )
+    matrix = [{"endpoint": "/api/secret", "method": "GET", "status": 200,
+               "content_type": "application/json", "response_size": 100, "auth_accepted": True}]
+    finding.extra_metadata = {"secret_blast_radius_matrix": matrix}
+    finding.affected_endpoint = endpoint
+    finding.proof_artifacts = []
+
+    db = AsyncMock()
+    scan_result = MagicMock()
+    scan_result.scalar_one_or_none.return_value = scan
+    findings_result = MagicMock()
+    findings_result.scalars.return_value.all.return_value = [finding]
+    db.execute = AsyncMock(side_effect=[scan_result, findings_result])
+
+    service = ReportingService(db=db, evidence_store=None)
+    service._evidence_store = None
+
+    report = await service.assemble_report(scan_id)
+
+    findings = report["findings"]
+    assert len(findings) == 1
+    metadata = findings[0].get("metadata")
+    assert isinstance(metadata, dict)
+    assert "secret_blast_radius_matrix" in metadata
+    assert len(metadata["secret_blast_radius_matrix"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_assemble_report_adds_identity_context_from_evidence_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+    from storage.db.models import Endpoint, Finding, ProofArtifact, Scan, Severity, Target
+    from control_plane.reporting import ReportingService
+
+    scan_id = uuid4()
+    target = Target(id=uuid4(), url="https://example.com", name="test", config={})
+    scan = Scan(id=scan_id, target_id=target.id, status="complete")
+    scan.target = target
+
+    endpoint = Endpoint(
+        id=uuid4(), asset_map_id=uuid4(), url_pattern="/api/data",
+        method="GET", auth_required=True, parameters=[],
+    )
+    finding = Finding(
+        id=uuid4(), scan_id=scan_id,
+        title="BOLA", description="desc",
+        severity=Severity.high, attack_class="bola",
+        affected_endpoint_id=endpoint.id,
+        repro_steps="steps", fix_guidance="fix",
+    )
+    finding.extra_metadata = {}
+    finding.affected_endpoint = endpoint
+    finding.proof_artifacts = [
+        ProofArtifact(
+            id=uuid4(),
+            attack_task_id=uuid4(),
+            proof_type="differential",
+            confidence_score=0.95,
+            attack_probe_id=uuid4(),
+            summary="summary",
+            evidence_notes="notes",
+        )
+    ]
+
+    db = AsyncMock()
+    scan_result = MagicMock()
+    scan_result.scalar_one_or_none.return_value = scan
+    findings_result = MagicMock()
+    findings_result.scalars.return_value.all.return_value = [finding]
+    db.execute = AsyncMock(side_effect=[scan_result, findings_result])
+
+    service = ReportingService(db=db, evidence_store=None)
+    service._evidence_store = None
+    monkeypatch.setattr(
+        service,
+        "_artifact_payload",
+        lambda **_: {
+            "artifact_id": "artifact-1",
+            "proof_type": "differential",
+            "confidence_score": 0.95,
+            "identity_labels": ["current_user", "alternate_user"],
+            "credentials": {"password": "secret"},
+            "auth_headers": {"Authorization": "Bearer secret"},
+            "request": {},
+            "response": {},
+        },
+    )
+
+    report = await service.assemble_report(scan_id)
+
+    finding_report = report["findings"][0]
+    assert finding_report["identity_context"] == {
+        "identities_used": ["current_user", "alternate_user"],
+    }
+    assert "credentials" not in finding_report["identity_context"]
+    assert "auth_headers" not in finding_report["identity_context"]
+
+
+@pytest.mark.asyncio
+async def test_assemble_report_omits_identity_context_without_identity_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+    from storage.db.models import Endpoint, Finding, ProofArtifact, Scan, Severity, Target
+    from control_plane.reporting import ReportingService
+
+    scan_id = uuid4()
+    target = Target(id=uuid4(), url="https://example.com", name="test", config={})
+    scan = Scan(id=scan_id, target_id=target.id, status="complete")
+    scan.target = target
+
+    endpoint = Endpoint(
+        id=uuid4(), asset_map_id=uuid4(), url_pattern="/api/data",
+        method="GET", auth_required=True, parameters=[],
+    )
+    finding = Finding(
+        id=uuid4(), scan_id=scan_id,
+        title="BOLA", description="desc",
+        severity=Severity.high, attack_class="bola",
+        affected_endpoint_id=endpoint.id,
+        repro_steps="steps", fix_guidance="fix",
+    )
+    finding.extra_metadata = {}
+    finding.affected_endpoint = endpoint
+    finding.proof_artifacts = [
+        ProofArtifact(
+            id=uuid4(),
+            attack_task_id=uuid4(),
+            proof_type="differential",
+            confidence_score=0.95,
+            attack_probe_id=uuid4(),
+            summary="summary",
+            evidence_notes="notes",
+        )
+    ]
+
+    db = AsyncMock()
+    scan_result = MagicMock()
+    scan_result.scalar_one_or_none.return_value = scan
+    findings_result = MagicMock()
+    findings_result.scalars.return_value.all.return_value = [finding]
+    db.execute = AsyncMock(side_effect=[scan_result, findings_result])
+
+    service = ReportingService(db=db, evidence_store=None)
+    service._evidence_store = None
+    monkeypatch.setattr(service, "_artifact_payload", lambda **_: {"request": {}, "response": {}})
+
+    report = await service.assemble_report(scan_id)
+
+    assert "identity_context" not in report["findings"][0]
+
+
+@pytest.mark.asyncio
+async def test_report_includes_actions_performed() -> None:
+    from unittest.mock import AsyncMock, MagicMock
+    from storage.db.models import Scan, Target
+
+    scan_id = uuid4()
+    target = Target(id=uuid4(), url="https://example.com", name="test", config={})
+    scan = Scan(id=scan_id, target_id=target.id, status="complete")
+    scan.target = target
+
+    scan_result = MagicMock()
+    scan_result.scalar_one_or_none.return_value = scan
+    findings_result = MagicMock()
+    findings_result.scalars.return_value.all.return_value = []
+    total_requests_result = MagicMock()
+    total_requests_result.scalar_one.return_value = 2
+    tasks_dispatched_result = MagicMock()
+    tasks_dispatched_result.scalar_one.return_value = 3
+    by_class_result = MagicMock()
+    by_class_result.all.return_value = [("bola", 2)]
+    tasks_with_findings_result = MagicMock()
+    tasks_with_findings_result.scalar_one.return_value = 1
+
+    db = AsyncMock()
+    db.execute = AsyncMock(
+        side_effect=[
+            scan_result,
+            findings_result,
+            total_requests_result,
+            tasks_dispatched_result,
+            by_class_result,
+            tasks_with_findings_result,
+        ]
+    )
+
+    service = ReportingService(db=db, evidence_store=None)
+    service._evidence_store = None
+
+    report = await service.assemble_report(scan_id)
+
+    assert report["actions_performed"] == {
+        "total_requests_sent": 2,
+        "requests_by_attack_class": {"bola": 2},
+        "tasks_dispatched": 3,
+        "tasks_with_findings": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_report_includes_skipped_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeRedis:
+        async def lrange(self, key: str, start: int, stop: int) -> list[str]:
+            assert key == f"skipped_tasks:{scan_id}"
+            assert start == 0
+            assert stop == -1
+            return [json.dumps({"task_id": "task-1", "reason": "blocked", "attack_class": "bola"})]
+
+        async def aclose(self) -> None:
+            return None
+
+    scan_id = uuid4()
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setattr("redis.asyncio.Redis.from_url", lambda *_, **__: FakeRedis())
+
+    service = ReportingService(db=None, evidence_store=None)
+
+    skipped_blocked = await service._skipped_blocked(scan_id)
+
+    assert skipped_blocked == {
+        "tasks_skipped": 1,
+        "skipped_details": [{"task_id": "task-1", "reason": "blocked", "attack_class": "bola"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_report_skipped_blocked_empty_on_no_redis(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    service = ReportingService(db=None, evidence_store=None)
+
+    skipped_blocked = await service._skipped_blocked(uuid4())
+
+    assert skipped_blocked == {"tasks_skipped": 0, "skipped_details": []}

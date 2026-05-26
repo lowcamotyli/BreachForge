@@ -4,6 +4,7 @@ import json
 import re
 from collections.abc import Iterable
 
+from execution_plane.planner.decision_log import FeedbackPayload
 from execution_plane.planner.rules.base import AssetMap, AttackRule, ScanContext
 from storage.db.models import AttackTask, Endpoint
 
@@ -113,6 +114,63 @@ class BflaRule(AttackRule):
                 priority_score=0.96 if "restricted_path" in indicators else 0.91,
             )
         ]
+
+    def generate_adaptive_followups(
+        self, feedback: FeedbackPayload, endpoint: Endpoint, context: ScanContext
+    ) -> list[AttackTask]:
+        tasks: list[AttackTask] = []
+        outcome = getattr(feedback.outcome, "value", feedback.outcome)
+        follow_up_hints = set(feedback.follow_up_hints)
+
+        if outcome == "blocked" and "bfla_follow_up" in follow_up_hints:
+            for role in _DEFAULT_LOW_PRIV_ROLES:
+                task = AttackTask(
+                    scan_id=context.scan_id,
+                    endpoint_id=endpoint.id,
+                    attack_class=self.attack_class,
+                    target_parameter=f"authorization:{role}",
+                    hypothesis=json.dumps(
+                        {
+                            "probe_type": "bfla_role_switch_follow_up",
+                            "identity_selector": role,
+                            "method": endpoint.method.upper(),
+                            "url_pattern": endpoint.url_pattern,
+                            "expected_status": [403, 404],
+                            "parent_evidence_ref": feedback.parent_evidence_ref,
+                            "requires_cross_role_probing": True,
+                            "read_only": endpoint.method.upper() == "GET",
+                        },
+                        sort_keys=True,
+                    ),
+                    priority_score=0.9,
+                )
+                task.parent_evidence_ref = feedback.parent_evidence_ref
+                tasks.append(task)
+
+        if outcome == "interesting":
+            for elevated_role in self._elevated_roles:
+                task = AttackTask(
+                    scan_id=context.scan_id,
+                    endpoint_id=endpoint.id,
+                    attack_class="privilege_escalation",
+                    target_parameter=f"privilege_drift:{elevated_role}",
+                    hypothesis=json.dumps(
+                        {
+                            "probe_type": "privilege_drift_follow_up",
+                            "candidate_elevated_role": elevated_role,
+                            "method": endpoint.method.upper(),
+                            "url_pattern": endpoint.url_pattern,
+                            "parent_evidence_ref": feedback.parent_evidence_ref,
+                            "requires_cross_role_probing": True,
+                        },
+                        sort_keys=True,
+                    ),
+                    priority_score=0.87,
+                )
+                task.parent_evidence_ref = feedback.parent_evidence_ref
+                tasks.append(task)
+
+        return tasks
 
     def expected_proof_signal(self) -> str:
         return "Low-privilege identity successfully accesses admin-only function or restricted HTTP action"

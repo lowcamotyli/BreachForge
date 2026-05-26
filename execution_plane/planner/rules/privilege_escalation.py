@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import re
 
+from execution_plane.planner.decision_log import FeedbackPayload
 from execution_plane.planner.rules.base import AssetMap, AttackRule, ScanContext
 from storage.db.models import AttackTask, Endpoint
 
 _PRIVILEGE_PARAMS: tuple[str, ...] = ("role", "user_id", "account_id", "org_id", "scope")
+_ELEVATED_ROLE_VALUES: tuple[str, ...] = ("admin", "manager", "owner", "superuser")
 _PATH_PARAM_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 _SUPPORTED_LOCATIONS: set[str] = {"path", "query", "body", "json", "form"}
 
@@ -19,18 +22,79 @@ class PrivilegeEscalation(AttackRule):
         del asset_map
         return bool(self._collect_targets(endpoint))
 
-    def generate_tasks(self, endpoint: Endpoint, context: ScanContext) -> list[AttackTask]:
+    def generate_tasks(
+        self,
+        endpoint: Endpoint,
+        context: ScanContext,
+        identity_pairs: list[tuple[str, str]] | None = None,
+    ) -> list[AttackTask]:
         substitution_targets = self._collect_targets(endpoint)
-        return [
-            AttackTask(
+        differential_pairs = identity_pairs or []
+        tasks: list[AttackTask] = []
+        for target in substitution_targets:
+            hypothesis = f"Substitute {target} with elevated/foreign value and confirm privilege boundary failure"
+            if differential_pairs:
+                for owner_name, low_privilege_name in differential_pairs:
+                    tasks.append(
+                        AttackTask(
+                            scan_id=context.scan_id,
+                            endpoint_id=endpoint.id,
+                            attack_class=self.attack_class,
+                            target_parameter=target,
+                            hypothesis=json.dumps(
+                                {
+                                    "hypothesis": hypothesis,
+                                    "identity_selector": low_privilege_name,
+                                    "owner_identity": owner_name,
+                                    "differential_probe": True,
+                                },
+                                sort_keys=True,
+                            ),
+                        )
+                    )
+                continue
+            tasks.append(
+                AttackTask(
+                    scan_id=context.scan_id,
+                    endpoint_id=endpoint.id,
+                    attack_class=self.attack_class,
+                    target_parameter=target,
+                    hypothesis=hypothesis,
+                )
+            )
+        return tasks
+
+    def generate_adaptive_followups(
+        self, feedback: FeedbackPayload, endpoint: Endpoint, context: ScanContext
+    ) -> list[AttackTask]:
+        outcome = getattr(feedback.outcome, "value", feedback.outcome)
+        if outcome != "blocked":
+            return []
+
+        tasks: list[AttackTask] = []
+        for target in _PRIVILEGE_PARAMS:
+            task = AttackTask(
                 scan_id=context.scan_id,
                 endpoint_id=endpoint.id,
                 attack_class=self.attack_class,
                 target_parameter=target,
-                hypothesis=f"Substitute {target} with elevated/foreign value and confirm privilege boundary failure",
+                hypothesis=json.dumps(
+                    {
+                        "probe_type": "privilege_role_probe_follow_up",
+                        "target_parameter": target,
+                        "elevated_role_candidates": list(_ELEVATED_ROLE_VALUES),
+                        "method": endpoint.method.upper(),
+                        "url_pattern": endpoint.url_pattern,
+                        "parent_evidence_ref": feedback.parent_evidence_ref,
+                    },
+                    sort_keys=True,
+                ),
+                priority_score=0.84,
             )
-            for target in substitution_targets
-        ]
+            task.parent_evidence_ref = feedback.parent_evidence_ref
+            tasks.append(task)
+
+        return tasks
 
     def expected_proof_signal(self) -> str:
         return "Response confirms attacker obtained higher privilege context than baseline"

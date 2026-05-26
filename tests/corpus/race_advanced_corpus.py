@@ -8,6 +8,7 @@ from execution_plane.validator.strategies.race_advanced import (
     DistributedLockEvasionStrategy,
     DoubleSpendStrategy,
     IdempotencyBypassStrategy,
+    InventoryReservationStrategy,
     LimitOverrideRaceStrategy,
 )
 from storage.db.models import ProofArtifact, RawProbe
@@ -196,3 +197,26 @@ def test_distributed_lock_evasion_finding() -> None:
     assert isinstance(artifact, ProofArtifact)
     assert artifact.confidence_score >= 0.85
     assert strategy.expected_attack_class() == "distributed_lock_evasion"
+
+
+def test_inventory_reservation_race_finding() -> None:
+    probe = _probe(
+        request={
+            "safe_fixture": True,
+            "attack_class": "inventory_reservation_abuse",
+            "requests_sent": 5,
+            "final_state": {"reserved": 5, "available": 2},
+        },
+        response={
+            "status_code": 200,
+            "accepted_count": 5,
+            "available_stock": 2,
+            "final_state": {"reserved": 5, "available": 2},
+        },
+    )
+
+    strategy = InventoryReservationStrategy()
+    artifact = strategy.validate(probe, None)
+
+    assert isinstance(artifact, ProofArtifact)
+    assert artifact.confidence_score >= 0.85

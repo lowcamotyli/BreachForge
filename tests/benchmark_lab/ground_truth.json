@@ -1,0 +1,13 @@
+{
+  "lab_version": "1.0.0",
+  "description": "Ground truth manifest for ProofScan benchmark lab",
+  "vulnerabilities": [
+    {"id": "vuln-001", "type": "BOLA", "endpoint": "/users/{user_id}", "method": "GET", "severity": "HIGH", "description": "Cross-user data access without tenant check"},
+    {"id": "vuln-002", "type": "BFLA", "endpoint": "/admin/orders/{order_id}/approve", "method": "POST", "severity": "HIGH", "description": "Admin function accessible by regular user"},
+    {"id": "vuln-003", "type": "TENANT_ISOLATION", "endpoint": "/orders/{order_id}", "method": "GET", "severity": "HIGH", "description": "Cross-tenant order data leakage without tenant validation"},
+    {"id": "vuln-004", "type": "PRIVILEGE_ESCALATION", "endpoint": "/users/{user_id}/profile", "method": "PATCH", "severity": "HIGH", "description": "Role escalation via profile update - no role change restriction"},
+    {"id": "vuln-005", "type": "RACE_CONDITION", "endpoint": "/cart/checkout", "method": "POST", "severity": "MEDIUM", "description": "Checkout endpoint has no idempotency - susceptible to double-charge race"},
+    {"id": "vuln-006", "type": "BUSINESS_LOGIC", "endpoint": "/api-tokens", "method": "POST", "severity": "MEDIUM", "description": "No quota enforcement on API token creation - unlimited tokens allowed"},
+    {"id": "vuln-007", "type": "AUTH_BYPASS", "endpoint": "/jobs/export", "method": "POST", "severity": "HIGH", "description": "Export endpoint accepts expired authentication tokens"}
+  ]
+}

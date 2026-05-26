@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 
 from execution_plane.planner.rules.base import AssetMap, AttackRule, ScanContext
@@ -25,7 +26,12 @@ class TenantIsolation(AttackRule):
                 return True
         return False
 
-    def generate_tasks(self, endpoint: Endpoint, context: ScanContext) -> list[AttackTask]:
+    def generate_tasks(
+        self,
+        endpoint: Endpoint,
+        context: ScanContext,
+        identity_pairs: list[tuple[str, str]] | None = None,
+    ) -> list[AttackTask]:
         tenant_params: list[str] = []
         seen: set[str] = set()
 
@@ -47,16 +53,40 @@ class TenantIsolation(AttackRule):
         if not tenant_params:
             tenant_params.append("tenant_id")
 
-        return [
-            AttackTask(
-                scan_id=context.scan_id,
-                endpoint_id=endpoint.id,
-                attack_class=self.attack_class,
-                target_parameter=parameter_name,
-                hypothesis="Substitute tenant identifier to access another tenant data",
+        hypothesis = "Substitute tenant identifier to access another tenant data"
+        differential_pairs = identity_pairs or []
+        tasks: list[AttackTask] = []
+        for parameter_name in tenant_params:
+            if differential_pairs:
+                for owner_name, attacker_name in differential_pairs:
+                    tasks.append(
+                        AttackTask(
+                            scan_id=context.scan_id,
+                            endpoint_id=endpoint.id,
+                            attack_class=self.attack_class,
+                            target_parameter=parameter_name,
+                            hypothesis=json.dumps(
+                                {
+                                    "hypothesis": hypothesis,
+                                    "identity_selector": attacker_name,
+                                    "owner_identity": owner_name,
+                                    "differential_probe": True,
+                                },
+                                sort_keys=True,
+                            ),
+                        )
+                    )
+                continue
+            tasks.append(
+                AttackTask(
+                    scan_id=context.scan_id,
+                    endpoint_id=endpoint.id,
+                    attack_class=self.attack_class,
+                    target_parameter=parameter_name,
+                    hypothesis=hypothesis,
+                )
             )
-            for parameter_name in tenant_params
-        ]
+        return tasks
 
     def expected_proof_signal(self) -> str:
         return "Response contains tenant-identifying markers from another tenant"

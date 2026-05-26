@@ -1,6 +1,6 @@
 # ProofScan — CLAUDE.md
 
-> Instrukcje projektowe dla Claude Code. Supplement do globalnego `~/.claude/CLAUDE.md` — tamto ma pierwszeństwo w regułach workflow. Tu są reguły specyficzne dla ProofScan.
+> Instrukcje projektowe specyficzne dla projektu ProofScan.
 
 ---
 
@@ -26,8 +26,6 @@ Brak frontendu w v1 beta — output: JSON + Markdown.
 
 ## Podział pracy — ProofScan
 
-Identyczny podział jak w globalnym CLAUDE.md. Różnice projektowe:
-
 | Zadanie | Worker | Uwagi |
 |---------|--------|-------|
 | Nowy plik Python > 20 linii | codex-main | Default |
@@ -37,14 +35,24 @@ Identyczny podział jak w globalnym CLAUDE.md. Różnice projektowe:
 | Attack rules (nowa klasa) | codex-main + Claude approve | Wymaga proof signal spec |
 | Validator strategies | codex-main + Claude approve | Proof-gate = krytyczne |
 | Fixy < 10 linii | Claude | Edit tool |
+| **Odczyt 4+ plików (Context Pack)** | **Gemini CLI** | **1M token window** |
+| **Arch docs (bez limitu linii)** | **Gemini CLI** | **plan mode — read-only** |
+| **Invariants check po sprincie** | **Gemini CLI** | **zastępuje stary `dad-reviewer`** |
 
-### Ścieżki worker-dad
+### Wywołanie Gemini CLI (ProofScan)
 
 ```bash
-# codex-dad (WSL worker-dad)
-DAD_PROMPT="..." bash ~/.claude/scripts/dad-exec.sh
-# Ścieżki zawsze: /mnt/d/SimpliAppSec/...
+# WYMAGANE przed każdym wywołaniem (Windows SSL fix):
+export NODE_OPTIONS="--use-system-ca"
+
+# Odczyt plików / Context Pack / Invariants check — ZAWSZE stdin pipe:
+{
+  echo "=== FILE: [plik1.py] ==="; cat d:/BreachForge/[plik1.py]
+  echo "=== FILE: [plik2.py] ==="; cat d:/BreachForge/[plik2.py]
+} | gemini --skip-trust --output-format text \
+  -p "[prompt]" 2>&1 | grep -v "^Warning:" | grep -v "^Ripgrep"
 ```
+> NIE używaj `--approval-mode plan` — w trybie headless auto-wykonuje plan i modyfikuje pliki.
 
 ---
 
@@ -52,31 +60,29 @@ DAD_PROMPT="..." bash ~/.claude/scripts/dad-exec.sh
 
 ```bash
 # Minimalna weryfikacja (zawsze):
-cd d:/SimpliAppSec && python -m pytest tests/unit/ -q
+"/c/Program Files/Python312/python.exe" -m pytest tests/unit/ -q
 
 # Pełna weryfikacja (przed close):
-python -m pytest tests/ -q
+"/c/Program Files/Python312/python.exe" -m pytest tests/ -q
 docker compose build --no-cache   # jeśli zmiany w Dockerfile
 ```
 
-Analogia do `npx tsc --noEmit` w Simpli → tu: `pytest tests/unit/ -q`.
-
-**WAŻNE — Python w bash shell:** Git bash nie rozwiązuje `python`/`python3` jako `.exe`. Zawsze używaj pełnej ścieżki:
-
-```bash
-"/c/Program Files/Python312/python.exe" -m pytest tests/unit/ -q
-"/c/Program Files/Python312/python.exe" -m pytest tests/ -q
-```
+> Git bash nie rozwiązuje `python`/`python3` jako `.exe` — zawsze pełna ścieżka.
 
 ---
 
 ## Architektura — zasady odczytu
 
 **NIGDY** nie czytaj `docs/architecture/` bezpośrednio przez Read — hook blokuje.
-Zawsze przez dad summary:
+Zawsze przez Gemini CLI:
 
 ```bash
-DAD_PROMPT="Read /mnt/d/SimpliAppSec/docs/architecture/[plik].md. List ALL constraints and rules relevant to [feature]. Bullets. Max 20 lines." bash ~/.claude/scripts/dad-exec.sh
+export NODE_OPTIONS="--use-system-ca"
+cat d:/BreachForge/docs/architecture/[plik].md \
+  | gemini --skip-trust --output-format text -p \
+"List ALL constraints, exceptions, rules relevant to [feature].
+Do NOT summarize away exceptions. Bullets only." \
+  2>&1 | grep -v "^Warning:" | grep -v "^Ripgrep"
 ```
 
 ### Która doc do którego tematu

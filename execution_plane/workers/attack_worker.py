@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 import json
 import os
 import random
@@ -14,14 +15,28 @@ import httpx
 import structlog
 from redis import Redis
 
+from api.models.requests import ScanPolicy
 from control_plane.auth_manager import AuthManager, IdentityRole, SessionSnapshot
 from control_plane.rate_limiter import DomainRateLimiter
+from execution_plane.planner.decision_log import FeedbackPayload, TaskOutcome
+from execution_plane.planner.planner import rq_enqueue_replan
 from execution_plane.workers.behavior_profiles import BehaviorConfig, BehaviorProfile, get_profile_config
 from storage.evidence.state_store import StateSnapshot, StateStore
 from storage.db.models import AttackTask, RawProbe
 
 logger = structlog.get_logger(__name__)
 _SENSITIVE_LOG_KEYS = {"authorization", "cookie", "x-auth-token", "password", "token", "x-api-key"}
+BUSINESS_LOGIC_MUTATING_CLASSES = frozenset(
+    {
+        "coupon_stacking",
+        "negative_quantity",
+        "price_tampering",
+        "inventory_reservation_abuse",
+        "approval_bypass",
+        "double_spend",
+        "cart_price_manipulation",
+    }
+)
 
 
 class GuardrailViolation(RuntimeError):
@@ -32,6 +47,14 @@ class AuthExpiredError(RuntimeError):
     pass
 
 
+class PolicyViolationError(RuntimeError):
+    pass
+
+
+class KillSwitchError(RuntimeError):
+    pass
+
+
 class AttackWorker:
     def __init__(
         self,
@@ -39,9 +62,11 @@ class AttackWorker:
         rate_limiter: DomainRateLimiter | None = None,
         auth_manager: AuthManager | None = None,
         behavior_profile: BehaviorProfile = BehaviorProfile.low_and_slow,
+        kill_switch_redis: Redis | None = None,
     ) -> None:
         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         self._redis = redis_client or Redis.from_url(redis_url, decode_responses=True)
+        self._kill_switch_redis: Redis | None = kill_switch_redis
         self._rate_limiter = rate_limiter or DomainRateLimiter(redis_client=self._redis)
         self._auth_manager = auth_manager
         self._behavior_config: BehaviorConfig = get_profile_config(behavior_profile)
@@ -57,12 +82,62 @@ class AttackWorker:
         identity_role: IdentityRole | str | None = None,
         identity_name: str | None = None,
         hypothesis_override: str | None = None,
-    ) -> RawProbe:
+        race_group_id: UUID | None = None,
+        policy: ScanPolicy | None = None,
+    ) -> RawProbe | None:
         self._save_state_snapshot(task=task, status="pre")
+        probe_race_group_id = race_group_id
+        attack_class = str(task.attack_class).strip().lower()
+        if (
+            attack_class in BUSINESS_LOGIC_MUTATING_CLASSES
+            and not self._is_business_logic_mutations_enabled(task)
+        ):
+            logger.warning(
+                "business_logic_task_skipped",
+                attack_class=task.attack_class,
+                reason="business_logic_mutations_disabled",
+            )
+            return RawProbe(
+                id=uuid4(),
+                attack_task_id=task.id,
+                worker_id=self._worker_id(),
+                timestamp=datetime.now(UTC),
+                request={
+                    "method": "SKIPPED",
+                    "url": str(task.endpoint.url_pattern) if task.endpoint is not None else "",
+                    "headers": {},
+                    "body": None,
+                },
+                response={
+                    "status": "SKIPPED",
+                    "headers": {},
+                    "body": "business_logic_mutations_disabled",
+                    "latency_ms": 0,
+                },
+            )
         endpoint = task.endpoint
         if endpoint is None:
             self._save_state_snapshot(task=task, status="failed")
             raise ValueError("AttackTask.endpoint must be loaded before execute()")
+
+        if self._kill_switch_redis is not None:
+            try:
+                self._check_kill_switch(self._kill_switch_redis, str(task.scan_id))
+            except KillSwitchError:
+                logger.warning("attack_task_killed", scan_id=str(task.scan_id), attack_task_id=str(task.id))
+                return None
+
+        if policy is not None:
+            try:
+                self._check_policy(task, policy)
+            except PolicyViolationError as exc:
+                logger.warning(
+                    "attack_task_policy_blocked",
+                    scan_id=str(task.scan_id),
+                    attack_task_id=str(task.id),
+                    reason=str(exc),
+                )
+                return None
 
         try:
             execution_session = await self._resolve_execution_session(
@@ -75,8 +150,10 @@ class AttackWorker:
             self._save_state_snapshot(task=task, status="failed")
             raise
         raw_probe: RawProbe | None = None
+        result_confidence: float | None = None
         try:
             hypothesis_config = self._parse_hypothesis(hypothesis_override if hypothesis_override is not None else task.hypothesis)
+            result_confidence = self._extract_result_confidence(hypothesis_config)
             chain_steps = hypothesis_config.get("chain_steps")
             if isinstance(chain_steps, list) and chain_steps:
                 raw_probe = await self._execute_chain_steps(
@@ -159,10 +236,106 @@ class AttackWorker:
             self._save_state_snapshot(task=task, status="failed")
             raise
 
+        if probe_race_group_id is not None:
+            raw_probe.request["_race_group_id"] = str(probe_race_group_id)
+        self._maybe_enqueue_adaptive_replan(task=task, raw_probe=raw_probe, confidence=result_confidence)
+
         status_value = raw_probe.response.get("status") if isinstance(raw_probe.response, dict) else None
         response_status_code = status_value if isinstance(status_value, int) else None
-        self._save_state_snapshot(task=task, status="post", response_status_code=response_status_code)
+        body = raw_probe.response.get("body", "") if isinstance(raw_probe.response, dict) else ""
+        ct = (
+            str(raw_probe.response.get("headers", {}).get("content-type", ""))
+            if isinstance(raw_probe.response, dict)
+            else ""
+        )
+        self._save_state_snapshot(
+            task=task,
+            status="post",
+            response_status_code=response_status_code,
+            response_body=body[:4096] if isinstance(body, str) else str(body)[:4096],
+            content_type=ct,
+        )
         return raw_probe
+
+    def _check_policy(self, task: AttackTask, policy: ScanPolicy) -> None:
+        endpoint = task.endpoint
+        method_hint = getattr(task, "http_method", None)
+        raw_method = method_hint if isinstance(method_hint, str) and method_hint.strip() else (
+            endpoint.method if endpoint is not None else ""
+        )
+        method = str(raw_method).upper()
+        if method in {"POST", "PUT", "PATCH", "DELETE"} and not policy.mutating_allowed:
+            raise PolicyViolationError("mutating request blocked by policy")
+
+        if policy.allowed_domains:
+            target_url_hint = getattr(task, "target_url", None)
+            target_url = (
+                target_url_hint
+                if isinstance(target_url_hint, str) and target_url_hint.strip()
+                else (endpoint.url_pattern if endpoint is not None else "")
+            )
+            hostname = self._normalize_domain(urlparse(str(target_url)).hostname)
+            allowed_domains = {self._normalize_domain(domain) for domain in policy.allowed_domains}
+            if not hostname or hostname not in allowed_domains:
+                raise PolicyViolationError("domain not in allowed_domains")
+
+    def _check_kill_switch(self, redis: Redis, scan_id: str) -> None:
+        scan_flag = redis.get(f"kill:{scan_id}")
+        global_flag = redis.get("kill:global")
+        if (isinstance(scan_flag, (str, bytes)) and scan_flag) or (
+            isinstance(global_flag, (str, bytes)) and global_flag
+        ):
+            raise KillSwitchError(f"kill switch active for scan {scan_id}")
+
+    async def _execute_reconciliation_probe(
+        self,
+        task: AttackTask,
+        session: SessionSnapshot | None,
+    ) -> RawProbe | None:
+        hypothesis = self._parse_hypothesis(task.hypothesis)
+        endpoint = hypothesis.get("endpoint")
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            return None
+        parsed = urlparse(endpoint)
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        try:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                request, response, latency_ms = await self._send_request(
+                    client=client,
+                    method="GET",
+                    url=endpoint,
+                )
+            probe = self._build_raw_probe(
+                task=task,
+                worker_id=self._worker_id(),
+                request=request,
+                response=response,
+                latency_ms=latency_ms,
+                probe_type=None,
+            )
+            probe.request["_reconciliation"] = True
+            race_group_hint = hypothesis.get("_race_group_id")
+            if not isinstance(race_group_hint, str):
+                race_group_hint = hypothesis.get("race_group_id")
+            if isinstance(race_group_hint, str) and race_group_hint:
+                probe.request["_race_group_id"] = race_group_hint
+            return probe
+        except Exception as exc:
+            logger.warning("reconciliation_probe_failed", attack_task_id=str(task.id), error=str(exc))
+            return None
+
+    async def execute_race_group_with_reconciliation(
+        self,
+        tasks: list[AttackTask],
+        session: SessionSnapshot | None,
+        race_group_id: UUID,
+    ) -> tuple[list[RawProbe], RawProbe | None]:
+        if not tasks:
+            return [], None
+        race_probes = await asyncio.gather(*[self.execute(task, session, race_group_id=race_group_id) for task in tasks])
+        reconciliation_probe = await self._execute_reconciliation_probe(tasks[0], session)
+        return list(race_probes), reconciliation_probe
 
     async def _resolve_execution_session(
         self,
@@ -172,21 +345,14 @@ class AttackWorker:
         identity_name: str | None,
     ) -> SessionSnapshot:
         unauth_mode = self._is_unauth_mode(task)
+        selected_identity = identity_name if identity_name is not None else identity_role
+        if unauth_mode or selected_identity == "anonymous":
+            return self._empty_execution_session(task.scan_id)
+
         if self._auth_manager is None:
             if not unauth_mode and (identity_role is not None or identity_name is not None):
                 raise GuardrailViolation("identity_role/identity_name requires AttackWorker(auth_manager=...)")
             if provided_session is None:
-                if unauth_mode:
-                    return SessionSnapshot(
-                        scan_id=task.scan_id,
-                        cookies=[],
-                        auth_headers={},
-                        csrf_tokens={},
-                        local_storage={},
-                        session_storage={},
-                        cookie_count=0,
-                        has_auth_token=False,
-                    )
                 raise GuardrailViolation("session is required when auth_manager is not configured")
             return provided_session
 
@@ -210,12 +376,21 @@ class AttackWorker:
                 f"auth_expired: failed to fetch session snapshot for scan_id={self._scan_id}: {type(exc).__name__}: {exc}"
             ) from exc
 
-        selected_identity = identity_name if identity_name is not None else identity_role
         if selected_identity is None:
             return fresh_session
 
         try:
             identity_context = await self._auth_manager.get_identity_context(scan_id=self._scan_id, role=selected_identity)
+        except RuntimeError as exc:
+            if isinstance(selected_identity, str):
+                raise AuthExpiredError(
+                    f"identity_not_found: {selected_identity!r} not in identity matrix for scan {self._scan_id}"
+                ) from exc
+            await self._pause_for_auth_expired("auth_expired:get_identity_context_failed")
+            raise AuthExpiredError(
+                f"auth_expired: failed to load identity context={selected_identity!r} for scan_id={self._scan_id}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         except Exception as exc:
             await self._pause_for_auth_expired("auth_expired:get_identity_context_failed")
             raise AuthExpiredError(
@@ -223,6 +398,18 @@ class AttackWorker:
                 f"{type(exc).__name__}: {exc}"
             ) from exc
         return identity_context.to_session_snapshot()
+
+    def _empty_execution_session(self, scan_id: UUID) -> SessionSnapshot:
+        return SessionSnapshot(
+            scan_id=scan_id,
+            cookies=[],
+            auth_headers={},
+            csrf_tokens={},
+            local_storage={},
+            session_storage={},
+            cookie_count=0,
+            has_auth_token=False,
+        )
 
     async def _pause_for_auth_expired(self, reason: str) -> None:
         if self._auth_manager is None:
@@ -305,6 +492,16 @@ class AttackWorker:
             return bool(config.get("unauth_mode"))
         return False
 
+    def _is_business_logic_mutations_enabled(self, task: AttackTask) -> bool:
+        scan = task.scan
+        if scan is None:
+            return False
+        target = getattr(scan, "target", None)
+        config = getattr(target, "config", None)
+        if not isinstance(config, dict):
+            return False
+        return bool(config.get("enable_business_logic_mutations"))
+
     async def execute_safe_token_replay(self, finding: dict, in_scope_domains: list[str]) -> dict:
         evidence = finding.get("evidence", {})
         token: str | None = None
@@ -379,6 +576,11 @@ class AttackWorker:
     async def _publish_evidence(self, scan_id: Any, raw_probe: RawProbe, metadata: dict[str, str] | None = None) -> None:
         stream_key = f"evidence:{scan_id}"
         # Evidence stored unredacted per invariant #6; redaction at ReportingService only.
+        state_evidence = self._state_dict_for_task(
+            task_id=str(raw_probe.attack_task_id),
+            scan_id=str(scan_id),
+            step_id=str(raw_probe.attack_task_id),
+        )
         payload = {
             "attack_task_id": str(raw_probe.attack_task_id),
             "worker_id": raw_probe.worker_id,
@@ -386,6 +588,8 @@ class AttackWorker:
             "request": json.dumps(raw_probe.request),
             "response": json.dumps(raw_probe.response),
         }
+        if state_evidence is not None:
+            payload["state_evidence"] = state_evidence
         if metadata:
             payload.update(metadata)
 
@@ -506,6 +710,56 @@ class AttackWorker:
         if not isinstance(parsed, dict):
             return {}
         return parsed
+
+    def _extract_result_confidence(self, hypothesis_config: dict[str, Any]) -> float | None:
+        raw_confidence = hypothesis_config.get("confidence")
+        if isinstance(raw_confidence, (int, float)):
+            return float(raw_confidence)
+        if isinstance(raw_confidence, str):
+            try:
+                return float(raw_confidence)
+            except ValueError:
+                return None
+        return None
+
+    def _maybe_enqueue_adaptive_replan(self, task: AttackTask, raw_probe: RawProbe, confidence: float | None) -> None:
+        attack_class = str(task.attack_class).strip().lower()
+        if attack_class not in {"sensitive_exposure", "secret_exposure"}:
+            return
+        if confidence is None or confidence < 0.5:
+            return
+
+        if os.getenv("ENABLE_ADAPTIVE_REPLAN", "1") == "0":
+            logger.info(
+                "adaptive_replan_skipped",
+                scan_id=str(task.scan_id),
+                attack_task_id=str(task.id),
+                attack_class=task.attack_class,
+                confidence=confidence,
+            )
+            return
+
+        outcome = TaskOutcome.success if confidence >= 0.85 else TaskOutcome.needs_followup
+        payload = FeedbackPayload(
+            outcome=outcome,
+            scan_id=str(task.scan_id),
+            task_id=str(task.id),
+            endpoint=str(task.endpoint.url_pattern) if task.endpoint is not None else "",
+            finding_class=task.attack_class,
+            confidence=confidence,
+            follow_up_hints=["replay_with_token", "blast_radius_map"],
+            parent_evidence_ref=str(raw_probe.id) if getattr(raw_probe, "id", None) is not None else str(task.id),
+        )
+        payload_dict = asdict(payload)
+        payload_dict["outcome"] = outcome.value
+        rq_enqueue_replan(scan_id=str(task.scan_id), feedback=payload_dict)
+        logger.info(
+            "adaptive_replan_enqueued",
+            scan_id=str(task.scan_id),
+            attack_task_id=str(task.id),
+            attack_class=task.attack_class,
+            confidence=confidence,
+        )
 
     async def _apply_timing_profile(self, timing_profile: Any) -> None:
         if not isinstance(timing_profile, dict):
@@ -732,13 +986,21 @@ class AttackWorker:
             latency_ms=last_latency_ms,
             probe_type=last_probe_type,
         )
+        chain_metadata: dict[str, str] = {
+            "chain_id": f"{task.id}_chain",
+            "chain_entries": json.dumps(chain_entries),
+        }
+        chain_state_evidence = self._state_dict_for_task(
+            task_id=str(task.id),
+            scan_id=str(task.scan_id),
+            step_id=str(raw_probe.attack_task_id),
+        )
+        if chain_state_evidence is not None:
+            chain_metadata["state_evidence"] = chain_state_evidence
         await self._publish_evidence(
             task.scan_id,
             raw_probe,
-            metadata={
-                "chain_id": f"{task.id}_chain",
-                "chain_entries": json.dumps(chain_entries),
-            },
+            metadata=chain_metadata,
         )
         return raw_probe
 
@@ -807,17 +1069,30 @@ class AttackWorker:
         task: AttackTask,
         status: str,
         response_status_code: int | None = None,
+        response_body: str | None = None,
+        content_type: str | None = None,
     ) -> None:
         scan_id = str(task.scan_id)
         step_id = str(task.id)
         version_key = (scan_id, step_id)
         next_version = self._snapshot_versions.get(version_key, 0) + 1
         self._snapshot_versions[version_key] = next_version
+        body_json_keys: list[str] = []
+        if response_body:
+            try:
+                parsed_body = json.loads(response_body[:4096])
+                if isinstance(parsed_body, dict):
+                    body_json_keys = sorted(key for key in parsed_body.keys() if isinstance(key, str))
+            except (json.JSONDecodeError, TypeError):
+                body_json_keys = []
 
         state_dict: dict[str, Any] = {
             "task_id": str(task.id),
             "status": status,
             "response_status_code": response_status_code,
+            "body_size": len(response_body) if response_body else 0,
+            "content_type": content_type or "",
+            "body_json_keys": body_json_keys,
         }
 
         self._state_store.save_snapshot(
@@ -829,3 +1104,13 @@ class AttackWorker:
                 version=next_version,
             )
         )
+
+    def _state_dict_for_task(self, task_id: str, scan_id: str, step_id: str) -> str | None:
+        _ = task_id
+        before_after = self._state_store.get_before_after(scan_id, step_id)
+        if before_after is None:
+            return None
+        before_snap, after_snap = before_after
+        if before_snap is None or after_snap is None:
+            return None
+        return json.dumps({"before": before_snap.state_dict, "after": after_snap.state_dict})

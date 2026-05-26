@@ -23,10 +23,12 @@ dependencies = [
   "pyotp",
   "python-jose[cryptography]",
   "cryptography",
+  "PyYAML",
+  "python-multipart",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["api", "control_plane", "storage"]
+packages = ["api", "control_plane", "execution_plane", "storage"]
 
 [project.optional-dependencies]
 dev = [

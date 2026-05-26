@@ -6,6 +6,21 @@ LIFECYCLE_SECOND_CHECK_DELAY_ENV = "LIFECYCLE_SECOND_CHECK_DELAY_SECONDS"
 LIFECYCLE_SECOND_CHECK_CAP_SECONDS = 300
 DEFAULT_LIFECYCLE_SECOND_CHECK_DELAY = 0
 DEFAULT_AUTONOMOUS_ATTACK_ROUNDS = 2
+MAX_CONCURRENT_REPLAN_TASKS = 3
+
+
+class Dispatcher:
+    @staticmethod
+    def dispatch_attack_tasks(scan_id: str) -> None:
+        dispatch_attack_tasks(scan_id)
+
+    @staticmethod
+    def execute_attack(attack_task_id: str) -> None:
+        execute_attack(attack_task_id)
+
+    @staticmethod
+    def finalize_scan(scan_id: str) -> None:
+        finalize_scan(scan_id)
 
 
 def create_empty_auth_context(scan_id: UUID) -> AuthContext:
@@ -44,13 +59,16 @@ def dispatch_attack_tasks(scan_id: str) -> None:
 
 
 async def _dispatch_attack_tasks_async(scan_id: str) -> None:
+    import json
     import os
-    from uuid import UUID
+    from uuid import UUID, uuid4
 
     import structlog
+    from control_plane.auth_manager import AuthManager, default_pause_scan
     from redis import Redis
     from rq import Queue
     from rq.job import Dependency
+    from execution_plane.planner.planner import MAX_REPLAN_ROUNDS
     from sqlalchemy import select
     from storage.db.models import AttackTask, AttackTaskStatus
     from storage.db.session import AsyncSessionLocal
@@ -85,15 +103,97 @@ async def _dispatch_attack_tasks_async(scan_id: str) -> None:
     queue_name = os.getenv("RQ_ATTACK_QUEUE", "attack_tasks")
     queue = Queue(name=queue_name, connection=connection)
 
-    jobs = [queue.enqueue(execute_attack, str(task.id)) for task in pending_tasks]
-
-    queue.enqueue(
-        finalize_scan,
-        scan_id,
-        depends_on=Dependency(jobs=jobs, allow_failure=True),
+    manager = AuthManager(scan_uuid, AsyncSessionLocal, default_pause_scan)
+    expired_identities = await _collect_expired_identity_names(
+        db_factory=AsyncSessionLocal,
+        scan_uuid=scan_uuid,
+        manager=manager,
+        logger=logger,
     )
 
-    logger.info("attack_tasks_dispatched", scan_id=scan_id, task_count=len(pending_tasks))
+    dispatch_batch_size = len(pending_tasks)
+    replan_rounds_raw = connection.get(f"replan:rounds:{scan_id}")
+    replan_rounds = _parse_int_or_zero(replan_rounds_raw)
+    if replan_rounds > MAX_REPLAN_ROUNDS:
+        dispatch_batch_size = min(dispatch_batch_size, MAX_CONCURRENT_REPLAN_TASKS)
+
+    tasks_to_dispatch = pending_tasks[:dispatch_batch_size]
+    race_group_ids_by_task: dict[UUID, str] = {}
+    race_groups: dict[str, dict[str, str]] = {}
+    race_tasks_by_class: dict[str, list[AttackTask]] = {}
+    for pending_task in tasks_to_dispatch:
+        if not _is_race_related_attack_class(pending_task.attack_class):
+            continue
+        race_tasks_by_class.setdefault(str(pending_task.attack_class), []).append(pending_task)
+    for class_tasks in race_tasks_by_class.values():
+        if not class_tasks:
+            continue
+        race_group_id = str(uuid4())
+        endpoint_id = str(class_tasks[0].endpoint_id)
+        for class_task in class_tasks:
+            race_group_ids_by_task[class_task.id] = race_group_id
+            race_groups[race_group_id] = {"endpoint_id": endpoint_id}
+    jobs = []
+    skipped_tasks = 0
+    kill_switch_active = False
+    async with AsyncSessionLocal() as db:
+        for task in tasks_to_dispatch:
+            _ks = connection.get(f"kill:{scan_id}")
+            _kg = connection.get("kill:global")
+            if (isinstance(_ks, (str, bytes)) and _ks) or (isinstance(_kg, (str, bytes)) and _kg):
+                logger.warning("dispatch_kill_switch_active", scan_id=scan_id)
+                kill_switch_active = True
+                break
+            race_group_id = race_group_ids_by_task.get(task.id)
+            if race_group_id is not None:
+                task.hypothesis = _inject_race_group_id(task.hypothesis, race_group_id)
+                db.add(task)
+            identity_selector = _extract_identity_selector_from_hypothesis(task.hypothesis)
+            if identity_selector is None or identity_selector not in expired_identities:
+                jobs.append(queue.enqueue(execute_attack, str(task.id)))
+                continue
+
+            task.status = AttackTaskStatus.failed
+            db.add(task)
+            skipped_tasks += 1
+            await _emit_identity_health_failed_event(
+                redis_connection=connection,
+                scan_id=scan_id,
+                payload={"event": "identity_health_failed", "identity_name": identity_selector, "task_id": str(task.id)},
+            )
+            logger.warning(
+                "task_skipped_identity_expired",
+                scan_id=scan_id,
+                task_id=str(task.id),
+                identity_name=identity_selector,
+                status="skipped:identity_expired",
+            )
+        await db.commit()
+
+    await manager.close()
+    if kill_switch_active:
+        return
+
+    finalize_dependencies = list(jobs)
+    if race_groups:
+        race_reconciliation_job = queue.enqueue(
+            dispatch_race_reconciliation,
+            scan_id,
+            race_groups,
+            depends_on=Dependency(jobs=jobs, allow_failure=True),
+        )
+        finalize_dependencies.append(race_reconciliation_job)
+    queue.enqueue(finalize_scan, scan_id, depends_on=Dependency(jobs=finalize_dependencies, allow_failure=True))
+
+    logger.info(
+        "attack_tasks_dispatched",
+        scan_id=scan_id,
+        task_count=len(pending_tasks),
+        dispatch_batch_size=dispatch_batch_size,
+        queued_count=len(jobs),
+        skipped_expired_count=skipped_tasks,
+        replan_rounds=replan_rounds,
+    )
 
 
 def execute_attack(attack_task_id: str) -> None:
@@ -240,10 +340,213 @@ def _parse_datetime(value: object) -> object:
         return None
 
 
+def _parse_int_or_zero(value: object) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="ignore")
+    try:
+        return int(str(value))
+    except ValueError:
+        return 0
+
+
+async def _collect_expired_identity_names(
+    db_factory: object,
+    scan_uuid: object,
+    manager: object,
+    logger: object,
+) -> set[str]:
+    from uuid import UUID
+
+    from sqlalchemy import select
+    from storage.db.models import AuthContext
+
+    expired: set[str] = set()
+    if not hasattr(manager, "per_identity_health_check"):
+        return expired
+
+    scan_id = scan_uuid if isinstance(scan_uuid, UUID) else UUID(str(scan_uuid))
+    try:
+        async with db_factory() as db:
+            auth_result = await db.execute(select(AuthContext).where(AuthContext.scan_id == scan_id))
+            auth_context = auth_result.scalar_one_or_none()
+        if auth_context is None:
+            return expired
+
+        session_snapshot = _session_snapshot_from_auth_context(auth_context, scan_id)
+        setattr(manager, "_session_snapshot", session_snapshot)
+        setattr(manager, "_auth_type", _auth_type_from_context(auth_context))
+        await manager.per_identity_health_check()
+        named_identities = getattr(manager, "_named_identities", {})
+        if isinstance(named_identities, dict):
+            for identity_name, identity in named_identities.items():
+                if not isinstance(identity_name, str):
+                    continue
+                if getattr(identity, "auth_state", None) == "expired":
+                    expired.add(identity_name)
+    except Exception:
+        logger.exception("identity_health_check_pre_dispatch_failed", scan_id=str(scan_id))
+    return expired
+
+
+def _extract_identity_selector_from_hypothesis(hypothesis: object) -> str | None:
+    import json
+
+    if not isinstance(hypothesis, str) or not hypothesis.strip():
+        return None
+    try:
+        payload = json.loads(hypothesis)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    selector = payload.get("identity_selector")
+    if not isinstance(selector, str):
+        return None
+    clean_selector = selector.strip()
+    return clean_selector if clean_selector else None
+
+
+async def _emit_identity_health_failed_event(redis_connection: object, scan_id: str, payload: dict[str, str]) -> None:
+    import asyncio
+
+    stream_key = f"scan_events:{scan_id}"
+    sanitized_payload = {
+        "event": payload.get("event", ""),
+        "identity_name": payload.get("identity_name", ""),
+        "task_id": payload.get("task_id", ""),
+    }
+    await asyncio.to_thread(redis_connection.xadd, stream_key, sanitized_payload)
+
+
+async def _emit_race_reconciliation_event(
+    redis_connection: object,
+    scan_id: str,
+    race_group_id: str,
+    status: str,
+    task_id: str,
+) -> None:
+    import asyncio
+
+    stream_key = f"race_reconciliation:{scan_id}"
+    payload = {
+        "event": "race_reconciliation_completed",
+        "race_group_id": race_group_id,
+        "status": status,
+        "task_id": task_id,
+    }
+    await asyncio.to_thread(redis_connection.xadd, stream_key, payload)
+
+
+def _is_race_related_attack_class(attack_class: object) -> bool:
+    if not isinstance(attack_class, str):
+        return False
+    value = attack_class.strip().lower()
+    race_classes = {
+        "double_spend",
+        "limit_override",
+        "limit_override_race",
+        "inventory_reservation",
+        "inventory_reservation_abuse",
+        "idempotency_bypass",
+        "race_condition",
+    }
+    return value in race_classes or "race" in value
+
+
+def _inject_race_group_id(hypothesis: object, race_group_id: str) -> str:
+    import json
+
+    payload: dict[str, object] = {}
+    if isinstance(hypothesis, str) and hypothesis.strip():
+        try:
+            parsed = json.loads(hypothesis)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except json.JSONDecodeError:
+            payload = {"hypothesis_raw": hypothesis}
+    payload["_race_group_id"] = race_group_id
+    return json.dumps(payload, sort_keys=True)
+
+
 def finalize_scan(scan_id: str) -> None:
     import asyncio
 
     asyncio.run(_finalize_scan_async(scan_id))
+
+
+def dispatch_race_reconciliation(scan_id: str, race_groups: dict[str, dict[str, str]]) -> None:
+    import asyncio
+
+    asyncio.run(_dispatch_race_reconciliation_async(scan_id, race_groups))
+
+
+async def _dispatch_race_reconciliation_async(scan_id: str, race_groups: dict[str, dict[str, str]]) -> None:
+    import json
+    import os
+    from uuid import UUID
+
+    import structlog
+    from redis import Redis
+    from storage.db.models import AttackTask, AttackTaskStatus
+    from storage.db.session import AsyncSessionLocal
+
+    logger = structlog.get_logger(__name__)
+    if not isinstance(race_groups, dict) or not race_groups:
+        return
+
+    scan_uuid = UUID(scan_id)
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    connection = Redis.from_url(redis_url)
+
+    for race_group_id, payload in race_groups.items():
+        if not isinstance(payload, dict):
+            continue
+        endpoint_id_raw = payload.get("endpoint_id")
+        if not isinstance(endpoint_id_raw, str) or not endpoint_id_raw:
+            continue
+        reconciliation_task_id: str | None = None
+        reconciliation_status = "failed"
+        try:
+            endpoint_uuid = UUID(endpoint_id_raw)
+            async with AsyncSessionLocal() as db:
+                hypothesis_payload = {
+                    "probe_type": "race_reconciliation_read",
+                    "attack_class": "reconciliation_read",
+                    "method": "GET",
+                    "_race_group_id": race_group_id,
+                }
+                reconciliation_task = AttackTask(
+                    scan_id=scan_uuid,
+                    endpoint_id=endpoint_uuid,
+                    attack_class="reconciliation_read",
+                    target_parameter="race_reconciliation",
+                    hypothesis=json.dumps(hypothesis_payload, sort_keys=True),
+                    status=AttackTaskStatus.pending,
+                )
+                db.add(reconciliation_task)
+                await db.commit()
+                reconciliation_task_id = str(reconciliation_task.id)
+
+            if reconciliation_task_id is None:
+                continue
+            await _execute_attack_async(reconciliation_task_id)
+            reconciliation_status = "done"
+        except Exception:
+            logger.exception(
+                "race_reconciliation_dispatch_failed",
+                scan_id=scan_id,
+                race_group_id=race_group_id,
+            )
+        finally:
+            await _emit_race_reconciliation_event(
+                redis_connection=connection,
+                scan_id=scan_id,
+                race_group_id=race_group_id,
+                status=reconciliation_status,
+                task_id=reconciliation_task_id or "",
+            )
 
 
 async def _finalize_scan_async(scan_id: str) -> None:
@@ -723,6 +1026,8 @@ def _extract_replayable_secret(probe_payload: dict[str, object]) -> tuple[str, s
 
 async def _validate_and_score_evidence(*, scan_uuid: object, redis_connection: object, logger: object) -> None:
     from control_plane.finding_scorer import _score_artifact_async
+    from execution_plane.planner.decision_log import FeedbackPayload, TaskOutcome
+    from execution_plane.planner.planner import rq_enqueue_replan
     from execution_plane.validator.validator import ExploitValidator
     from storage.evidence.store import EvidenceStore
 
@@ -736,13 +1041,38 @@ async def _validate_and_score_evidence(*, scan_uuid: object, redis_connection: o
     inline_queue = _InlineFindingQueue()
     validator = ExploitValidator(redis_client=redis_connection, evidence_store=EvidenceStore())
     validator._finding_queue = inline_queue
+    sensitive_followup_endpoints: set[str] = set()
+    scan_id_str = str(scan_uuid)
 
     processed_messages = 0
     while True:
         processed = await validator.process_once(scan_uuid)
+        if hasattr(validator, "drain_feedback"):
+            drained = validator.drain_feedback()
+            await _forward_feedback_to_replan(
+                scan_id=scan_id_str,
+                feedback_items=drained,
+                sensitive_followup_endpoints=sensitive_followup_endpoints,
+                logger=logger,
+                rq_enqueue_replan_fn=rq_enqueue_replan,
+                task_outcome=TaskOutcome,
+                feedback_payload_cls=FeedbackPayload,
+            )
         if processed == 0:
             break
         processed_messages += processed
+
+    if hasattr(validator, "drain_feedback"):
+        drained = validator.drain_feedback()
+        await _forward_feedback_to_replan(
+            scan_id=scan_id_str,
+            feedback_items=drained,
+            sensitive_followup_endpoints=sensitive_followup_endpoints,
+            logger=logger,
+            rq_enqueue_replan_fn=rq_enqueue_replan,
+            task_outcome=TaskOutcome,
+            feedback_payload_cls=FeedbackPayload,
+        )
 
     for score_scan_id, finding_id, artifact_payload in inline_queue.jobs:
         await _score_artifact_async(
@@ -757,3 +1087,70 @@ async def _validate_and_score_evidence(*, scan_uuid: object, redis_connection: o
         evidence_messages=processed_messages,
         scoring_jobs=len(inline_queue.jobs),
     )
+
+
+async def _forward_feedback_to_replan(
+    *,
+    scan_id: str,
+    feedback_items: list[object],
+    sensitive_followup_endpoints: set[str],
+    logger: object,
+    rq_enqueue_replan_fn: object,
+    task_outcome: object,
+    feedback_payload_cls: object,
+) -> None:
+    task_outcome_no_signal = getattr(task_outcome, "no_signal", "no_signal")
+    task_outcome_needs_followup = getattr(task_outcome, "needs_followup", "needs_followup")
+    is_active = await _scan_is_active(scan_id)
+    for item in feedback_items:
+        if not isinstance(item, feedback_payload_cls):
+            continue
+        if item.outcome != task_outcome_no_signal:
+            rq_enqueue_replan_fn(scan_id, item)
+
+        finding_class = str(item.finding_class).lower()
+        if finding_class not in {"sensitive_exposure", "secret_exposure"}:
+            continue
+        if float(item.confidence) < 0.5:
+            continue
+        endpoint = str(item.endpoint)
+        if endpoint in sensitive_followup_endpoints or not is_active:
+            continue
+
+        sensitive_followup_endpoints.add(endpoint)
+        rq_enqueue_replan_fn(
+            scan_id,
+            feedback_payload_cls(
+                outcome=task_outcome_needs_followup,
+                scan_id=scan_id,
+                task_id=str(item.task_id),
+                endpoint=endpoint,
+                finding_class=str(item.finding_class),
+                confidence=float(item.confidence),
+                follow_up_hints=["replay_with_token", "blast_radius_map"],
+                parent_evidence_ref=item.parent_evidence_ref,
+                metadata=dict(item.metadata),
+            ),
+        )
+        logger.info(
+            "sensitive_exposure_followup_replan_enqueued",
+            scan_id=scan_id,
+            endpoint=endpoint,
+            task_id=str(item.task_id),
+        )
+
+
+async def _scan_is_active(scan_id: str) -> bool:
+    from uuid import UUID
+
+    from sqlalchemy import select
+    from storage.db.models import Scan, ScanStatus
+    from storage.db.session import AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Scan.status).where(Scan.id == UUID(scan_id)))
+            status = result.scalar_one_or_none()
+            return status in {ScanStatus.created, ScanStatus.running}
+    except Exception:
+        return False

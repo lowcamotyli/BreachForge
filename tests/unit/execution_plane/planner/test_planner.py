@@ -26,9 +26,10 @@ def _extend_execution_plane_package_paths() -> None:
 
 _extend_execution_plane_package_paths()
 
-from execution_plane.planner.planner import AttackPlanner
+from api.models.requests import ScanPolicy
+from execution_plane.planner.planner import AttackPlanner, filter_tasks_by_policy
 from execution_plane.planner.rules.base import ScanContext
-from storage.db.models import AssetMap, Endpoint
+from storage.db.models import AssetMap, AttackTask, Endpoint
 
 
 def _build_endpoint(
@@ -115,3 +116,53 @@ def test_plan_respects_max_50_tasks_per_endpoint() -> None:
     assert len(tasks) == 50
     assert all(task.attack_class == "bola" for task in tasks)
     assert all(task.endpoint_id == endpoint.id for task in tasks)
+
+
+def test_filter_tasks_blocks_mutating() -> None:
+    endpoint = _build_endpoint(
+        method="POST",
+        auth_required=True,
+        url_pattern="https://app.example.com/api/users",
+        parameters=[],
+    )
+    task = AttackTask(
+        scan_id=uuid4(),
+        endpoint_id=endpoint.id,
+        attack_class="mass_assignment",
+        target_parameter=None,
+        hypothesis="probe mutation",
+    )
+    task.endpoint = endpoint
+
+    allowed, skipped = filter_tasks_by_policy([task], ScanPolicy(mutating_allowed=False))
+
+    assert allowed == []
+    assert skipped == [
+        {
+            "task_id": str(task.id),
+            "reason": "mutating method POST blocked by policy",
+            "attack_class": "mass_assignment",
+        }
+    ]
+
+
+def test_filter_tasks_allows_get() -> None:
+    endpoint = _build_endpoint(
+        method="GET",
+        auth_required=True,
+        url_pattern="https://app.example.com/api/users/{id}",
+        parameters=[],
+    )
+    task = AttackTask(
+        scan_id=uuid4(),
+        endpoint_id=endpoint.id,
+        attack_class="bola",
+        target_parameter=None,
+        hypothesis="probe read",
+    )
+    task.endpoint = endpoint
+
+    allowed, skipped = filter_tasks_by_policy([task], ScanPolicy(mutating_allowed=False))
+
+    assert allowed == [task]
+    assert skipped == []

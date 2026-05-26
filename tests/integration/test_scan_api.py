@@ -73,10 +73,18 @@ class _FakeSession:
 
 class _FakeQueue:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str]] = []
+        self.calls: list[tuple[object, ...]] = []
 
-    def enqueue(self, task_name: str, scan_id: str, auth_context_id: str) -> None:
-        self.calls.append((task_name, scan_id, auth_context_id))
+    def enqueue(self, *args: object) -> None:
+        self.calls.append(args)
+
+
+class _FailingQueue:
+    name = "recon"
+
+    def enqueue(self, *args: object) -> None:
+        del args
+        raise RuntimeError("queue unavailable")
 
 
 def test_post_and_get_scan_with_mock_db_and_mock_redis(monkeypatch) -> None:
@@ -109,5 +117,68 @@ def test_post_and_get_scan_with_mock_db_and_mock_redis(monkeypatch) -> None:
     assert get_body["id"] == scan_id
     assert get_body["status"] == "running"
     assert len(fake_queue.calls) == 1
+
+    app.dependency_overrides.clear()
+
+
+def test_post_unauth_scan_enqueues_recon_job(monkeypatch) -> None:
+    fake_db = _FakeSession()
+    fake_queue = _FakeQueue()
+
+    async def _override_get_db():
+        yield fake_db
+
+    monkeypatch.setattr(scans_module, "_get_recon_queue", lambda: fake_queue)
+    app.dependency_overrides[scans_module.get_db] = _override_get_db
+
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/scans",
+        json={
+            "target_url": "https://public.example.com",
+            "unauth_mode": True,
+        },
+    )
+
+    assert create_response.status_code == 201
+    create_body = create_response.json()
+    scan_id = create_body["id"]
+    scan = fake_db.scans[UUID(scan_id)]
+
+    assert create_body["status"] == "running"
+    assert create_body["phase"] == "recon"
+    assert scan.status == ScanStatus.running
+    assert scan.phase == "recon"
+    assert fake_db.auth_contexts == {}
+    assert fake_queue.calls == [("execution_plane.crawler.engine.run_crawler", scan_id)]
+
+    app.dependency_overrides.clear()
+
+
+def test_post_unauth_scan_enqueue_failure_marks_scan_failed(monkeypatch) -> None:
+    fake_db = _FakeSession()
+
+    async def _override_get_db():
+        yield fake_db
+
+    monkeypatch.setattr(scans_module, "_get_recon_queue", lambda: _FailingQueue())
+    app.dependency_overrides[scans_module.get_db] = _override_get_db
+
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/scans",
+        json={
+            "target_url": "https://public.example.com",
+            "unauth_mode": True,
+        },
+    )
+
+    assert create_response.status_code == 503
+    assert create_response.json()["detail"] == "Failed to enqueue scan"
+    [scan] = list(fake_db.scans.values())
+    assert scan.status == ScanStatus.failed
+    assert scan.phase == "failed:enqueue"
 
     app.dependency_overrides.clear()

@@ -17,3 +17,7 @@ class ValidationStrategy(ABC):
     @abstractmethod
     def expected_attack_class(self) -> str:
         """Return the attack_class key that should route to this strategy."""
+
+    def requires_state_effect(self) -> bool:
+        """Return True if a finding requires observable state change evidence."""
+        return False

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from execution_plane.planner.decision_log import FeedbackPayload
 from execution_plane.planner.rules.base import AssetMap, AttackRule, ScanContext
 from execution_plane.crawler.graphql_parser import is_graphql_endpoint
 from storage.db.models import AttackTask, Endpoint
@@ -110,8 +111,91 @@ class GraphqlRule(AttackRule):
             )
         return tasks
 
+    def generate_adaptive_followups(
+        self, feedback: FeedbackPayload, endpoint: Endpoint, context: ScanContext
+    ) -> list[AttackTask]:
+        tasks: list[AttackTask] = []
+        follow_up_hints = set(feedback.follow_up_hints)
+        outcome = getattr(feedback.outcome, "value", feedback.outcome)
+        can_probe_schema = outcome in {"needs_followup", "interesting"}
+
+        if can_probe_schema and "schema_driven_field_probe" in follow_up_hints:
+            for schema_type in self._schema_type_names(feedback.metadata.get("schema_types", [])):
+                task = AttackTask(
+                    scan_id=context.scan_id,
+                    endpoint_id=endpoint.id,
+                    attack_class="graphql_field_probe",
+                    target_parameter=schema_type,
+                    hypothesis=json.dumps(
+                        {
+                            "probe_type": "graphql_schema_driven_field_probe",
+                            "schema_type": schema_type,
+                            "parent_evidence_ref": feedback.parent_evidence_ref,
+                            "read_only": True,
+                            "params": self._base_params(endpoint),
+                        },
+                        sort_keys=True,
+                    ),
+                    priority_score=0.86,
+                )
+                task.parent_evidence_ref = feedback.parent_evidence_ref
+                tasks.append(task)
+
+        if "depth_exhaustion_probe" in follow_up_hints:
+            for depth in (3, 5, 10):
+                task = AttackTask(
+                    scan_id=context.scan_id,
+                    endpoint_id=endpoint.id,
+                    attack_class="graphql_depth",
+                    target_parameter=f"depth_{depth}",
+                    hypothesis=json.dumps(
+                        {
+                            "probe_type": "graphql_depth_exhaustion_probe",
+                            "max_depth": depth,
+                            "parent_evidence_ref": feedback.parent_evidence_ref,
+                            "read_only": True,
+                            "timeout_seconds": 5,
+                            "params": self._base_params(endpoint),
+                        },
+                        sort_keys=True,
+                    ),
+                    priority_score=0.8,
+                )
+                task.parent_evidence_ref = feedback.parent_evidence_ref
+                tasks.append(task)
+
+        return tasks
+
     def expected_proof_signal(self) -> str:
         return "GraphQL endpoint permits introspection, batch amplification, deep queries, or alias-based bypass"
+
+    def _base_params(self, endpoint: Endpoint) -> dict[str, Any]:
+        return {
+            "method": endpoint.method.upper(),
+            "path": endpoint.url_pattern,
+            "graphql": True,
+        }
+
+    def _schema_type_names(self, raw_schema_types: Any) -> list[str]:
+        if not isinstance(raw_schema_types, list):
+            return []
+
+        names: list[str] = []
+        seen: set[str] = set()
+        for raw_schema_type in raw_schema_types:
+            if isinstance(raw_schema_type, str):
+                name = raw_schema_type.strip()
+            elif isinstance(raw_schema_type, dict) and isinstance(raw_schema_type.get("name"), str):
+                name = raw_schema_type["name"].strip()
+            else:
+                continue
+
+            if not name or name.startswith("__") or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+
+        return names
 
     def _signals(self, asset_map: AssetMap) -> dict[str, Any]:
         raw_signals = getattr(asset_map, "signals", None)

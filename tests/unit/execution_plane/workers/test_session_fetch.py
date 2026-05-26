@@ -25,6 +25,7 @@ attack_worker_module = importlib.util.module_from_spec(ATTACK_WORKER_SPEC)
 ATTACK_WORKER_SPEC.loader.exec_module(attack_worker_module)
 AttackWorker = attack_worker_module.AttackWorker
 AuthExpiredError = attack_worker_module.AuthExpiredError
+IdentityRole = attack_worker_module.IdentityRole
 
 
 class _FakeRateLimiter:
@@ -182,3 +183,107 @@ async def test_execute_raises_auth_expired_when_health_check_fails(monkeypatch: 
         await worker.execute(task)
 
     auth_manager.get_session_snapshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_execution_session_uses_named_identity_context() -> None:
+    task = _build_task()
+    base_session = _build_session(task.scan_id)
+    named_session = _build_session(task.scan_id)
+    named_session.auth_headers = {"Authorization": "Bearer named-user"}
+
+    identity_context = MagicMock()
+    identity_context.to_session_snapshot.return_value = named_session
+
+    auth_manager = MagicMock()
+    auth_manager.health_check = AsyncMock(return_value=True)
+    auth_manager.get_session_snapshot = AsyncMock(return_value=base_session)
+    auth_manager.get_identity_context = AsyncMock(return_value=identity_context)
+
+    worker = AttackWorker(redis_client=MagicMock(), rate_limiter=_FakeRateLimiter(), auth_manager=auth_manager)
+
+    resolved = await worker._resolve_execution_session(
+        task=task,
+        provided_session=None,
+        identity_role=None,
+        identity_name="current_user",
+    )
+
+    assert resolved.auth_headers == {"Authorization": "Bearer named-user"}
+    auth_manager.get_identity_context.assert_awaited_once_with(scan_id=task.scan_id, role="current_user")
+
+
+@pytest.mark.asyncio
+async def test_resolve_execution_session_keeps_identity_role_lookup() -> None:
+    task = _build_task()
+    base_session = _build_session(task.scan_id)
+    role_session = _build_session(task.scan_id)
+    role_session.auth_headers = {"Authorization": "Bearer admin-user"}
+
+    identity_context = MagicMock()
+    identity_context.to_session_snapshot.return_value = role_session
+
+    auth_manager = MagicMock()
+    auth_manager.health_check = AsyncMock(return_value=True)
+    auth_manager.get_session_snapshot = AsyncMock(return_value=base_session)
+    auth_manager.get_identity_context = AsyncMock(return_value=identity_context)
+
+    worker = AttackWorker(redis_client=MagicMock(), rate_limiter=_FakeRateLimiter(), auth_manager=auth_manager)
+
+    resolved = await worker._resolve_execution_session(
+        task=task,
+        provided_session=None,
+        identity_role=IdentityRole.admin,
+        identity_name=None,
+    )
+
+    assert resolved.auth_headers == {"Authorization": "Bearer admin-user"}
+    auth_manager.get_identity_context.assert_awaited_once_with(scan_id=task.scan_id, role=IdentityRole.admin)
+
+
+@pytest.mark.asyncio
+async def test_resolve_execution_session_anonymous_returns_empty_session_without_auth_lookup() -> None:
+    task = _build_task()
+    auth_manager = MagicMock()
+    auth_manager.health_check = AsyncMock(return_value=True)
+    auth_manager.get_session_snapshot = AsyncMock(return_value=_build_session(task.scan_id))
+    auth_manager.get_identity_context = AsyncMock()
+
+    worker = AttackWorker(redis_client=MagicMock(), rate_limiter=_FakeRateLimiter(), auth_manager=auth_manager)
+
+    resolved = await worker._resolve_execution_session(
+        task=task,
+        provided_session=None,
+        identity_role=None,
+        identity_name="anonymous",
+    )
+
+    assert resolved.scan_id == task.scan_id
+    assert resolved.cookies == []
+    assert resolved.auth_headers == {}
+    assert resolved.csrf_tokens == {}
+    auth_manager.health_check.assert_not_awaited()
+    auth_manager.get_session_snapshot.assert_not_awaited()
+    auth_manager.get_identity_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_execution_session_missing_named_identity_raises_identity_not_found() -> None:
+    task = _build_task()
+    auth_manager = MagicMock()
+    auth_manager.health_check = AsyncMock(return_value=True)
+    auth_manager.get_session_snapshot = AsyncMock(return_value=_build_session(task.scan_id))
+    auth_manager.get_identity_context = AsyncMock(side_effect=RuntimeError("Identity context is not initialized"))
+
+    worker = AttackWorker(redis_client=MagicMock(), rate_limiter=_FakeRateLimiter(), auth_manager=auth_manager)
+
+    with pytest.raises(
+        AuthExpiredError,
+        match=f"identity_not_found: 'missing_user' not in identity matrix for scan {task.scan_id}",
+    ):
+        await worker._resolve_execution_session(
+            task=task,
+            provided_session=None,
+            identity_role=None,
+            identity_name="missing_user",
+        )

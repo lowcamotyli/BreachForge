@@ -2,7 +2,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from threading import Lock
+from typing import Any
+
+
+class TaskOutcome(str, Enum):
+    success = "success"
+    interesting = "interesting"
+    needs_followup = "needs_followup"
+    blocked = "blocked"
+    no_signal = "no_signal"
+    unsafe_blocked = "unsafe_blocked"
+
+
+@dataclass
+class FeedbackPayload:
+    outcome: TaskOutcome
+    scan_id: str
+    task_id: str
+    endpoint: str
+    finding_class: str
+    confidence: float
+    follow_up_hints: list[str] = field(default_factory=list)
+    parent_evidence_ref: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

@@ -1,0 +1,39 @@
+id: sensitive_exposure_adaptive_followup
+attack_class: sensitive_exposure
+preconditions:
+  requires_finding: sensitive_exposure
+  requires_outcome:
+    - needs_followup
+    - interesting
+steps:
+  - id: safe_replay
+    action: safe_token_replay
+    identity_selector: discovered_token
+    probe_template:
+      mode: observe
+      template: replay_discovered_token_on_in_scope_endpoints
+      allowed_methods:
+        - GET
+    expected_signal: discovered token grants read-only access to in-scope endpoint
+    observe_only: true
+    max_attempts: 1
+  - id: blast_radius
+    action: blast_radius_reference_mapping
+    identity_selector: discovered_token
+    probe_template:
+      mode: observe
+      template: map_read_only_impact_candidates
+      allowed_methods:
+        - GET
+    expected_signal: read-only impact candidates are mapped without mutation
+    observe_only: true
+    max_attempts: 1
+validators:
+  safe_replay_validator:
+    signal: discovered_reference_authenticated_access
+  blast_radius_validator:
+    signal: read_only_impact_candidates
+safety_budget:
+  max_requests: 5
+  get_only: true
+  scope: target_only

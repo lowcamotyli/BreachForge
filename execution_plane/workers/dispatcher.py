@@ -9,6 +9,111 @@ DEFAULT_AUTONOMOUS_ATTACK_ROUNDS = 2
 MAX_CONCURRENT_REPLAN_TASKS = 3
 
 
+class ScanBudgetExceeded(RuntimeError):
+    pass
+
+
+def retry_on_redis_error(func):
+    def _wrapped(*args, **kwargs):
+        import time
+
+        from redis.exceptions import ConnectionError as RedisConnectionError
+        from redis.exceptions import TimeoutError as RedisTimeoutError
+
+        delay_seconds = 0.1
+        retries = 3
+        last_exc: Exception | None = None
+        for attempt in range(retries):
+            try:
+                return func(*args, **kwargs)
+            except (RedisConnectionError, RedisTimeoutError) as exc:
+                last_exc = exc
+                if attempt == retries - 1:
+                    raise
+                time.sleep(delay_seconds)
+                delay_seconds *= 2
+        if last_exc is not None:
+            raise last_exc
+        return None
+
+    return _wrapped
+
+
+@retry_on_redis_error
+def _redis_get(connection: object, key: str) -> object:
+    return connection.get(key)
+
+
+@retry_on_redis_error
+def _redis_incr(connection: object, key: str) -> int:
+    return int(connection.incr(key))
+
+
+@retry_on_redis_error
+def _redis_setnx(connection: object, key: str, value: str) -> bool:
+    return bool(connection.setnx(key, value))
+
+
+@retry_on_redis_error
+def _redis_expire(connection: object, key: str, ttl_seconds: int) -> None:
+    connection.expire(key, ttl_seconds)
+
+
+def _class_in_priority(priority_classes: object, attack_class: str) -> bool:
+    if not isinstance(priority_classes, list):
+        return False
+    return attack_class in [item for item in priority_classes if isinstance(item, str)]
+
+
+def _parse_scan_budget(task: object) -> dict[str, object] | None:
+    import json
+
+    hypothesis = getattr(task, "hypothesis", None)
+    if not isinstance(hypothesis, str) or not hypothesis.strip():
+        return None
+    try:
+        payload = json.loads(hypothesis)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    scan_budget = payload.get("scan_budget")
+    return scan_budget if isinstance(scan_budget, dict) else None
+
+
+def _enforce_dispatch_budget(*, connection: object, scan_id: str, attack_class: str, scan_budget: dict[str, object]) -> None:
+    max_requests = scan_budget.get("max_requests")
+    if not isinstance(max_requests, int) or isinstance(max_requests, bool) or max_requests <= 0:
+        return
+
+    priority_classes = scan_budget.get("priority_classes")
+    if _class_in_priority(priority_classes, attack_class):
+        return
+
+    total_key = f"budget:{scan_id}:requests"
+    total_dispatched = _redis_incr(connection, total_key)
+    if total_dispatched == 1:
+        _redis_expire(connection, total_key, 86400)
+    if total_dispatched > max_requests:
+        raise ScanBudgetExceeded(f"scan request budget exceeded for {scan_id}")
+
+    class_cap = 0
+    per_class_cap = scan_budget.get("per_class_cap")
+    if isinstance(per_class_cap, dict):
+        raw_cap = per_class_cap.get(attack_class)
+        if isinstance(raw_cap, int) and not isinstance(raw_cap, bool):
+            class_cap = raw_cap
+    if class_cap <= 0:
+        return
+
+    class_key = f"budget:{scan_id}:class:{attack_class}"
+    class_count = _redis_incr(connection, class_key)
+    if class_count == 1:
+        _redis_expire(connection, class_key, 86400)
+    if class_count > class_cap:
+        raise ScanBudgetExceeded(f"class budget exceeded for {attack_class}")
+
+
 class Dispatcher:
     @staticmethod
     def dispatch_attack_tasks(scan_id: str) -> None:
@@ -70,7 +175,8 @@ async def _dispatch_attack_tasks_async(scan_id: str) -> None:
     from rq.job import Dependency
     from execution_plane.planner.planner import MAX_REPLAN_ROUNDS
     from sqlalchemy import select
-    from storage.db.models import AttackTask, AttackTaskStatus
+    from sqlalchemy.orm import selectinload
+    from storage.db.models import AttackTask, AttackTaskStatus, Scan
     from storage.db.session import AsyncSessionLocal
 
     logger = structlog.get_logger(__name__)
@@ -78,9 +184,14 @@ async def _dispatch_attack_tasks_async(scan_id: str) -> None:
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(AttackTask).where(
+            select(AttackTask)
+            .where(
                 AttackTask.scan_id == scan_uuid,
                 AttackTask.status == AttackTaskStatus.pending,
+            )
+            .options(
+                selectinload(AttackTask.endpoint),
+                selectinload(AttackTask.scan).selectinload(Scan.target),
             )
         )
         pending_tasks = list(result.scalars().all())
@@ -112,7 +223,7 @@ async def _dispatch_attack_tasks_async(scan_id: str) -> None:
     )
 
     dispatch_batch_size = len(pending_tasks)
-    replan_rounds_raw = connection.get(f"replan:rounds:{scan_id}")
+    replan_rounds_raw = _redis_get(connection, f"replan:rounds:{scan_id}")
     replan_rounds = _parse_int_or_zero(replan_rounds_raw)
     if replan_rounds > MAX_REPLAN_ROUNDS:
         dispatch_batch_size = min(dispatch_batch_size, MAX_CONCURRENT_REPLAN_TASKS)
@@ -120,26 +231,45 @@ async def _dispatch_attack_tasks_async(scan_id: str) -> None:
     tasks_to_dispatch = pending_tasks[:dispatch_batch_size]
     race_group_ids_by_task: dict[UUID, str] = {}
     race_groups: dict[str, dict[str, str]] = {}
-    race_tasks_by_class: dict[str, list[AttackTask]] = {}
+    race_tasks_by_key: dict[tuple[str, str], list[AttackTask]] = {}
     for pending_task in tasks_to_dispatch:
         if not _is_race_related_attack_class(pending_task.attack_class):
             continue
-        race_tasks_by_class.setdefault(str(pending_task.attack_class), []).append(pending_task)
-    for class_tasks in race_tasks_by_class.values():
+        race_key = (str(pending_task.attack_class), str(pending_task.endpoint_id))
+        race_tasks_by_key.setdefault(race_key, []).append(pending_task)
+    for class_tasks in race_tasks_by_key.values():
         if not class_tasks:
             continue
         race_group_id = str(uuid4())
-        endpoint_id = str(class_tasks[0].endpoint_id)
+        first_task = class_tasks[0]
+        endpoint_id = str(first_task.endpoint_id)
+        endpoint_url = _task_endpoint_url(first_task)
         for class_task in class_tasks:
             race_group_ids_by_task[class_task.id] = race_group_id
-            race_groups[race_group_id] = {"endpoint_id": endpoint_id}
+        race_groups[race_group_id] = {
+            "endpoint_id": endpoint_id,
+            "endpoint_url": endpoint_url,
+            "attack_class": str(first_task.attack_class),
+            "task_ids": ",".join(str(task.id) for task in class_tasks),
+            "reconcile_required": "true",
+        }
     jobs = []
     skipped_tasks = 0
     kill_switch_active = False
+    if race_groups:
+        _ks = _redis_get(connection, f"kill:{scan_id}")
+        _kg = _redis_get(connection, "kill:global")
+        if (isinstance(_ks, (str, bytes)) and _ks) or (isinstance(_kg, (str, bytes)) and _kg):
+            logger.warning("dispatch_kill_switch_active", scan_id=scan_id)
+            kill_switch_active = True
+        else:
+            await _prime_race_initial_state_hashes(scan_uuid=scan_uuid, race_groups=race_groups)
     async with AsyncSessionLocal() as db:
         for task in tasks_to_dispatch:
-            _ks = connection.get(f"kill:{scan_id}")
-            _kg = connection.get("kill:global")
+            if kill_switch_active:
+                break
+            _ks = _redis_get(connection, f"kill:{scan_id}")
+            _kg = _redis_get(connection, "kill:global")
             if (isinstance(_ks, (str, bytes)) and _ks) or (isinstance(_kg, (str, bytes)) and _kg):
                 logger.warning("dispatch_kill_switch_active", scan_id=scan_id)
                 kill_switch_active = True
@@ -150,7 +280,19 @@ async def _dispatch_attack_tasks_async(scan_id: str) -> None:
                 db.add(task)
             identity_selector = _extract_identity_selector_from_hypothesis(task.hypothesis)
             if identity_selector is None or identity_selector not in expired_identities:
-                jobs.append(queue.enqueue(execute_attack, str(task.id)))
+                try:
+                    scan_budget = _parse_scan_budget(task)
+                    if scan_budget is not None:
+                        _enforce_dispatch_budget(
+                            connection=connection,
+                            scan_id=scan_id,
+                            attack_class=str(task.attack_class),
+                            scan_budget=scan_budget,
+                        )
+                    jobs.append(queue.enqueue(execute_attack, str(task.id)))
+                except ScanBudgetExceeded:
+                    task.status = AttackTaskStatus.failed
+                    db.add(task)
                 continue
 
             task.status = AttackTaskStatus.failed
@@ -351,6 +493,106 @@ def _parse_int_or_zero(value: object) -> int:
         return 0
 
 
+def _task_endpoint_url(task: object) -> str:
+    from urllib.parse import urljoin, urlparse
+
+    endpoint = getattr(task, "endpoint", None)
+    raw_url = getattr(endpoint, "url_pattern", None)
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        return ""
+
+    parsed = urlparse(raw_url)
+    if parsed.scheme and parsed.netloc:
+        return raw_url
+
+    scan = getattr(task, "scan", None)
+    target = getattr(scan, "target", None)
+    base_url = getattr(target, "url", None)
+    if not isinstance(base_url, str) or not base_url.strip():
+        return raw_url
+    return urljoin(base_url.rstrip("/") + "/", raw_url.lstrip("/"))
+
+
+async def _prime_race_initial_state_hashes(scan_uuid: object, race_groups: dict[str, dict[str, str]]) -> None:
+    session = await _load_session_snapshot_for_scan(scan_uuid)
+    for payload in race_groups.values():
+        endpoint_url = payload.get("endpoint_url")
+        if not isinstance(endpoint_url, str) or not endpoint_url:
+            continue
+        initial_hash = await _fetch_state_hash(endpoint_url, session)
+        if initial_hash is not None:
+            payload["initial_state_hash"] = initial_hash
+
+
+async def _load_session_snapshot_for_scan(scan_uuid: object) -> object:
+    from sqlalchemy import select
+    from storage.db.models import AuthContext
+    from storage.db.session import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(AuthContext).where(AuthContext.scan_id == scan_uuid))
+        auth_context = result.scalar_one_or_none()
+    if auth_context is None:
+        auth_context = create_empty_auth_context(scan_uuid)
+    return _session_snapshot_from_auth_context(auth_context, scan_uuid)
+
+
+async def _fetch_state_hash(endpoint_url: str, session: object) -> str | None:
+    from urllib.parse import urlparse
+
+    import httpx
+
+    parsed = urlparse(endpoint_url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+
+    headers = _session_headers(session)
+    cookies = _session_cookies(session)
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.get(endpoint_url, headers=headers, cookies=cookies)
+    except Exception:
+        return None
+    return _hash_state_payload({"status": response.status_code, "body": response.text})
+
+
+def _session_headers(session: object) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    auth_headers = getattr(session, "auth_headers", {})
+    if isinstance(auth_headers, dict):
+        headers.update({str(key): str(value) for key, value in auth_headers.items()})
+    csrf_tokens = getattr(session, "csrf_tokens", {})
+    if isinstance(csrf_tokens, dict):
+        headers.update({str(key): str(value) for key, value in csrf_tokens.items()})
+    return headers
+
+
+def _session_cookies(session: object) -> dict[str, str]:
+    cookies_raw = getattr(session, "cookies", [])
+    if not isinstance(cookies_raw, list):
+        return {}
+    cookies: dict[str, str] = {}
+    for cookie in cookies_raw:
+        if not isinstance(cookie, dict):
+            continue
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if isinstance(name, str) and isinstance(value, str):
+            cookies[name] = value
+    return cookies
+
+
+def _hash_state_payload(payload: object) -> str:
+    import hashlib
+    import json
+
+    try:
+        material = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        material = str(payload)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
 async def _collect_expired_identity_names(
     db_factory: object,
     scan_uuid: object,
@@ -426,6 +668,7 @@ async def _emit_race_reconciliation_event(
     race_group_id: str,
     status: str,
     task_id: str,
+    metadata: dict[str, str] | None = None,
 ) -> None:
     import asyncio
 
@@ -436,7 +679,41 @@ async def _emit_race_reconciliation_event(
         "status": status,
         "task_id": task_id,
     }
+    if metadata:
+        payload.update(metadata)
     await asyncio.to_thread(redis_connection.xadd, stream_key, payload)
+
+
+async def _record_race_reconciliation_result(
+    redis_connection: object,
+    scan_id: str,
+    race_group_id: str,
+    payload: dict[str, str],
+) -> None:
+    import asyncio
+
+    key = f"race_reconcile:{scan_id}:{race_group_id}"
+    try:
+        await asyncio.to_thread(redis_connection.hset, key, mapping=payload)
+        await asyncio.to_thread(redis_connection.expire, key, 60 * 60 * 24)
+    except Exception:
+        return
+
+
+async def _reconcile_race_final_state(
+    endpoint_url: str,
+    session: object,
+    initial_state_hash: str | None,
+    final_state_hash: str | None,
+) -> bool:
+    if not isinstance(initial_state_hash, str) or not initial_state_hash:
+        return False
+    resolved_final_hash = final_state_hash
+    if not isinstance(resolved_final_hash, str) or not resolved_final_hash:
+        resolved_final_hash = await _fetch_state_hash(endpoint_url, session)
+    if not isinstance(resolved_final_hash, str) or not resolved_final_hash:
+        return False
+    return resolved_final_hash != initial_state_hash
 
 
 def _is_race_related_attack_class(attack_class: object) -> bool:
@@ -489,7 +766,8 @@ async def _dispatch_race_reconciliation_async(scan_id: str, race_groups: dict[st
 
     import structlog
     from redis import Redis
-    from storage.db.models import AttackTask, AttackTaskStatus
+    from sqlalchemy import select
+    from storage.db.models import AttackTask, AttackTaskStatus, Endpoint
     from storage.db.session import AsyncSessionLocal
 
     logger = structlog.get_logger(__name__)
@@ -508,14 +786,54 @@ async def _dispatch_race_reconciliation_async(scan_id: str, race_groups: dict[st
             continue
         reconciliation_task_id: str | None = None
         reconciliation_status = "failed"
+        reconciliation_metadata: dict[str, str] = {
+            "reconcile_required": "true",
+            "reconcile_passed": "false",
+        }
         try:
             endpoint_uuid = UUID(endpoint_id_raw)
+            endpoint_url = payload.get("endpoint_url")
+            if not isinstance(endpoint_url, str) or not endpoint_url.strip():
+                async with AsyncSessionLocal() as db:
+                    endpoint_result = await db.execute(select(Endpoint).where(Endpoint.id == endpoint_uuid))
+                    endpoint = endpoint_result.scalar_one_or_none()
+                    endpoint_url = str(endpoint.url_pattern) if endpoint is not None else ""
+            session = await _load_session_snapshot_for_scan(scan_uuid)
+            initial_state_hash = payload.get("initial_state_hash")
+            final_state_hash = await _fetch_state_hash(endpoint_url, session) if endpoint_url else None
+            final_ok = await _reconcile_race_final_state(
+                endpoint_url,
+                session,
+                initial_state_hash,
+                final_state_hash,
+            )
+            reconciliation_metadata.update(
+                {
+                    "reconcile_passed": "true" if final_ok else "false",
+                    "initial_state_hash": initial_state_hash or "",
+                    "final_state_hash": final_state_hash or "",
+                    "endpoint_url": endpoint_url or "",
+                }
+            )
+            await _record_race_reconciliation_result(
+                redis_connection=connection,
+                scan_id=scan_id,
+                race_group_id=race_group_id,
+                payload=reconciliation_metadata,
+            )
+            if not final_ok:
+                reconciliation_status = "no_signal"
+                continue
+
             async with AsyncSessionLocal() as db:
                 hypothesis_payload = {
                     "probe_type": "race_reconciliation_read",
                     "attack_class": "reconciliation_read",
                     "method": "GET",
                     "_race_group_id": race_group_id,
+                    "reconcile_passed": True,
+                    "initial_state_hash": initial_state_hash,
+                    "final_state_hash": final_state_hash,
                 }
                 reconciliation_task = AttackTask(
                     scan_id=scan_uuid,
@@ -546,6 +864,7 @@ async def _dispatch_race_reconciliation_async(scan_id: str, race_groups: dict[st
                 race_group_id=race_group_id,
                 status=reconciliation_status,
                 task_id=reconciliation_task_id or "",
+                metadata=reconciliation_metadata,
             )
 
 
@@ -562,6 +881,11 @@ async def _finalize_scan_async(scan_id: str) -> None:
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     connection = Redis.from_url(redis_url, decode_responses=True)
+    finalize_key = f"finalized:{scan_id}"
+    if not _redis_setnx(connection, finalize_key, "1"):
+        logger.info("scan_finalize_already_done", scan_id=scan_id)
+        return
+    _redis_expire(connection, finalize_key, 86400)
     max_rounds = _autonomous_attack_rounds(os.getenv(AUTONOMOUS_ATTACK_ROUNDS_ENV))
     delay_seconds = _lifecycle_second_check_delay(os.getenv(LIFECYCLE_SECOND_CHECK_DELAY_ENV))
     for round_index in range(max_rounds + 1):

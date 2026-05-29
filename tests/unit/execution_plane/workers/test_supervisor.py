@@ -16,6 +16,8 @@ SUPERVISOR_PATH = PROJECT_ROOT / "execution_plane/workers/supervisor.py"
 def _load_supervisor_module() -> ModuleType:
     redis_module = ModuleType("redis")
     redis_module.Redis = type("Redis", (), {"from_url": staticmethod(lambda *args, **kwargs: MagicMock())})
+    redis_exceptions_module = ModuleType("redis.exceptions")
+    redis_exceptions_module.RedisError = type("RedisError", (Exception,), {})
 
     rq_module = ModuleType("rq")
     rq_module.Queue = type("Queue", (), {"__init__": lambda self, *args, **kwargs: None})
@@ -24,12 +26,16 @@ def _load_supervisor_module() -> ModuleType:
         (),
         {"__init__": lambda self, *args, **kwargs: None, "work": lambda self, **kwargs: None},
     )
+    rq_exceptions_module = ModuleType("rq.exceptions")
+    rq_exceptions_module.NoSuchJobError = type("NoSuchJobError", (Exception,), {})
 
     rq_job_module = ModuleType("rq.job")
     rq_job_module.Job = type("Job", (), {"fetch": staticmethod(lambda *args, **kwargs: MagicMock(started_at=None))})
 
     sys.modules.setdefault("redis", redis_module)
+    sys.modules.setdefault("redis.exceptions", redis_exceptions_module)
     sys.modules.setdefault("rq", rq_module)
+    sys.modules.setdefault("rq.exceptions", rq_exceptions_module)
     sys.modules.setdefault("rq.job", rq_job_module)
 
     spec = importlib.util.spec_from_file_location("project_supervisor", SUPERVISOR_PATH)
@@ -90,7 +96,7 @@ def test_is_task_timeout_exceeded_raises_on_job_fetch_failure() -> None:
     supervisor = WorkerSupervisor(queues=["attack"], redis_client=redis_client)
 
     def _raise_fetch(*args: object, **kwargs: object) -> object:
-        raise RuntimeError("redis error")
+        raise supervisor_module.RedisError("redis error")
 
     original_fetch = supervisor_module.Job.fetch
     supervisor_module.Job.fetch = _raise_fetch

@@ -66,6 +66,12 @@ BASE_ORDERS: dict[str, dict[str, Any]] = {
 
 USERS: dict[str, dict[str, Any]] = deepcopy(BASE_USERS)
 ORDERS: dict[str, dict[str, Any]] = deepcopy(BASE_ORDERS)
+
+# Static auth material exported for use by benchmark_lab.py without running the server
+BENCHMARK_AUTH: dict[str, dict[str, str]] = {
+    username: {"token": user["token"], "role": user["role"], "tenant": user["tenant"]}
+    for username, user in BASE_USERS.items()
+}
 CARTS: dict[str, list[dict[str, Any]]] = {username: [] for username in BASE_USERS}
 API_TOKENS: dict[str, list[dict[str, str]]] = {username: [] for username in BASE_USERS}
 JOBS: dict[str, dict[str, str]] = {}

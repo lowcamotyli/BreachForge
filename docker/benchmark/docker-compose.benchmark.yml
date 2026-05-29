@@ -1,0 +1,24 @@
+services:
+  lab_app:
+    image: python:3.12-slim
+    working_dir: /app
+    command: python /app/tests/benchmark_lab/lab_app.py
+    ports:
+      - "5000:5000"
+    volumes:
+      - ../..:/app
+
+  redis:
+    image: redis:7-alpine
+
+  benchmark_runner:
+    image: python:3.12-slim
+    working_dir: /app
+    command: python /app/scripts/benchmark_lab.py --quick --lab all
+    depends_on:
+      - lab_app
+      - redis
+    environment:
+      BENCHMARK_SEED: ${BENCHMARK_SEED:-42}
+    volumes:
+      - ../..:/app

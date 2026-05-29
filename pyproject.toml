@@ -25,10 +25,14 @@ dependencies = [
   "cryptography",
   "PyYAML",
   "python-multipart",
+  "click>=8.0",
 ]
 
+[project.scripts]
+breachforge = "cli.main:breachforge"
+
 [tool.hatch.build.targets.wheel]
-packages = ["api", "control_plane", "execution_plane", "storage"]
+packages = ["api", "control_plane", "execution_plane", "storage", "cli"]
 
 [project.optional-dependencies]
 dev = [

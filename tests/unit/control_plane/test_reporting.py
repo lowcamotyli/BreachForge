@@ -4,7 +4,7 @@ import json
 from uuid import uuid4
 
 import pytest
-from control_plane.reporting import ReportingService
+from control_plane.reporting import ReportingService, compute_attack_class_readiness, generate_coverage_report
 
 
 def test_redact_report_redacts_sensitive_keys() -> None:
@@ -1237,7 +1237,9 @@ async def test_report_includes_actions_performed() -> None:
 
     assert report["actions_performed"] == {
         "total_requests_sent": 2,
+        "total_requests": 2,
         "requests_by_attack_class": {"bola": 2},
+        "by_class": {"bola": 2},
         "tasks_dispatched": 3,
         "tasks_with_findings": 1,
     }
@@ -1265,7 +1267,7 @@ async def test_report_includes_skipped_blocked(monkeypatch: pytest.MonkeyPatch) 
 
     assert skipped_blocked == {
         "tasks_skipped": 1,
-        "skipped_details": [{"task_id": "task-1", "reason": "blocked", "attack_class": "bola"}],
+        "skipped_details": [{"task_id": "task-1", "reason": "policy:blocked", "attack_class": "bola", "endpoint": ""}],
     }
 
 
@@ -1277,3 +1279,351 @@ async def test_report_skipped_blocked_empty_on_no_redis(monkeypatch: pytest.Monk
     skipped_blocked = await service._skipped_blocked(uuid4())
 
     assert skipped_blocked == {"tasks_skipped": 0, "skipped_details": []}
+
+
+def test_render_json_includes_operator_sections_and_redacts_credentials() -> None:
+    service = ReportingService(db=None, evidence_store=None)
+    report = {
+        "scan_id": "scan-operator",
+        "generated_at": "2026-05-26T00:00:00+00:00",
+        "scan_config": {
+            "credentials": {"username": "alice", "password": "super-secret"},
+            "cookies": [{"name": "sid", "value": "cookie-secret"}],
+        },
+        "auth_reliability": {
+            "session_valid_count": 2,
+            "role_count": 2,
+            "tenant_count": 1,
+            "health_check_pass_rate": 0.5,
+            "identity_failures": [
+                {"identity_id": "admin", "reason": "expired", "timestamp": "2026-05-26T01:00:00+00:00"}
+            ],
+        },
+        "discovery_coverage_metrics": {
+            "label": "Discovery Coverage Metrics",
+            "expected_surface_count": 2,
+            "discovered_surface_count": 1,
+            "coverage_pct": 50.0,
+            "blind_spot_endpoints": ["/api/admin"],
+            "source_attribution": {"crawler": 1, "har": 0, "openapi": 0, "js": 0, "wordlist": 0, "manual": 0},
+        },
+        "scan_blind_spots": {
+            "label": "Scan Blind Spots",
+            "auth_failures": [
+                {"identity_id": "admin", "reason": "expired", "timestamp": "2026-05-26T01:00:00+00:00"}
+            ],
+            "discovery_gaps": ["/api/admin"],
+            "policy_skipped_attack_classes": [{"attack_class": "bola", "reason": "policy:mutating_allowed", "count": 1}],
+            "manually_excluded_paths": ["/api/private"],
+            "summary": {
+                "auth_failure_count": 1,
+                "discovery_gap_count": 1,
+                "policy_skipped_attack_class_count": 1,
+                "manually_excluded_path_count": 1,
+            },
+        },
+        "findings": [],
+    }
+
+    rendered = service.render_json(report)
+    payload = json.loads(rendered)
+
+    assert payload["auth_reliability"]["session_valid_count"] == 2
+    assert payload["discovery_coverage_metrics"]["label"] == "Discovery Coverage Metrics"
+    assert payload["scan_blind_spots"]["label"] == "Scan Blind Spots"
+    assert "super-secret" not in rendered
+    assert "cookie-secret" not in rendered
+    assert payload["scan_config"]["credentials"] == "[REDACTED]"
+    assert payload["scan_config"]["cookies"] == "[REDACTED]"
+
+
+def test_render_markdown_includes_operator_sections_outside_findings() -> None:
+    service = ReportingService(db=None, evidence_store=None)
+    report = {
+        "scan_id": "scan-operator",
+        "generated_at": "2026-05-26T00:00:00+00:00",
+        "auth_reliability": {
+            "session_valid_count": 1,
+            "role_count": 1,
+            "tenant_count": 0,
+            "health_check_pass_rate": 1.0,
+            "identity_failures": [
+                {"identity_id": "user", "reason": "forbidden", "timestamp": "2026-05-26T01:00:00+00:00"}
+            ],
+        },
+        "discovery_coverage_metrics": {
+            "label": "Discovery Coverage Metrics",
+            "expected_surface_count": 2,
+            "discovered_surface_count": 1,
+            "coverage_pct": 50.0,
+            "blind_spot_endpoints": ["/api/admin"],
+            "source_attribution": {"crawler": 1, "har": 0, "openapi": 0, "js": 0, "wordlist": 0, "manual": 0},
+        },
+        "scan_blind_spots": {
+            "label": "Scan Blind Spots",
+            "auth_failures": [
+                {"identity_id": "user", "reason": "forbidden", "timestamp": "2026-05-26T01:00:00+00:00"}
+            ],
+            "discovery_gaps": ["/api/admin"],
+            "policy_skipped_attack_classes": [{"attack_class": "csrf", "reason": "policy:mutating_allowed", "count": 2}],
+            "manually_excluded_paths": ["/api/private"],
+        },
+        "findings": [{"title": "Confirmed issue", "severity": "high", "attack_class": "bola", "metadata": {}}],
+    }
+
+    markdown = service.render_markdown(report)
+
+    assert "## Auth Reliability" in markdown
+    assert "## Discovery Coverage Metrics" in markdown
+    assert "## Scan Blind Spots" in markdown
+    assert "| user | forbidden | 2026-05-26T01:00:00+00:00 |" in markdown
+    assert "## Discovery Coverage Metrics" in markdown.split("## 1. Confirmed issue")[0]
+
+
+@pytest.mark.asyncio
+async def test_assemble_report_includes_auth_setup_section() -> None:
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock, MagicMock
+
+    from control_plane.auth_manager import IdentityContext, IdentityHealthMatrix, IdentityRole
+    from storage.db.models import Scan, Target
+
+    scan_id = uuid4()
+    target = Target(id=uuid4(), url="https://example.com", name="test", config={})
+    scan = Scan(id=scan_id, target_id=target.id, status="complete")
+    scan.target = target
+
+    identity = IdentityContext(
+        scan_id=scan_id,
+        role=IdentityRole.user,
+        cookies=[],
+        auth_headers={},
+        csrf_tokens={},
+        captured_at=datetime.now(UTC),
+    )
+    matrix = IdentityHealthMatrix()
+    matrix.record_probe(identity, success=True, status_code=200)
+
+    class FakeAuthManager:
+        identity_health_matrix = matrix
+
+        def get_auth_coverage_metrics(self) -> dict[str, float | int]:
+            return {
+                "session_valid_count": 1,
+                "role_count": 1,
+                "tenant_count": 0,
+                "health_check_pass_rate": 1.0,
+            }
+
+        async def get_identity_failures(self) -> list[object]:
+            return []
+
+    scan_result = MagicMock()
+    scan_result.scalar_one_or_none.return_value = scan
+    findings_result = MagicMock()
+    findings_result.scalars.return_value.all.return_value = []
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[scan_result, findings_result])
+
+    service = ReportingService(db=db, evidence_store=None, auth_manager=FakeAuthManager())
+    report = await service.assemble_report(scan_id)
+
+    assert "auth_setup" in report
+    assert report["auth_setup"]["overall_reliability_score"] == 1.0
+    assert report["auth_setup"]["preflight_status"] == "unknown"
+    assert report["auth_setup"]["is_clean_report_reliable"] is True
+
+
+def test_auth_setup_report_section_marks_low_pass_rate_unreliable() -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from control_plane.auth_manager import IdentityContext, IdentityHealthMatrix, IdentityRole
+
+    scan_id = uuid4()
+    identity = IdentityContext(
+        scan_id=scan_id,
+        role=IdentityRole.admin,
+        cookies=[],
+        auth_headers={},
+        csrf_tokens={},
+        captured_at=datetime.now(UTC),
+    )
+    matrix = IdentityHealthMatrix()
+    matrix.record_probe(identity, success=True, status_code=200)
+    matrix.record_probe(identity, success=False, status_code=401)
+    matrix.record_probe(identity, success=False, status_code=403)
+
+    section = ReportingService(db=None).auth_setup_report_section(matrix, SimpleNamespace(status="ok"))
+
+    assert section["is_clean_report_reliable"] is False
+    assert section["per_identity_blind_spots"][0]["identity"] == "admin"
+    assert section["per_identity_blind_spots"][0]["pass_rate"] < 0.8
+    assert section["per_identity_blind_spots"][0]["blind_spots"]
+
+
+def test_auth_setup_report_section_warns_on_unchecked_identity_and_failed_preflight() -> None:
+    from types import SimpleNamespace
+
+    from control_plane.auth_manager import IdentityHealthMatrix
+
+    matrix = IdentityHealthMatrix()
+    matrix._role_markers.append("admin")
+
+    section = ReportingService(db=None).auth_setup_report_section(matrix, SimpleNamespace(status="failed"))
+
+    assert section["preflight_status"] == "failed"
+    assert section["is_clean_report_reliable"] is False
+    assert section["auth_warnings"]
+    assert any("0 probes" in warning for warning in section["auth_warnings"])
+    assert section["per_identity_blind_spots"][0]["blind_spots"] == ["unchecked identity"]
+
+
+@pytest.mark.asyncio
+async def test_assemble_report_adds_operator_grade_sections() -> None:
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from storage.db.models import AssetMap, Endpoint, Scan, Target
+
+    scan_id = uuid4()
+    target = Target(
+        id=uuid4(),
+        url="https://example.com",
+        name="test",
+        config={"expected_surface": ["/api/data", "/api/admin"], "manual_excluded_paths": ["/api/private"]},
+    )
+    scan = Scan(id=scan_id, target_id=target.id, status="complete")
+    scan.target = target
+    asset_map = AssetMap(id=uuid4(), scan_id=scan_id)
+    asset_map.endpoints = [
+        Endpoint(
+            id=uuid4(),
+            asset_map_id=asset_map.id,
+            url_pattern="/api/data",
+            method="GET",
+            auth_required=True,
+            parameters=[],
+            source="crawler",
+        ),
+        Endpoint(
+            id=uuid4(),
+            asset_map_id=asset_map.id,
+            url_pattern="/api/extra",
+            method="GET",
+            auth_required=False,
+            parameters=[],
+            source="js",
+        ),
+    ]
+    scan.asset_map = asset_map
+
+    class FakeAuthManager:
+        def get_auth_coverage_metrics(self) -> dict[str, float | int]:
+            return {
+                "session_valid_count": 1,
+                "role_count": 2,
+                "tenant_count": 1,
+                "health_check_pass_rate": 0.75,
+            }
+
+        async def get_identity_failures(self) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(
+                    identity_id="admin",
+                    reason="expired",
+                    timestamp=datetime(2026, 5, 26, 1, 0, tzinfo=UTC),
+                )
+            ]
+
+    scan_result = MagicMock()
+    scan_result.scalar_one_or_none.return_value = scan
+    findings_result = MagicMock()
+    findings_result.scalars.return_value.all.return_value = []
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[scan_result, findings_result])
+
+    service = ReportingService(db=db, evidence_store=None, auth_manager=FakeAuthManager())
+    report = await service.assemble_report(scan_id)
+
+    assert report["auth_reliability"]["session_valid_count"] == 1
+    assert report["auth_reliability"]["identity_failures"][0]["reason"] == "expired"
+    assert report["discovery_coverage_metrics"]["expected_surface_count"] == 2
+    assert report["discovery_coverage_metrics"]["discovered_surface_count"] == 2
+    assert report["discovery_coverage_metrics"]["coverage_pct"] == 50.0
+    assert report["discovery_coverage_metrics"]["blind_spot_endpoints"] == ["/api/admin"]
+    assert report["discovery_coverage_metrics"]["source_attribution"]["crawler"] == 1
+    assert report["discovery_coverage_metrics"]["source_attribution"]["js"] == 1
+    assert report["scan_blind_spots"]["discovery_gaps"] == ["/api/admin"]
+    assert report["scan_blind_spots"]["manually_excluded_paths"] == ["/api/private"]
+
+
+def test_generate_coverage_report_aggregates_status_and_endpoint_details() -> None:
+    report = generate_coverage_report(
+        "scan-abc",
+        [
+            {
+                "endpoint_pattern": "/api/users/{id}",
+                "method": "get",
+                "status": "tested",
+                "tested_classes": ["bola"],
+                "finding_count": 2,
+            },
+            {
+                "endpoint_pattern": "/api/admin",
+                "method": "POST",
+                "status": "blocked",
+                "tested_classes": [],
+                "finding_count": 0,
+            },
+            {
+                "endpoint_pattern": "/api/orders/{id}",
+                "method": "GET",
+                "status": "tested",
+                "tested_classes": ["idor"],
+                "finding_count": 1,
+            },
+        ],
+    )
+
+    assert report["scan_id"] == "scan-abc"
+    assert report["total_endpoints"] == 3
+    assert report["by_status"] == {"tested": 2, "blocked": 1}
+    assert report["per_endpoint"]["GET /api/users/{id}"] == {
+        "status": "tested",
+        "tested_classes": ["bola"],
+        "finding_count": 2,
+    }
+    assert report["per_endpoint"]["POST /api/admin"]["status"] == "blocked"
+
+
+def test_compute_attack_class_readiness_returns_expected_scores() -> None:
+    readiness = compute_attack_class_readiness(
+        {
+            "svc-a": {
+                "tested": 3,
+                "discovered": 4,
+                "auth_tested": True,
+                "identity_tested": True,
+                "stateful_proof_tested": False,
+            },
+            "svc-b": {
+                "tested": 0,
+                "discovered": 0,
+                "auth_tested": False,
+                "identity_tested": False,
+                "stateful_proof_tested": False,
+            },
+        }
+    )
+
+    assert readiness["svc-a"]["auth_discovery"] == 0.75
+    assert readiness["svc-a"]["identity_tests"] == 1.0
+    assert readiness["svc-a"]["stateful_proof"] == 0.0
+    assert readiness["svc-a"]["overall"] == (0.75 + 1.0 + 0.0) / 3.0
+
+    assert readiness["svc-b"]["auth_discovery"] == 0.0
+    assert readiness["svc-b"]["identity_tests"] == 0.0
+    assert readiness["svc-b"]["stateful_proof"] == 0.0
+    assert readiness["svc-b"]["overall"] == 0.0

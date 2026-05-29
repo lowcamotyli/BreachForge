@@ -1,0 +1,13 @@
+{
+  "lab_version": "1.0.0",
+  "mode": "full",
+  "coverage": 1.0,
+  "tp": 7,
+  "fp": 0,
+  "fn": 0,
+  "time_to_proof_avg": 0.002,
+  "unsafe_block_count": 7,
+  "findings_count": 7,
+  "ground_truth_count": 7,
+  "note": "Golden baseline: scanner detects all 7 lab vulnerabilities via HTTP probes"
+}

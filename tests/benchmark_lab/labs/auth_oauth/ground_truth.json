@@ -1,0 +1,23 @@
+{
+  "lab_id": "auth_oauth",
+  "lab_version": "1.0.0",
+  "attack_classes": ["EXPIRED_TOKEN_REUSE", "LOGOUT_REUSE", "OAUTH_STATE_CSRF", "REDIRECT_MANIPULATION", "SESSION_EXPIRED", "SESSION_REVOKED", "CSRF_FAILED", "INSUFFICIENT_ROLE"],
+  "identities": [
+    {"username": "alice", "role": "user", "tenant": "tenant_a"},
+    {"username": "bob", "role": "admin", "tenant": "tenant_a"}
+  ],
+  "expected_surface": ["/api/profile", "/api/data", "/oauth/authorize", "/oauth/callback", "/auth/expired", "/auth/logout", "/auth/role-check", "/auth/csrf-protected"],
+  "expected_endpoints": ["/api/profile", "/api/data", "/oauth/authorize", "/oauth/callback", "/auth/expired", "/auth/logout", "/auth/role-check", "/auth/csrf-protected"],
+  "auth_corpus_expectations": [
+    {"endpoint": "/auth/expired", "method": "GET", "expected_status": 401, "error": "session_expired"},
+    {"endpoint": "/auth/logout", "method": "POST", "expected_status": 401, "error": "session_revoked", "notes": "after session cookie has been blacklisted"},
+    {"endpoint": "/auth/role-check", "method": "GET", "expected_status": 403, "error": "insufficient_role", "notes": "unless X-Role: admin header is present"},
+    {"endpoint": "/auth/csrf-protected", "method": "GET", "expected_status": 403, "error": "csrf_failed", "notes": "unless X-CSRF-Token matches fixed corpus token"}
+  ],
+  "vulnerabilities": [
+    {"id": "ao-vuln-001", "type": "EXPIRED_TOKEN_REUSE", "endpoint": "/api/profile", "method": "GET", "severity": "HIGH", "description": "Expired tokens accepted on /api/profile"},
+    {"id": "ao-vuln-002", "type": "LOGOUT_REUSE", "endpoint": "/api/data", "method": "GET", "severity": "HIGH", "description": "Logged-out tokens still accepted on /api/data"},
+    {"id": "ao-vuln-003", "type": "OAUTH_STATE_CSRF", "endpoint": "/oauth/callback", "method": "GET", "severity": "HIGH", "description": "OAuth callback does not validate state parameter"},
+    {"id": "ao-vuln-004", "type": "REDIRECT_MANIPULATION", "endpoint": "/oauth/authorize", "method": "GET", "severity": "HIGH", "description": "OAuth authorize does not validate redirect_uri against allowlist"}
+  ]
+}

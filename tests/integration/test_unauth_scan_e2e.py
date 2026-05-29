@@ -11,7 +11,7 @@ from control_plane.orchestrator import ScanOrchestrator
 from execution_plane.planner.planner import AttackPlanner
 from execution_plane.planner.rules.base import AssetMap, AttackRule, ScanContext
 from storage.db.models import AssetMap as DbAssetMap
-from storage.db.models import AttackTask, Endpoint, Scan, ScanStatus, Target
+from storage.db.models import AttackTask, AuditEvent, Endpoint, Scan, ScanStatus, Target
 
 # Existing credential-auth tests should continue to pass; this file only covers the unauth_mode branch.
 
@@ -48,6 +48,9 @@ class _SessionStub:
     async def execute(self, statement: object) -> _ScalarResult:
         del statement
         return _ScalarResult(self._scan)
+
+    def add(self, obj: object) -> None:
+        assert isinstance(obj, AuditEvent)
 
     async def commit(self) -> None:
         self._committed_phases.append((self._scan.status, self._scan.phase))
@@ -180,6 +183,7 @@ async def test_unauth_scan_without_auth_context_completes_fsm(
     ]
     assert session_factory.scan.auth_context is None
     assert session_factory.committed_phases == [
+        (ScanStatus.running, "recon"),
         (ScanStatus.running, "recon"),
         (ScanStatus.running, "attack"),
         (ScanStatus.running, "validate"),

@@ -49,6 +49,7 @@ class SpecImporter:
                     method=method,
                     auth_required=auth_required,
                     parameters=parameters,
+                    source="openapi",
                 )
 
                 normalized = builder.normalize_url_pattern(url)
@@ -109,6 +110,7 @@ class SpecImporter:
                     method=method,
                     auth_required=False,
                     parameters=[],
+                    source="manual",
                 )
 
                 normalized = builder.normalize_url_pattern(url)
@@ -369,6 +371,7 @@ class SpecImporter:
                 method=method,
                 auth_required=False,
                 parameters=params,
+                source="manual",
             )
 
             normalized = builder.normalize_url_pattern(url)

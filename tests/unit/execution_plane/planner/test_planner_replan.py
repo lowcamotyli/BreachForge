@@ -140,3 +140,37 @@ def test_scan_context_completed_task_ids_defaults_to_empty_set() -> None:
     context = ScanContext(scan_id=uuid4(), target_url="https://app.example.com", asset_map=asset_map)
 
     assert context.completed_task_ids == set()
+
+
+def test_replan_budget_stops_after_max_rounds() -> None:
+    planner = AttackPlanner()
+    endpoint = _build_endpoint(
+        method="GET",
+        auth_required=True,
+        url_pattern="/api/users/{id}",
+        parameters=[{"name": "id", "in": "path"}],
+    )
+    context = _build_context([endpoint])
+
+    for _ in range(3):
+        planner.replan(context)
+
+    result = planner.replan(context)
+    assert result == []
+
+
+def test_replan_budget_tracks_rounds() -> None:
+    planner = AttackPlanner()
+    endpoint = _build_endpoint(
+        method="GET",
+        auth_required=True,
+        url_pattern="/api/orders",
+        parameters=[],
+    )
+    context = _build_context([endpoint])
+
+    planner.replan(context)
+    planner.replan(context)
+
+    assert context.replan_budget is not None
+    assert context.replan_budget.rounds_used == 2

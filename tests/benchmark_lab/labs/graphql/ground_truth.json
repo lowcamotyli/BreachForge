@@ -1,0 +1,18 @@
+{
+  "lab_id": "graphql",
+  "lab_version": "1.0.0",
+  "attack_classes": ["GRAPHQL_INTROSPECTION", "GRAPHQL_BATCH", "GRAPHQL_DEPTH", "GRAPHQL_FIELD_AUTH"],
+  "identities": [
+    {"username": "alice", "role": "user", "tenant": "tenant_a"},
+    {"username": "bob", "role": "admin", "tenant": "tenant_a"},
+    {"username": "carol", "role": "user", "tenant": "tenant_b"}
+  ],
+  "expected_surface": ["/graphql"],
+  "expected_endpoints": ["/graphql"],
+  "vulnerabilities": [
+    {"id": "gql-vuln-001", "type": "GRAPHQL_INTROSPECTION", "endpoint": "/graphql", "method": "POST", "severity": "LOW", "description": "Introspection enabled in production"},
+    {"id": "gql-vuln-002", "type": "GRAPHQL_BATCH", "endpoint": "/graphql", "method": "POST", "severity": "MEDIUM", "description": "Batch query execution allowed without limit"},
+    {"id": "gql-vuln-003", "type": "GRAPHQL_DEPTH", "endpoint": "/graphql", "method": "POST", "severity": "MEDIUM", "description": "No query depth limit -- deeply nested queries allowed"},
+    {"id": "gql-vuln-004", "type": "GRAPHQL_FIELD_AUTH", "endpoint": "/graphql", "method": "POST", "severity": "HIGH", "description": "adminConfig field accessible without admin role check"}
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "attack_classes": [
+    "EXPIRED_TOKEN_REUSE",
+    "LOGOUT_REUSE",
+    "OAUTH_STATE_CSRF",
+    "REDIRECT_MANIPULATION"
+  ],
+  "coverage": 0.0,
+  "coverage_by_attack_class": {
+    "EXPIRED_TOKEN_REUSE": 0.0,
+    "LOGOUT_REUSE": 0.0,
+    "OAUTH_STATE_CSRF": 0.0,
+    "REDIRECT_MANIPULATION": 0.0
+  },
+  "fn": 4,
+  "fp": 0,
+  "ground_truth_count": 4,
+  "lab_id": "auth_oauth",
+  "lab_version": "1.0.0",
+  "max_fp": 0,
+  "min_coverage": 0.0,
+  "mode": "quick",
+  "tp": 0
+}

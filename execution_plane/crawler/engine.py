@@ -48,6 +48,7 @@ class _CapturedRequest:
     auth_status_code: int | None = None
     observed_content_type: str | None = None
     auth_required: bool = False
+    source: str | None = None
 
 
 class CrawlerReconEngine:
@@ -149,6 +150,7 @@ class CrawlerReconEngine:
                 in_scope=request.in_scope,
                 auth_required=request.auth_required,
                 parameters=request.query_params + request.body_params,
+                source=request.source or "crawler",
                 observed_content_type=request.observed_content_type,
                 example_response_code=request.auth_status_code,
             )
@@ -197,6 +199,7 @@ class CrawlerReconEngine:
             in_scope=in_scope,
             auth_required=False,
             parameters=self._extract_query_params(link),
+            source="crawler",
             observed_content_type=None,
             example_response_code=None,
         )
@@ -244,35 +247,58 @@ class CrawlerReconEngine:
                     self._js_secret_findings.extend(
                         self._js_extractor.extract_secrets(js_content=js_content, source_url=script_src)
                     )
+                    sourcemap_urls = self._js_extractor.extract_sourcemap_urls(
+                        js_content=js_content,
+                        script_url=script_src,
+                    )
                     if urlparse(script_src).path.lower().endswith(".js"):
-                        sourcemap_url = f"{script_src}.map"
-                        try:
-                            sourcemap_response = await page.context.request.get(sourcemap_url, timeout=5000)
-                        except Exception:
-                            sourcemap_response = None
-                        if sourcemap_response is not None and sourcemap_response.status == 200:
-                            route_hints = await self._js_extractor.extract_from_sourcemap(
-                                sourcemap_url=sourcemap_url,
-                                base_url=base_url,
+                        fallback_sourcemap_url = f"{script_src}.map"
+                        if fallback_sourcemap_url not in sourcemap_urls:
+                            sourcemap_urls.append(fallback_sourcemap_url)
+                    for sourcemap_url in sourcemap_urls:
+                        route_hints = await self._js_extractor.extract_from_sourcemap(
+                            sourcemap_url=sourcemap_url,
+                            base_url=base_url,
+                        )
+                        for route_hint in route_hints:
+                            resolved_hint = urljoin(base_url, route_hint["endpoint"])
+                            if not self._is_in_scope(resolved_hint):
+                                continue
+                            self._asset_map_builder.add_endpoint(
+                                url=self._strip_query(resolved_hint),
+                                method=route_hint.get("method", "GET"),
+                                in_scope=True,
+                                auth_required=False,
+                                parameters=self._extract_query_params(resolved_hint),
+                                source=route_hint.get("source", "JS"),
+                                observed_content_type=None,
+                                example_response_code=None,
                             )
-                            for route_hint in route_hints:
-                                resolved_hint = urljoin(base_url, route_hint)
-                                if not self._is_in_scope(resolved_hint):
-                                    continue
-                                self._asset_map_builder.add_endpoint(
-                                    url=self._strip_query(resolved_hint),
-                                    method="GET",
-                                    in_scope=True,
-                                    auth_required=False,
-                                    parameters=self._extract_query_params(resolved_hint),
-                                    source="sourcemap",
-                                    observed_content_type=None,
-                                    example_response_code=None,
-                                )
             except Exception:
                 continue
 
         for script in script_snippets:
+            for endpoint in self._js_extractor.extract(script):
+                endpoint_url = endpoint["endpoint"]
+                resolved = urljoin(base_url, endpoint_url)
+                if not self._is_in_scope(resolved):
+                    continue
+                normalized_url = self._strip_query(resolved)
+                method = endpoint.get("method", "GET")
+                key = (normalized_url, method)
+                captured.setdefault(
+                    key,
+                    _CapturedRequest(
+                        url=normalized_url,
+                        method=method,
+                        in_scope=True,
+                        headers={},
+                        query_params=self._extract_query_params(resolved),
+                        body_params=[],
+                        post_data=None,
+                        source=endpoint.get("source", "JS"),
+                    ),
+                )
             for endpoint_url in self._extract_js_fetch_urls(script):
                 resolved = urljoin(base_url, endpoint_url)
                 if not self._is_in_scope(resolved):
@@ -289,6 +315,7 @@ class CrawlerReconEngine:
                         query_params=self._extract_query_params(resolved),
                         body_params=[],
                         post_data=None,
+                        source="JS",
                     ),
                 )
 
@@ -595,6 +622,7 @@ async def _run_crawler_async(scan_id: str) -> None:
                         "in_scope": endpoint.in_scope,
                         "auth_required": endpoint.auth_required,
                         "parameters": endpoint.parameters,
+                        "source": endpoint.source,
                         "observed_content_type": endpoint.observed_content_type,
                         "example_response_code": endpoint.example_response_code,
                     }
@@ -630,6 +658,7 @@ async def _run_crawler_async(scan_id: str) -> None:
                         method=endpoint.method,
                         auth_required=endpoint.auth_required,
                         parameters=endpoint.parameters,
+                        source=endpoint.source,
                         observed_content_type=endpoint.observed_content_type,
                         example_response_code=endpoint.example_response_code,
                     )

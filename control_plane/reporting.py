@@ -7,16 +7,19 @@ import os
 import re
 import uuid as _uuid_mod
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
 from uuid import UUID
 
 import structlog
 from botocore.exceptions import BotoCoreError, ClientError
-from sqlalchemy import distinct, func, select
+from sqlalchemy import distinct, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from api.models.responses import AttackChain, AttackChainReportResponse, AttackChainScoreFactors, AttackChainStep
+from api.models.requests import ScanPolicyV2
+from api.models.responses import AuthorizationPackResponse
 from control_plane.attack_chain_builder import (
     ChainConfidenceResult,
     adjust_chain_severity,
@@ -24,15 +27,41 @@ from control_plane.attack_chain_builder import (
     compute_chain_confidence,
     compute_chain_score,
 )
-from storage.db.models import AuditEvent, AuditEventType, AttackTask, Finding, ProofArtifact, RawProbe, Scan, Severity
+from control_plane.exporters.replay_exporter import ReplayExporter
+from control_plane.ownership import OwnershipResolver
+from storage.db.models import (
+    AssetMap,
+    AuditEvent,
+    AuditEventType,
+    AttackTask,
+    AttackTaskStatus,
+    AuthContext,
+    Endpoint,
+    Finding,
+    ProofArtifact,
+    RawProbe,
+    Scan,
+    Severity,
+)
 from storage.evidence.store import EvidenceStore
+
+if TYPE_CHECKING:
+    from control_plane.auth_manager import IdentityHealthMatrix
+    from control_plane.orchestrator import PreflightResult
 
 logger = structlog.get_logger(__name__)
 
 REDACTED = "[REDACTED]"
-_SENSITIVE_KEY_PATTERN = re.compile(r"authorization|cookie|password|token|secret", re.IGNORECASE)
+_SENSITIVE_KEY_PATTERN = re.compile(r"authorization|cookie|credential|password|token|secret", re.IGNORECASE)
 _REQUEST_HEADER_SENSITIVE_KEYS: tuple[str, ...] = ("authorization", "cookie", "password", "token", "x-api-key")
-_SAFE_SECRET_METADATA_KEYS: tuple[str, ...] = ("secret_blast_radius", "secret_blast_radius_matrix")
+_SAFE_SECRET_METADATA_KEYS: tuple[str, ...] = (
+    "secret_blast_radius",
+    "secret_blast_radius_matrix",
+    "secret_exposure_evidence_pack",
+    "secret_properties",
+    "secret_type",
+    "secret_fingerprint",
+)
 _SAFE_IDENTITY_KEYS: frozenset[str] = frozenset({"name", "role_hint", "tenant_hint", "identity_labels"})
 _IDENTITY_CREDENTIAL_KEYS: frozenset[str] = frozenset(
     {"credentials", "cookies", "bearer_token", "password", "token", "secret", "auth_headers"}
@@ -81,11 +110,82 @@ _DEFAULT_UNTESTED_REASON = "Requires authenticated session. Re-run with credenti
 _RACE_TIMELINE_CLASSES: frozenset[str] = frozenset(
     {"double_spend", "limit_override_race", "inventory_reservation_abuse", "idempotency_bypass"}
 )
+_DISCOVERY_SOURCES: tuple[str, ...] = ("crawler", "har", "openapi", "js", "wordlist", "manual")
+_EXPECTED_SURFACE_KEYS: tuple[str, ...] = ("expected_surface", "expected_endpoints")
+_DISCOVERED_SURFACE_KEYS: tuple[str, ...] = ("discovered_surface", "discovered_endpoints")
+_MANUAL_EXCLUDED_PATH_KEYS: tuple[str, ...] = (
+    "manual_excluded_paths",
+    "manually_excluded_paths",
+    "excluded_paths",
+    "exclude_paths",
+    "path_exclusions",
+)
+_IDENTITY_FAILURE_REASONS: frozenset[str] = frozenset(
+    {"expired", "missing", "forbidden", "csrf_failed", "refresh_failed"}
+)
+
+
+def build_attack_chain_timeline(finding: Finding, tasks_by_id: dict[object, AttackTask]) -> list[dict[str, Any]]:
+    chain: list[dict[str, Any]] = []
+    task_id = getattr(finding, "attack_task_id", None)
+    if task_id is None:
+        proof_artifacts = getattr(finding, "proof_artifacts", [])
+        if isinstance(proof_artifacts, list) and proof_artifacts:
+            task_id = getattr(proof_artifacts[0], "attack_task_id", None)
+
+    task = tasks_by_id.get(task_id) or tasks_by_id.get(str(task_id))
+    seen: set[str] = set()
+    while task is not None:
+        task_key = str(getattr(task, "id", ""))
+        if not task_key or task_key in seen:
+            break
+        seen.add(task_key)
+        chain.insert(
+            0,
+            {
+                "task_id": task_key,
+                "attack_class": str(getattr(task, "attack_class", "")),
+                "endpoint_id": str(getattr(task, "endpoint_id", "")),
+                "replan_reason": getattr(task, "replan_reason", None),
+                "timestamp": _task_timestamp(task),
+            },
+        )
+        parent_task_id = getattr(task, "parent_task_id", None)
+        if parent_task_id is None:
+            break
+        parent_task = tasks_by_id.get(parent_task_id) or tasks_by_id.get(str(parent_task_id))
+        if parent_task is None:
+            parent_task = getattr(task, "parent_task", None)
+        task = parent_task
+
+    return [
+        {
+            "step": f"step_{index}",
+            **entry,
+        }
+        for index, entry in enumerate(chain, start=1)
+    ]
+
+
+def _task_timestamp(task: AttackTask) -> str | None:
+    for attr_name in ("created_at", "updated_at", "timestamp"):
+        value = getattr(task, attr_name, None)
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 class ReportingService:
-    def __init__(self, db: AsyncSession, evidence_store: EvidenceStore | None = None) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        evidence_store: EvidenceStore | None = None,
+        auth_manager: Any | None = None,
+    ) -> None:
         self._db = db
+        self._auth_manager = auth_manager
         if evidence_store is not None:
             self._evidence_store = evidence_store
             return
@@ -95,7 +195,15 @@ class ReportingService:
             self._evidence_store = None
 
     async def assemble_report(self, scan_id: UUID) -> dict[str, Any]:
-        scan_result = await self._db.execute(select(Scan).where(Scan.id == scan_id).options(selectinload(Scan.target)))
+        scan_result = await self._db.execute(
+            select(Scan)
+            .where(Scan.id == scan_id)
+            .options(
+                selectinload(Scan.target),
+                selectinload(Scan.auth_context),
+                selectinload(Scan.asset_map).selectinload(AssetMap.endpoints),
+            )
+        )
         scan = scan_result.scalar_one_or_none()
         if scan is None:
             raise LookupError(f"Scan not found: {scan_id}")
@@ -107,15 +215,66 @@ class ReportingService:
                 selectinload(Finding.affected_endpoint),
                 selectinload(Finding.proof_artifacts).selectinload(ProofArtifact.attack_probe),
                 selectinload(Finding.proof_artifacts).selectinload(ProofArtifact.control_probe),
+                selectinload(Finding.proof_artifacts)
+                .selectinload(ProofArtifact.attack_task)
+                .selectinload(AttackTask.parent_task)
+                .selectinload(AttackTask.parent_task),
             )
         )
         findings = findings_result.scalars().all()
 
         actions_performed = await self._actions_performed(scan_id)
         skipped_blocked = await self._skipped_blocked(scan_id)
+        auth_manager = self._auth_manager or await self._build_report_auth_manager(scan_id=scan_id, scan=scan)
+        auth_reliability = await self._auth_reliability(scan_id=scan_id, scan=scan, auth_manager=auth_manager)
+        identity_health_matrix = getattr(auth_manager, "identity_health_matrix", None)
+        auth_setup = self.auth_setup_report_section(
+            identity_health_matrix,
+            self._preflight_result_for_report(scan=scan, auth_manager=auth_manager),
+        )
+        discovery_coverage_metrics = await self._discovery_coverage_metrics(scan_id=scan_id, scan=scan)
+        scan_blind_spots = self._scan_blind_spots(
+            auth_reliability=auth_reliability,
+            discovery_coverage_metrics=discovery_coverage_metrics,
+            skipped_blocked=skipped_blocked,
+            scan=scan,
+        )
         report_findings: list[dict[str, Any]] = []
         for finding in findings:
             metadata = copy.deepcopy(finding.extra_metadata) if isinstance(finding.extra_metadata, dict) else {}
+            metadata_owner = metadata.get("owner") if isinstance(metadata.get("owner"), dict) else {}
+            finding_owner = getattr(finding, "owner", None)
+            owner_data: dict[str, Any] = metadata_owner
+            if not owner_data and isinstance(finding_owner, dict):
+                owner_data = finding_owner
+            owner_team = owner_data.get("team", getattr(finding_owner, "team", None))
+            owner_service = owner_data.get("service", getattr(finding_owner, "service", None))
+            owner_confidence = owner_data.get("confidence", getattr(finding_owner, "confidence", None))
+            owner_repo_hint = owner_data.get("repo_hint", getattr(finding_owner, "repo_hint", None))
+
+            if not owner_team:
+                endpoint_url = getattr(getattr(finding, "affected_endpoint", None), "url_pattern", None)
+                if not endpoint_url and hasattr(finding, "get"):
+                    endpoint_url = finding.get("endpoint_url")
+                if not endpoint_url:
+                    endpoint_meta = metadata.get("endpoint") if isinstance(metadata.get("endpoint"), dict) else {}
+                    endpoint_url = (
+                        metadata.get("endpoint_url")
+                        or metadata.get("affected_endpoint")
+                        or endpoint_meta.get("url_pattern")
+                        or endpoint_meta.get("url")
+                    )
+                if endpoint_url:
+                    try:
+                        resolver = OwnershipResolver()
+                        resolved_owner = await resolver.resolve(str(endpoint_url))
+                    except Exception:
+                        resolved_owner = None
+                    if resolved_owner is not None:
+                        owner_team = owner_team or resolved_owner.team
+                        owner_service = owner_service or resolved_owner.service
+                        owner_confidence = owner_confidence or resolved_owner.confidence
+                        owner_repo_hint = owner_repo_hint or resolved_owner.repo_hint
             severity = self._severity_value(finding.severity)
             artifacts: list[dict[str, Any]] = []
             for artifact in finding.proof_artifacts:
@@ -127,6 +286,9 @@ class ReportingService:
                 endpoint_url=finding.affected_endpoint.url_pattern,
                 artifacts=artifacts,
             )
+            tasks_by_id = self._tasks_by_id_for_finding(finding)
+            attack_chain_timeline = build_attack_chain_timeline(finding, tasks_by_id)
+            replay_exports = self._build_replay_exports(finding=finding, artifacts=artifacts, metadata=metadata)
 
             report_finding = {
                 "id": str(finding.id),
@@ -134,6 +296,8 @@ class ReportingService:
                 "severity": severity,
                 "severity_factors": self._severity_factors_from_metadata(metadata),
                 "remediation_priority": self._remediation_priority(severity, metadata),
+                "provider_attribution": {"engine": self._get_provider_id(finding)},
+                "validator_confirmation": {"strategy": self._get_validator_strategy(finding)},
                 "attack_class": finding.attack_class,
                 "description": finding.description,
                 "business_impact": BUSINESS_IMPACT_DESCRIPTIONS.get(
@@ -162,9 +326,22 @@ class ReportingService:
                     self._extract_secret_blast_radius_matrix_from_metadata(metadata)
                 ),
                 "audit_event_ids": await self._audit_event_ids_for_finding(scan_id=scan_id, finding_id=finding.id),
+                "audit_trail": await self._audit_event_ids_for_finding(
+                    scan_id=scan_id,
+                    finding_id=finding.id,
+                    task_ids={artifact.attack_task_id for artifact in finding.proof_artifacts},
+                ),
                 "score_explanation": self._score_explanation_for_artifacts(artifacts),
                 "metadata": metadata,
+                "replay_exports": replay_exports,
             }
+            if owner_data or finding_owner is not None or owner_team or owner_service or owner_confidence or owner_repo_hint:
+                report_finding["owner_team"] = owner_team
+                report_finding["owner_service"] = owner_service
+                report_finding["owner_confidence"] = owner_confidence
+                report_finding["owner_repo_hint"] = owner_repo_hint
+            if len(attack_chain_timeline) > 1:
+                report_finding["attack_chain_timeline"] = attack_chain_timeline
             identity_context = self._identity_context_from_artifacts(artifacts)
             if identity_context:
                 report_finding["identity_context"] = identity_context
@@ -176,11 +353,79 @@ class ReportingService:
             "scan_config": scan.target.config if scan.target is not None else {},
             "actions_performed": actions_performed,
             "skipped_blocked": skipped_blocked,
+            "auth_reliability": auth_reliability,
+            "auth_setup": auth_setup,
+            "discovery_coverage_metrics": discovery_coverage_metrics,
+            "scan_blind_spots": scan_blind_spots,
             "findings": report_findings,
         }
 
+    def _build_replay_exports(
+        self, finding: Finding, artifacts: list[dict[str, Any]], metadata: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        bundle = self._extract_replay_bundle(finding=finding, artifacts=artifacts, metadata=metadata)
+        if not bundle:
+            return None
+
+        return {
+            "curl": ReplayExporter.to_curl(bundle),
+            "httpie": ReplayExporter.to_httpie(bundle),
+            "postman": ReplayExporter.to_postman(bundle),
+            "har": ReplayExporter.to_har_subset(bundle),
+        }
+
+    def _extract_replay_bundle(
+        self, finding: Finding, artifacts: list[dict[str, Any]], metadata: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        finding_bundle = getattr(finding, "bundle", None)
+        finding_attack_request = getattr(finding, "attack_request", None)
+        candidate_bundle: dict[str, Any] = {}
+
+        if isinstance(finding_attack_request, dict) and finding_attack_request:
+            candidate_bundle["attack_request"] = finding_attack_request
+        elif isinstance(finding_bundle, dict) and finding_bundle:
+            candidate_bundle = dict(finding_bundle)
+        elif isinstance(metadata.get("attack_request"), dict) and metadata.get("attack_request"):
+            candidate_bundle["attack_request"] = dict(metadata["attack_request"])
+        elif isinstance(metadata.get("bundle"), dict) and metadata.get("bundle"):
+            candidate_bundle = dict(metadata["bundle"])
+
+        if not candidate_bundle:
+            for artifact in artifacts:
+                request_payload = artifact.get("request")
+                if isinstance(request_payload, dict) and request_payload:
+                    candidate_bundle = {"attack_request": request_payload}
+                    break
+
+        attack_request = candidate_bundle.get("attack_request")
+        if not isinstance(attack_request, dict) or not attack_request:
+            return None
+        return candidate_bundle
+
+    def _tasks_by_id_for_finding(self, finding: Finding) -> dict[object, AttackTask]:
+        tasks_by_id: dict[object, AttackTask] = {}
+        proof_artifacts = getattr(finding, "proof_artifacts", [])
+        if not isinstance(proof_artifacts, list):
+            return tasks_by_id
+
+        for artifact in proof_artifacts:
+            task = getattr(artifact, "attack_task", None)
+            while isinstance(task, AttackTask):
+                task_id = getattr(task, "id", None)
+                if task_id is None or task_id in tasks_by_id:
+                    break
+                tasks_by_id[task_id] = task
+                tasks_by_id[str(task_id)] = task
+                try:
+                    task = getattr(task, "parent_task", None)
+                except Exception:
+                    break
+        return tasks_by_id
+
     async def _actions_performed(self, scan_id: UUID) -> dict[str, Any]:
         empty = {
+            "total_requests": 0,
+            "by_class": {},
             "total_requests_sent": 0,
             "requests_by_attack_class": {},
             "tasks_dispatched": 0,
@@ -188,7 +433,9 @@ class ReportingService:
         }
         try:
             total_requests_result = await self._db.execute(
-                select(func.count(RawProbe.id)).join(AttackTask).where(AttackTask.scan_id == scan_id)
+                select(func.count(RawProbe.id))
+                .join(AttackTask, RawProbe.attack_task_id == AttackTask.id)
+                .where(AttackTask.scan_id == scan_id, AttackTask.status == AttackTaskStatus.done)
             )
             tasks_dispatched_result = await self._db.execute(
                 select(func.count(AttackTask.id)).where(AttackTask.scan_id == scan_id)
@@ -196,7 +443,7 @@ class ReportingService:
             by_class_result = await self._db.execute(
                 select(AttackTask.attack_class, func.count(RawProbe.id))
                 .join(RawProbe, RawProbe.attack_task_id == AttackTask.id)
-                .where(AttackTask.scan_id == scan_id)
+                .where(AttackTask.scan_id == scan_id, AttackTask.status == AttackTaskStatus.done)
                 .group_by(AttackTask.attack_class)
             )
             tasks_with_findings_result = await self._db.execute(
@@ -207,58 +454,803 @@ class ReportingService:
         except Exception:
             return empty
 
+        by_class: dict[str, int] = {}
+        for attack_class, count in by_class_result.all():
+            key = str(attack_class).strip() if attack_class is not None else ""
+            by_class[key or "unknown"] = by_class.get(key or "unknown", 0) + int(count or 0)
+
+        total_requests = int(total_requests_result.scalar_one() or 0)
         return {
-            "total_requests_sent": int(total_requests_result.scalar_one() or 0),
-            "requests_by_attack_class": {
-                str(attack_class): int(count or 0) for attack_class, count in by_class_result.all()
-            },
+            "total_requests": total_requests,
+            "by_class": by_class,
+            "total_requests_sent": total_requests,
+            "requests_by_attack_class": by_class,
             "tasks_dispatched": int(tasks_dispatched_result.scalar_one() or 0),
             "tasks_with_findings": int(tasks_with_findings_result.scalar_one() or 0),
         }
 
     async def _skipped_blocked(self, scan_id: UUID) -> dict[str, Any]:
         skipped_details: list[dict[str, str]] = []
+        skipped_by_task: dict[str, dict[str, str]] = {}
+
+        try:
+            task_rows_result = await self._db.execute(
+                select(AttackTask.id, AttackTask.attack_class, Endpoint.url_pattern)
+                .join(Endpoint, Endpoint.id == AttackTask.endpoint_id)
+                .where(AttackTask.scan_id == scan_id)
+            )
+        except Exception:
+            task_rows_result = None
+        task_context_by_id: dict[str, dict[str, str]] = {}
+        if task_rows_result is not None:
+            for task_id, attack_class, endpoint in task_rows_result.all():
+                task_context_by_id[str(task_id)] = {
+                    "attack_class": str(attack_class or "unknown"),
+                    "endpoint": str(endpoint or ""),
+                }
+
+        try:
+            skipped_events_result = await self._db.execute(
+                select(AuditEvent.id, AuditEvent.details)
+                .where(AuditEvent.scan_id == scan_id, AuditEvent.event_type == AuditEventType.TASK_SKIPPED)
+                .order_by(AuditEvent.created_at.asc())
+            )
+            for _, details in skipped_events_result.all():
+                if not isinstance(details, dict):
+                    continue
+                task_id_raw = details.get("task_id")
+                if task_id_raw is None:
+                    continue
+                task_id = str(task_id_raw)
+                if not task_id:
+                    continue
+                policy_reason = details.get("policy_skip_reason") or details.get("reason") or ""
+                reason_str = str(policy_reason or "")
+                if reason_str and not reason_str.startswith("policy:"):
+                    reason_str = f"policy:{reason_str}"
+                task_context = task_context_by_id.get(task_id, {})
+                skipped_by_task[task_id] = {
+                    "task_id": task_id,
+                    "attack_class": str(task_context.get("attack_class") or details.get("attack_class") or "unknown"),
+                    "reason": reason_str,
+                    "endpoint": str(task_context.get("endpoint") or details.get("endpoint") or ""),
+                }
+        except Exception:
+            pass
+
+        redis_url = os.getenv("REDIS_URL")
+        if redis_url:
+            try:
+                from redis.asyncio import Redis as AsyncRedis
+
+                redis_client = AsyncRedis.from_url(redis_url, decode_responses=True)
+                try:
+                    raw_records = await redis_client.lrange(f"skipped_tasks:{scan_id}", 0, -1)
+                finally:
+                    await redis_client.aclose()
+            except Exception:
+                raw_records = []
+
+            for raw_record in raw_records:
+                try:
+                    parsed = json.loads(raw_record)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                task_id = str(parsed.get("task_id") or "")
+                if not task_id:
+                    continue
+                task_context = task_context_by_id.get(task_id, {})
+                raw_reason = str(parsed.get("policy_skip_reason") or parsed.get("reason") or "")
+                reason = raw_reason if raw_reason.startswith("policy:") else (f"policy:{raw_reason}" if raw_reason else "")
+                skipped_by_task[task_id] = {
+                    "task_id": task_id,
+                    "attack_class": str(parsed.get("attack_class") or task_context.get("attack_class") or "unknown"),
+                    "reason": reason,
+                    "endpoint": str(parsed.get("endpoint") or task_context.get("endpoint") or ""),
+                }
+
+        skipped_details = list(skipped_by_task.values())
+        return {"tasks_skipped": len(skipped_details), "skipped_details": skipped_details}
+
+    async def _auth_reliability(self, *, scan_id: UUID, scan: Scan, auth_manager: Any | None = None) -> dict[str, Any]:
+        auth_manager = auth_manager or self._auth_manager or await self._build_report_auth_manager(scan_id=scan_id, scan=scan)
+        metrics = self._empty_auth_coverage_metrics()
+        failures: list[Any] = []
+
+        get_metrics = getattr(auth_manager, "get_auth_coverage_metrics", None)
+        if callable(get_metrics):
+            try:
+                raw_metrics = get_metrics()
+                if isinstance(raw_metrics, dict):
+                    metrics = self._normalize_auth_coverage_metrics(raw_metrics)
+            except Exception:
+                metrics = self._empty_auth_coverage_metrics()
+
+        get_failures = getattr(auth_manager, "get_identity_failures", None)
+        if callable(get_failures):
+            try:
+                raw_failures = get_failures()
+                failures = await raw_failures if hasattr(raw_failures, "__await__") else raw_failures
+            except Exception:
+                failures = []
+
+        identity_matrix = {}
+        raw_identity_matrix = getattr(auth_manager, "identity_health_matrix", None)
+        if raw_identity_matrix is not None:
+            try:
+                identity_matrix = self.auth_identity_matrix_section(raw_identity_matrix)
+            except Exception:
+                identity_matrix = {}
+
+        return {
+            **metrics,
+            "identity_failures": self._identity_failure_rows(failures),
+            "identity_matrix": identity_matrix,
+        }
+
+    def auth_identity_matrix_section(self, matrix: IdentityHealthMatrix) -> dict[str, Any]:
+        summary = matrix.summary
+        per_role = summary.get("per_role")
+        per_tenant = summary.get("per_tenant")
+        role_markers = summary.get("role_markers")
+        tenant_markers = summary.get("tenant_markers")
+        return {
+            "per_role": per_role if isinstance(per_role, dict) else {},
+            "per_tenant": per_tenant if isinstance(per_tenant, dict) else {},
+            "role_markers": role_markers if isinstance(role_markers, list) else [],
+            "tenant_markers": tenant_markers if isinstance(tenant_markers, list) else [],
+        }
+
+    def auth_setup_report_section(
+        self,
+        matrix: IdentityHealthMatrix | None,
+        preflight_result: PreflightResult | None,
+    ) -> dict[str, Any]:
+        identity_rows = self._auth_setup_identity_rows(matrix)
+        weighted_successes = 0.0
+        weighted_total = 0
+        per_identity_blind_spots: list[dict[str, Any]] = []
+        auth_warnings: list[str] = []
+
+        for row in identity_rows:
+            identity = row["identity"]
+            role = row["role"]
+            pass_rate = row["pass_rate"]
+            total_probes = row["total_probes"]
+            failed_probes = row["failed_probes"]
+            degraded_probes = row["degraded_probes"]
+            blind_spots: list[str] = []
+
+            if total_probes == 0:
+                blind_spots.append("unchecked identity")
+                auth_warnings.append(f"{role} identity had 0 probes ({identity})")
+            if failed_probes:
+                blind_spots.append(f"{failed_probes} failed probes")
+            if degraded_probes:
+                blind_spots.append(f"{degraded_probes} degraded probes")
+            if total_probes > 0 and pass_rate == 0.0:
+                auth_warnings.append(f"{role} identity had 0 successful probes ({identity})")
+            if pass_rate < 1.0 and total_probes > 0:
+                auth_warnings.append(f"{role} identity pass rate was {pass_rate:.0%} ({identity})")
+
+            if total_probes > 0:
+                weighted_successes += pass_rate * total_probes
+                weighted_total += total_probes
+
+            if pass_rate < 1.0 or degraded_probes > 0:
+                per_identity_blind_spots.append(
+                    {
+                        "identity": identity,
+                        "role": role,
+                        "pass_rate": pass_rate,
+                        "blind_spots": blind_spots,
+                    }
+                )
+
+        preflight_status = self._preflight_status(preflight_result)
+        preflight_failed = preflight_status == "failed"
+        if preflight_failed:
+            auth_warnings.append("auth preflight failed")
+
+        return {
+            "overall_reliability_score": (weighted_successes / weighted_total) if weighted_total else 0.0,
+            "per_identity_blind_spots": per_identity_blind_spots,
+            "auth_warnings": list(dict.fromkeys(auth_warnings)),
+            "preflight_status": preflight_status,
+            "is_clean_report_reliable": not (
+                preflight_failed or any(row["pass_rate"] < 0.8 for row in identity_rows)
+            ),
+        }
+
+    def _auth_setup_identity_rows(self, matrix: IdentityHealthMatrix | None) -> list[dict[str, Any]]:
+        if matrix is None:
+            return []
+        try:
+            matrix_section = self.auth_identity_matrix_section(matrix)
+        except Exception:
+            return []
+
+        rows: list[dict[str, Any]] = []
+        rows.extend(
+            self._auth_setup_rows_from_bucket(
+                bucket=matrix_section.get("per_role"),
+                markers=matrix_section.get("role_markers"),
+                role_fallback="role",
+            )
+        )
+        rows.extend(
+            self._auth_setup_rows_from_bucket(
+                bucket=matrix_section.get("per_tenant"),
+                markers=matrix_section.get("tenant_markers"),
+                role_fallback="tenant",
+            )
+        )
+        return rows
+
+    def _auth_setup_rows_from_bucket(
+        self,
+        *,
+        bucket: Any,
+        markers: Any,
+        role_fallback: str,
+    ) -> list[dict[str, Any]]:
+        stats_by_identity = bucket if isinstance(bucket, dict) else {}
+        marker_list = markers if isinstance(markers, list) else []
+        identities = list(dict.fromkeys([*(str(marker) for marker in marker_list), *(str(key) for key in stats_by_identity)]))
+        rows: list[dict[str, Any]] = []
+        for identity_raw in identities:
+            identity = self._safe_report_label(identity_raw or "unknown")
+            stats = stats_by_identity.get(identity_raw)
+            stats = stats if isinstance(stats, dict) else {}
+            total_probes = self._coerce_int(stats.get("total_probes"), default=0)
+            rows.append(
+                {
+                    "identity": identity,
+                    "role": identity if role_fallback == "role" else role_fallback,
+                    "pass_rate": max(0.0, min(1.0, self._coerce_float(stats.get("pass_rate"), default=0.0))),
+                    "total_probes": total_probes,
+                    "failed_probes": self._coerce_int(stats.get("failed_probes"), default=0),
+                    "degraded_probes": self._coerce_int(stats.get("degraded_probes"), default=0),
+                }
+            )
+        return rows
+
+    def _preflight_status(self, preflight_result: PreflightResult | None) -> str:
+        if preflight_result is None:
+            return "unknown"
+        if isinstance(preflight_result, dict):
+            return str(preflight_result.get("status") or "unknown").strip().lower() or "unknown"
+        return str(getattr(preflight_result, "status", "unknown") or "unknown").strip().lower() or "unknown"
+
+    def _preflight_result_for_report(self, *, scan: Scan, auth_manager: Any | None) -> Any | None:
+        preflight_result = getattr(auth_manager, "preflight_result", None)
+        if preflight_result is not None:
+            return preflight_result
+        auth_context = getattr(scan, "auth_context", None)
+        if not isinstance(auth_context, AuthContext):
+            auth_context = getattr(scan, "auth_context_ref", None)
+        health_payload = getattr(auth_context, "health", None)
+        if not isinstance(health_payload, dict):
+            return None
+        for key in ("preflight_result", "preflight", "auth_preflight"):
+            candidate = health_payload.get(key)
+            if isinstance(candidate, dict):
+                return candidate
+        return None
+
+    async def _build_report_auth_manager(self, *, scan_id: UUID, scan: Scan) -> Any | None:
+        try:
+            from control_plane.auth_manager import AuthManager, IdentityFailure, IdentityRole, SessionSnapshot
+        except Exception:
+            return None
+
+        async def _noop_pause_scan(_scan_id: UUID, _reason: str) -> None:
+            return None
+
+        def _unused_session_factory() -> None:
+            raise RuntimeError("Reporting auth metrics do not open a session")
+
+        manager = AuthManager(scan_id, _unused_session_factory, _noop_pause_scan)
+        auth_context = await self._auth_context_for_scan(scan_id=scan_id, scan=scan)
+        if auth_context is None:
+            return manager
+
+        snapshot_payload = auth_context.session_snapshot if isinstance(auth_context.session_snapshot, dict) else {}
+        health_payload = auth_context.health if isinstance(auth_context.health, dict) else {}
+        captured_at = self._parse_datetime(snapshot_payload.get("captured_at")) or datetime.now(UTC)
+        expires_at = self._parse_datetime(snapshot_payload.get("expires_at"))
+
+        cookies: list[dict[str, str]] = []
+        if self._snapshot_has_material(snapshot_payload.get("cookies")):
+            cookies = [{"name": "session", "value": "present"}]
+
+        auth_headers: dict[str, str] = {}
+        if self._snapshot_has_material(snapshot_payload.get("auth_headers")) or self._snapshot_has_material(
+            snapshot_payload.get("bearer_token")
+        ):
+            auth_headers["Authorization"] = "present"
+
+        session_snapshot = SessionSnapshot(
+            scan_id=scan_id,
+            cookies=cookies,
+            auth_headers=auth_headers,
+            csrf_tokens={},
+            captured_at=captured_at,
+            expires_at=expires_at,
+        )
+        manager._session_snapshot = session_snapshot
+        manager._identity_contexts = manager._build_identity_contexts(session_snapshot)
+        manager._health_check_results = self._health_check_results_from_payload(health_payload)
+        self._hydrate_named_identities(
+            manager=manager,
+            scan_id=scan_id,
+            raw_identities=snapshot_payload.get("identities"),
+            captured_at=captured_at,
+        )
+        self._hydrate_identity_failures_from_health(
+            manager=manager,
+            identity_failure_type=IdentityFailure,
+            health_payload=health_payload,
+        )
+        for failure in await self._redis_identity_failures(scan_id):
+            try:
+                manager._identity_failures.append(
+                    IdentityFailure(
+                        identity_id=failure["identity_id"],
+                        reason=failure["reason"],
+                        timestamp=self._parse_datetime(failure.get("timestamp")) or datetime.now(UTC),
+                    )
+                )
+            except Exception:
+                continue
+        return manager
+
+    async def _auth_context_for_scan(self, *, scan_id: UUID, scan: Scan) -> AuthContext | None:
+        auth_context = getattr(scan, "auth_context", None)
+        if isinstance(auth_context, AuthContext):
+            return auth_context
+        auth_context_ref = getattr(scan, "auth_context_ref", None)
+        if isinstance(auth_context_ref, AuthContext):
+            return auth_context_ref
+        try:
+            result = await self._db.execute(select(AuthContext).where(AuthContext.scan_id == scan_id))
+        except Exception:
+            return None
+        return result.scalar_one_or_none()
+
+    def _hydrate_named_identities(
+        self,
+        *,
+        manager: Any,
+        scan_id: UUID,
+        raw_identities: Any,
+        captured_at: datetime,
+    ) -> None:
+        if not isinstance(raw_identities, list):
+            return
+        try:
+            from control_plane.auth_manager import IdentityContext, IdentityRole
+        except Exception:
+            return
+
+        for raw_identity in raw_identities:
+            if not isinstance(raw_identity, dict):
+                continue
+            identity_id = self._safe_report_label(str(raw_identity.get("name") or "unknown"))
+            auth_state = str(raw_identity.get("auth_state") or "active").strip().lower()
+            if auth_state not in {"active", "expired", "none", "pending"}:
+                auth_state = "none"
+
+            auth_context = raw_identity.get("auth_context")
+            auth_context_dict = auth_context if isinstance(auth_context, dict) else {}
+            has_cookies = self._snapshot_has_material(auth_context_dict.get("cookies"))
+            has_token = self._snapshot_has_material(auth_context_dict.get("bearer_token"))
+            role_hint = str(raw_identity.get("role_hint") or IdentityRole.user.value)
+            try:
+                role = IdentityRole(role_hint)
+            except ValueError:
+                role = IdentityRole.user
+
+            context = IdentityContext(
+                scan_id=scan_id,
+                role=role,
+                cookies=[{"name": "session", "value": "present"}] if has_cookies else [],
+                auth_headers={"Authorization": "present"} if has_token else {},
+                csrf_tokens={},
+                captured_at=captured_at,
+                name=identity_id,
+                tenant_hint=(
+                    str(raw_identity.get("tenant_hint")) if raw_identity.get("tenant_hint") is not None else None
+                ),
+                auth_state="active" if auth_state == "active" else "expired",
+                active=auth_state == "active",
+            )
+            manager._named_identities[identity_id] = context
+            manager._identity_contexts[identity_id] = context
+            if auth_state in {"expired", "none"}:
+                reason = "expired" if auth_state == "expired" else "missing"
+                manager._record_identity_failure(identity_id=identity_id, reason=reason)
+            elif not has_cookies and not has_token:
+                manager._record_identity_failure(identity_id=identity_id, reason="missing")
+
+    def _hydrate_identity_failures_from_health(
+        self,
+        *,
+        manager: Any,
+        identity_failure_type: Any,
+        health_payload: dict[str, Any],
+    ) -> None:
+        raw_failures = health_payload.get("identity_failures")
+        if isinstance(raw_failures, list):
+            for raw_failure in raw_failures:
+                if not isinstance(raw_failure, dict):
+                    continue
+                reason = self._identity_failure_reason(raw_failure.get("reason"))
+                if reason is None:
+                    continue
+                identity_id = self._safe_report_label(str(raw_failure.get("identity_id") or "unknown"))
+                timestamp = self._parse_datetime(raw_failure.get("timestamp")) or datetime.now(UTC)
+                manager._identity_failures.append(
+                    identity_failure_type(identity_id=identity_id, reason=reason, timestamp=timestamp)
+                )
+
+        validation_payload = health_payload.get("session_validation")
+        if isinstance(validation_payload, dict) and validation_payload.get("valid") is False:
+            reason = self._identity_failure_reason(validation_payload.get("reason")) or "refresh_failed"
+            manager._identity_failures.append(
+                identity_failure_type(identity_id="session", reason=reason, timestamp=datetime.now(UTC))
+            )
+
+        status_value = str(health_payload.get("status") or "").lower()
+        if status_value == "unhealthy" and not raw_failures:
+            reason = self._identity_failure_reason(health_payload.get("error")) or "refresh_failed"
+            manager._identity_failures.append(
+                identity_failure_type(identity_id="session", reason=reason, timestamp=datetime.now(UTC))
+            )
+
+    async def _redis_identity_failures(self, scan_id: UUID) -> list[dict[str, str]]:
         redis_url = os.getenv("REDIS_URL")
         if not redis_url:
-            return {"tasks_skipped": 0, "skipped_details": skipped_details}
-
+            return []
         try:
             from redis.asyncio import Redis as AsyncRedis
 
             redis_client = AsyncRedis.from_url(redis_url, decode_responses=True)
             try:
-                raw_records = await redis_client.lrange(f"skipped_tasks:{scan_id}", 0, -1)
+                raw_events = await redis_client.xrange(f"scan_events:{scan_id}", "-", "+")
             finally:
                 await redis_client.aclose()
         except Exception:
-            return {"tasks_skipped": 0, "skipped_details": skipped_details}
+            return []
 
-        for raw_record in raw_records:
-            try:
-                parsed = json.loads(raw_record)
-            except (TypeError, ValueError, json.JSONDecodeError):
+        failures: list[dict[str, str]] = []
+        for event_id, payload in raw_events:
+            if not isinstance(payload, dict) or payload.get("event") != "identity_health_failed":
                 continue
-            if not isinstance(parsed, dict):
-                continue
-            skipped_details.append(
-                {
-                    "task_id": str(parsed.get("task_id", "")),
-                    "reason": str(parsed.get("reason", "")),
-                    "attack_class": str(parsed.get("attack_class", "")),
-                }
-            )
-        return {"tasks_skipped": len(skipped_details), "skipped_details": skipped_details}
+            identity_id = self._safe_report_label(str(payload.get("identity_name") or "unknown"))
+            timestamp = self._timestamp_from_redis_event_id(str(event_id)) or datetime.now(UTC).isoformat()
+            failures.append({"identity_id": identity_id, "reason": "expired", "timestamp": timestamp})
+        return failures
 
-    async def _audit_event_ids_for_finding(self, *, scan_id: UUID, finding_id: UUID) -> list[str]:
+    def _timestamp_from_redis_event_id(self, event_id: str) -> str | None:
+        millis_text, _, _sequence = event_id.partition("-")
+        try:
+            millis = int(millis_text)
+        except ValueError:
+            return None
+        return datetime.fromtimestamp(millis / 1000, tz=UTC).isoformat()
+
+    def _empty_auth_coverage_metrics(self) -> dict[str, Any]:
+        return {
+            "session_valid_count": 0,
+            "role_count": 0,
+            "tenant_count": 0,
+            "health_check_pass_rate": 0.0,
+        }
+
+    def _normalize_auth_coverage_metrics(self, raw_metrics: dict[str, Any]) -> dict[str, Any]:
+        metrics = self._empty_auth_coverage_metrics()
+        for key in ("session_valid_count", "role_count", "tenant_count"):
+            metrics[key] = self._coerce_int(raw_metrics.get(key), default=0)
+        metrics["health_check_pass_rate"] = self._coerce_float(
+            raw_metrics.get("health_check_pass_rate"),
+            default=0.0,
+        )
+        return metrics
+
+    def _identity_failure_rows(self, failures: Any) -> list[dict[str, str]]:
+        if not isinstance(failures, list):
+            return []
+        rows: list[dict[str, str]] = []
+        for failure in failures:
+            identity_id = self._safe_report_label(str(getattr(failure, "identity_id", "unknown") or "unknown"))
+            reason = self._identity_failure_reason(getattr(failure, "reason", None))
+            timestamp_raw = getattr(failure, "timestamp", None)
+            timestamp = timestamp_raw.isoformat() if isinstance(timestamp_raw, datetime) else str(timestamp_raw or "")
+            if reason is None:
+                continue
+            rows.append({"identity_id": identity_id, "reason": reason, "timestamp": timestamp})
+        return rows
+
+    def _identity_failure_reason(self, value: Any) -> str | None:
+        text = str(value or "").strip().lower()
+        for reason in _IDENTITY_FAILURE_REASONS:
+            if reason in text:
+                return reason
+        return None
+
+    def _health_check_results_from_payload(self, health_payload: dict[str, Any]) -> list[bool]:
+        raw_results = health_payload.get("health_check_results")
+        if isinstance(raw_results, list):
+            return [bool(result) for result in raw_results if isinstance(result, (bool, int, float))]
+
+        session_validation = health_payload.get("session_validation")
+        if isinstance(session_validation, dict) and isinstance(session_validation.get("valid"), bool):
+            return [bool(session_validation["valid"])]
+
+        status_value = str(health_payload.get("status") or "").strip().lower()
+        if status_value == "healthy":
+            return [True]
+        if status_value == "unhealthy":
+            return [False]
+        return []
+
+    def _snapshot_has_material(self, value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, list):
+            return bool(value)
+        if isinstance(value, dict):
+            if value.get("_encrypted") == "kms_envelope_v1":
+                return bool(value.get("ciphertext"))
+            return any(self._snapshot_has_material(item) for item in value.values())
+        return bool(value)
+
+    async def _discovery_coverage_metrics(self, *, scan_id: UUID, scan: Scan) -> dict[str, Any]:
+        discovered_rows = await self._discovered_surface_rows(scan_id=scan_id, scan=scan)
+        discovered_surface = sorted({row["endpoint"] for row in discovered_rows if row.get("endpoint")})
+        source_attribution = {source: 0 for source in _DISCOVERY_SOURCES}
+        for row in discovered_rows:
+            source = self._normalize_discovery_source(row.get("source"))
+            source_attribution[source] = source_attribution.get(source, 0) + 1
+
+        expected_surface = self._expected_surface(scan=scan)
+        if not discovered_surface:
+            discovered_surface = self._configured_surface(scan=scan, keys=_DISCOVERED_SURFACE_KEYS)
+
+        expected_set = set(expected_surface)
+        discovered_set = set(discovered_surface)
+        blind_spots = sorted(expected_set - discovered_set)
+        if expected_set:
+            coverage_pct = round((len(expected_set & discovered_set) / len(expected_set)) * 100.0, 1)
+        else:
+            coverage_pct = 0.0
+
+        configured_source_counts = self._configured_source_attribution(scan=scan)
+        if configured_source_counts:
+            source_attribution.update(configured_source_counts)
+
+        return {
+            "label": "Discovery Coverage Metrics",
+            "expected_surface_count": len(expected_surface),
+            "discovered_surface_count": len(discovered_surface),
+            "coverage_pct": coverage_pct,
+            "blind_spot_endpoints": blind_spots,
+            "source_attribution": source_attribution,
+        }
+
+    async def _discovered_surface_rows(self, *, scan_id: UUID, scan: Scan) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        asset_map = getattr(scan, "asset_map", None)
+        endpoints = getattr(asset_map, "endpoints", None)
+        if isinstance(endpoints, list):
+            for endpoint in endpoints:
+                endpoint_label = self._normalize_endpoint_label(getattr(endpoint, "url_pattern", ""))
+                if not endpoint_label:
+                    continue
+                rows.append(
+                    {
+                        "endpoint": endpoint_label,
+                        "source": self._normalize_discovery_source(getattr(endpoint, "source", None)),
+                    }
+                )
+            return rows
+
         try:
             result = await self._db.execute(
-                select(AuditEvent.id).where(
-                    AuditEvent.scan_id == scan_id,
-                    AuditEvent.event_type.in_(
-                        [AuditEventType.TASK_DISPATCHED, AuditEventType.FINDING_RECORDED]
-                    ),
-                    AuditEvent.details["finding_id"].as_string() == str(finding_id),
-                )
+                select(Endpoint.url_pattern, Endpoint.source)
+                .select_from(AssetMap)
+                .join(Endpoint, Endpoint.asset_map_id == AssetMap.id)
+                .where(AssetMap.scan_id == scan_id)
+            )
+        except Exception:
+            return rows
+
+        for url_pattern, source in result.all():
+            endpoint_label = self._normalize_endpoint_label(url_pattern)
+            if not endpoint_label:
+                continue
+            rows.append({"endpoint": endpoint_label, "source": self._normalize_discovery_source(source)})
+        return rows
+
+    def _expected_surface(self, *, scan: Scan) -> list[str]:
+        return self._configured_surface(scan=scan, keys=_EXPECTED_SURFACE_KEYS)
+
+    def _configured_surface(self, *, scan: Scan, keys: tuple[str, ...]) -> list[str]:
+        endpoints: list[str] = []
+        for container in self._scan_config_containers(scan):
+            for key in keys:
+                raw_value = container.get(key)
+                endpoints.extend(self._normalize_endpoint_list(raw_value))
+        return sorted(dict.fromkeys(endpoints))
+
+    def _configured_source_attribution(self, *, scan: Scan) -> dict[str, int]:
+        for container in self._scan_config_containers(scan):
+            raw_value = container.get("source_attribution") or container.get("source_attribution_summary")
+            if not isinstance(raw_value, dict):
+                continue
+            counts: dict[str, int] = {}
+            for key, value in raw_value.items():
+                source = self._normalize_discovery_source(key)
+                counts[source] = self._coerce_int(value, default=0)
+            return counts
+        return {}
+
+    def _scan_config_containers(self, scan: Scan) -> list[dict[str, Any]]:
+        containers: list[dict[str, Any]] = []
+        target = getattr(scan, "target", None)
+        target_config = getattr(target, "config", None)
+        if isinstance(target_config, dict):
+            containers.append(target_config)
+            for key in ("benchmark", "ground_truth", "discovery", "crawler"):
+                nested = target_config.get(key)
+                if isinstance(nested, dict):
+                    containers.append(nested)
+        scan_policy = getattr(scan, "policy", None)
+        if isinstance(scan_policy, dict):
+            containers.append(scan_policy)
+        return containers
+
+    def _normalize_endpoint_list(self, raw_value: Any) -> list[str]:
+        if isinstance(raw_value, str):
+            return [endpoint for endpoint in [self._normalize_endpoint_label(raw_value)] if endpoint]
+        if not isinstance(raw_value, list):
+            return []
+        endpoints: list[str] = []
+        for item in raw_value:
+            endpoint = self._normalize_endpoint_label(item)
+            if endpoint:
+                endpoints.append(endpoint)
+        return endpoints
+
+    def _normalize_endpoint_label(self, value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if not text:
+            return ""
+        method_match = re.match(r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(.+)$", text, flags=re.IGNORECASE)
+        if method_match is not None:
+            text = method_match.group(2).strip()
+        parsed = urlparse(text)
+        if parsed.scheme and parsed.netloc:
+            text = parsed.path or "/"
+        if len(text) > 1:
+            text = text.rstrip("/")
+        try:
+            from execution_plane.crawler.asset_map import normalize_url_pattern
+
+            text = normalize_url_pattern(text)
+        except Exception:
+            pass
+        redacted = self._redact_value(text)
+        return str(redacted) if isinstance(redacted, str) else REDACTED
+
+    def _normalize_discovery_source(self, value: Any) -> str:
+        source = str(value or "crawler").strip().lower()
+        aliases = {"javascript": "js", "sourcemap": "js", "open_api": "openapi", "open-api": "openapi"}
+        source = aliases.get(source, source)
+        return source if source in _DISCOVERY_SOURCES else "manual"
+
+    def _scan_blind_spots(
+        self,
+        *,
+        auth_reliability: dict[str, Any],
+        discovery_coverage_metrics: dict[str, Any],
+        skipped_blocked: dict[str, Any],
+        scan: Scan,
+    ) -> dict[str, Any]:
+        identity_failures = auth_reliability.get("identity_failures")
+        auth_failures = identity_failures if isinstance(identity_failures, list) else []
+        discovery_gaps = discovery_coverage_metrics.get("blind_spot_endpoints")
+        policy_skipped = self._policy_skipped_attack_classes(skipped_blocked)
+        manual_excluded_paths = self._manual_excluded_paths(scan)
+        return {
+            "label": "Scan Blind Spots",
+            "auth_failures": auth_failures,
+            "discovery_gaps": discovery_gaps if isinstance(discovery_gaps, list) else [],
+            "policy_skipped_attack_classes": policy_skipped,
+            "manually_excluded_paths": manual_excluded_paths,
+            "summary": {
+                "auth_failure_count": len(auth_failures),
+                "discovery_gap_count": len(discovery_gaps) if isinstance(discovery_gaps, list) else 0,
+                "policy_skipped_attack_class_count": len(policy_skipped),
+                "manually_excluded_path_count": len(manual_excluded_paths),
+            },
+        }
+
+    def _policy_skipped_attack_classes(self, skipped_blocked: dict[str, Any]) -> list[dict[str, Any]]:
+        skipped_details = skipped_blocked.get("skipped_details")
+        if not isinstance(skipped_details, list):
+            return []
+        aggregated: dict[tuple[str, str], int] = {}
+        for detail in skipped_details:
+            if not isinstance(detail, dict):
+                continue
+            reason = str(detail.get("reason") or "")
+            if not reason.startswith("policy:"):
+                continue
+            attack_class = self._safe_report_label(str(detail.get("attack_class") or "unknown"))
+            key = (attack_class, self._safe_report_label(reason))
+            aggregated[key] = aggregated.get(key, 0) + 1
+        return [
+            {"attack_class": attack_class, "reason": reason, "count": count}
+            for (attack_class, reason), count in sorted(aggregated.items())
+        ]
+
+    def _manual_excluded_paths(self, scan: Scan) -> list[str]:
+        paths: list[str] = []
+        for container in self._scan_config_containers(scan):
+            for key in _MANUAL_EXCLUDED_PATH_KEYS:
+                paths.extend(self._normalize_endpoint_list(container.get(key)))
+        return sorted(dict.fromkeys(paths))
+
+    def _safe_report_label(self, value: str) -> str:
+        redacted = self._redact_value(value.strip())
+        if not isinstance(redacted, str):
+            return REDACTED
+        return self._truncate_markdown_cell(redacted.replace("|", "/"), limit=160)
+
+    def _parse_datetime(self, value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+    def _coerce_int(self, value: Any, *, default: int) -> int:
+        if isinstance(value, bool):
+            return int(value)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _coerce_float(self, value: Any, *, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    async def _audit_event_ids_for_finding(
+        self, *, scan_id: UUID, finding_id: UUID, task_ids: set[UUID] | None = None
+    ) -> list[str]:
+        try:
+            predicates = [AuditEvent.details["finding_id"].as_string() == str(finding_id)]
+            if task_ids:
+                task_id_values = [str(task_id) for task_id in task_ids]
+                if task_id_values:
+                    predicates.append(AuditEvent.details["task_id"].as_string().in_(task_id_values))
+            result = await self._db.execute(
+                select(AuditEvent.id).where(AuditEvent.scan_id == scan_id, or_(*predicates))
             )
         except Exception:
             return []
@@ -402,6 +1394,7 @@ class ReportingService:
         }
 
     def render_markdown(self, report: dict[str, Any]) -> str:
+        report = self._redact_report(report)
         lines: list[str] = [f"# Scan Report: {report['scan_id']}", ""]
         scan_config_raw = report.get("scan_config")
         scan_config = scan_config_raw if isinstance(scan_config_raw, dict) else {}
@@ -423,6 +1416,9 @@ class ReportingService:
                     skipped_rules = planner_skipped_rules
             if skipped_rules:
                 lines.extend([self.generate_untested_classes_section(scan_config=scan_config, skipped_rules=skipped_rules), ""])
+        operator_sections = self._render_operator_sections(report)
+        if operator_sections:
+            lines.extend([operator_sections, ""])
         findings = report.get("findings", [])
 
         for index, finding in enumerate(findings, start=1):
@@ -496,6 +1492,9 @@ class ReportingService:
             race_timeline_section = self._build_race_timeline(finding)
             if race_timeline_section:
                 lines.extend(["", race_timeline_section])
+            attack_chain_timeline_section = self._build_attack_chain_timeline_section(finding)
+            if attack_chain_timeline_section:
+                lines.extend(["", attack_chain_timeline_section])
             if leak_source_section:
                 lines.extend(["", leak_source_section])
             lines.extend(["", "### Attack Path"])
@@ -655,6 +1654,176 @@ class ReportingService:
 
         return "\n".join(lines)
 
+    def _render_operator_sections(self, report: dict[str, Any]) -> str:
+        sections: list[str] = []
+        auth_reliability = report.get("auth_reliability")
+        if isinstance(auth_reliability, dict):
+            sections.append(self._render_auth_reliability_section(auth_reliability))
+
+        auth_setup = report.get("auth_setup")
+        if isinstance(auth_setup, dict):
+            sections.append(self._render_auth_setup_section(auth_setup))
+
+        discovery_coverage = report.get("discovery_coverage_metrics")
+        if isinstance(discovery_coverage, dict):
+            sections.append(self._render_discovery_coverage_section(discovery_coverage))
+
+        scan_blind_spots = report.get("scan_blind_spots")
+        if isinstance(scan_blind_spots, dict):
+            sections.append(self._render_scan_blind_spots_section(scan_blind_spots))
+
+        return "\n\n".join(section for section in sections if section)
+
+    def _render_auth_reliability_section(self, auth_reliability: dict[str, Any]) -> str:
+        failures = auth_reliability.get("identity_failures")
+        failure_rows = failures if isinstance(failures, list) else []
+        lines: list[str] = [
+            "## Auth Reliability",
+            f"- Session Valid Count: {self._coerce_int(auth_reliability.get('session_valid_count'), default=0)}",
+            f"- Role Count: {self._coerce_int(auth_reliability.get('role_count'), default=0)}",
+            f"- Tenant Count: {self._coerce_int(auth_reliability.get('tenant_count'), default=0)}",
+            (
+                "- Health Check Pass Rate: "
+                f"{self._coerce_float(auth_reliability.get('health_check_pass_rate'), default=0.0):.0%}"
+            ),
+            "",
+            "### Identity Failures",
+        ]
+        if not failure_rows:
+            lines.append("- None recorded")
+            return "\n".join(lines)
+
+        lines.extend(["| Identity ID | Reason | Timestamp |", "|---|---|---|"])
+        for failure in failure_rows:
+            if not isinstance(failure, dict):
+                continue
+            identity_id = self._safe_report_label(str(failure.get("identity_id") or "unknown"))
+            reason = self._safe_report_label(str(failure.get("reason") or "unknown"))
+            timestamp = self._safe_report_label(str(failure.get("timestamp") or ""))
+            lines.append(f"| {identity_id} | {reason} | {timestamp} |")
+        return "\n".join(lines)
+
+    def _render_auth_setup_section(self, auth_setup: dict[str, Any]) -> str:
+        blind_spots = auth_setup.get("per_identity_blind_spots")
+        blind_spot_rows = blind_spots if isinstance(blind_spots, list) else []
+        warnings = auth_setup.get("auth_warnings")
+        warning_rows = warnings if isinstance(warnings, list) else []
+        lines: list[str] = [
+            "## Auth Setup",
+            (
+                "- Overall Reliability Score: "
+                f"{self._coerce_float(auth_setup.get('overall_reliability_score'), default=0.0):.0%}"
+            ),
+            f"- Preflight Status: {self._safe_report_label(str(auth_setup.get('preflight_status') or 'unknown'))}",
+            f"- Clean Report Reliable: {'yes' if bool(auth_setup.get('is_clean_report_reliable')) else 'no'}",
+            "",
+            "### Auth Warnings",
+        ]
+        if warning_rows:
+            lines.extend(f"- {self._safe_report_label(str(warning))}" for warning in warning_rows)
+        else:
+            lines.append("- None")
+
+        lines.extend(["", "### Per-Identity Blind Spots"])
+        if not blind_spot_rows:
+            lines.append("- None")
+            return "\n".join(lines)
+
+        lines.extend(["| Identity | Role | Pass Rate | Blind Spots |", "|---|---|---:|---|"])
+        for row in blind_spot_rows:
+            if not isinstance(row, dict):
+                continue
+            identity = self._safe_report_label(str(row.get("identity") or "unknown"))
+            role = self._safe_report_label(str(row.get("role") or "unknown"))
+            pass_rate = self._coerce_float(row.get("pass_rate"), default=0.0)
+            raw_spots = row.get("blind_spots")
+            spots = raw_spots if isinstance(raw_spots, list) else []
+            spot_text = ", ".join(self._safe_report_label(str(spot)) for spot in spots) or "-"
+            lines.append(f"| {identity} | {role} | {pass_rate:.0%} | {spot_text} |")
+        return "\n".join(lines)
+
+    def _render_discovery_coverage_section(self, discovery_coverage: dict[str, Any]) -> str:
+        blind_spots = discovery_coverage.get("blind_spot_endpoints")
+        blind_spot_rows = blind_spots if isinstance(blind_spots, list) else []
+        source_attribution = discovery_coverage.get("source_attribution")
+        source_counts = source_attribution if isinstance(source_attribution, dict) else {}
+        lines: list[str] = [
+            "## Discovery Coverage Metrics",
+            (
+                "- Expected Surface Count: "
+                f"{self._coerce_int(discovery_coverage.get('expected_surface_count'), default=0)}"
+            ),
+            (
+                "- Discovered Surface Count: "
+                f"{self._coerce_int(discovery_coverage.get('discovered_surface_count'), default=0)}"
+            ),
+            f"- Coverage: {self._coerce_float(discovery_coverage.get('coverage_pct'), default=0.0):.1f}%",
+            "",
+            "### Blind Spot Endpoints",
+        ]
+        if blind_spot_rows:
+            lines.extend(f"- {self._safe_report_label(str(endpoint))}" for endpoint in blind_spot_rows)
+        else:
+            lines.append("- None")
+
+        lines.extend(["", "### Source Attribution", "| Source | Endpoint Count |", "|---|---:|"])
+        for source in _DISCOVERY_SOURCES:
+            lines.append(f"| {source} | {self._coerce_int(source_counts.get(source), default=0)} |")
+        extra_sources = sorted(set(str(source) for source in source_counts) - set(_DISCOVERY_SOURCES))
+        for source in extra_sources:
+            count = self._coerce_int(source_counts.get(source), default=0)
+            lines.append(f"| {self._safe_report_label(source)} | {count} |")
+        return "\n".join(lines)
+
+    def _render_scan_blind_spots_section(self, scan_blind_spots: dict[str, Any]) -> str:
+        auth_failures = scan_blind_spots.get("auth_failures")
+        discovery_gaps = scan_blind_spots.get("discovery_gaps")
+        policy_skipped = scan_blind_spots.get("policy_skipped_attack_classes")
+        manual_paths = scan_blind_spots.get("manually_excluded_paths")
+        auth_failure_rows = auth_failures if isinstance(auth_failures, list) else []
+        discovery_gap_rows = discovery_gaps if isinstance(discovery_gaps, list) else []
+        policy_rows = policy_skipped if isinstance(policy_skipped, list) else []
+        manual_path_rows = manual_paths if isinstance(manual_paths, list) else []
+
+        lines: list[str] = ["## Scan Blind Spots", "### Auth Failures That Skipped Coverage"]
+        if auth_failure_rows:
+            lines.extend(["| Identity ID | Reason | Timestamp |", "|---|---|---|"])
+            for failure in auth_failure_rows:
+                if not isinstance(failure, dict):
+                    continue
+                identity_id = self._safe_report_label(str(failure.get("identity_id") or "unknown"))
+                reason = self._safe_report_label(str(failure.get("reason") or "unknown"))
+                timestamp = self._safe_report_label(str(failure.get("timestamp") or ""))
+                lines.append(f"| {identity_id} | {reason} | {timestamp} |")
+        else:
+            lines.append("- None recorded")
+
+        lines.extend(["", "### Discovery Gaps"])
+        if discovery_gap_rows:
+            lines.extend(f"- {self._safe_report_label(str(endpoint))}" for endpoint in discovery_gap_rows)
+        else:
+            lines.append("- None")
+
+        lines.extend(["", "### Policy-Skipped Attack Classes"])
+        if policy_rows:
+            lines.extend(["| Attack Class | Reason | Count |", "|---|---|---:|"])
+            for item in policy_rows:
+                if not isinstance(item, dict):
+                    continue
+                attack_class = self._safe_report_label(str(item.get("attack_class") or "unknown"))
+                reason = self._safe_report_label(str(item.get("reason") or "unknown"))
+                count = self._coerce_int(item.get("count"), default=0)
+                lines.append(f"| {attack_class} | {reason} | {count} |")
+        else:
+            lines.append("- None")
+
+        lines.extend(["", "### Manually Excluded Paths"])
+        if manual_path_rows:
+            lines.extend(f"- {self._safe_report_label(str(path))}" for path in manual_path_rows)
+        else:
+            lines.append("- None")
+        return "\n".join(lines)
+
     def render_json(self, report: dict[str, Any]) -> str:
         output = copy.deepcopy(report)
         findings = output.get("findings")
@@ -690,17 +1859,348 @@ class ReportingService:
                             "guidance": self._lifecycle_guidance(secret_metadata),
                         }
                 finding["secret_exposure_evidence_pack"] = self._build_secret_exposure_evidence_pack(finding)
+        output = self._redact_report(output)
         return json.dumps(output, indent=2, ensure_ascii=False)
 
-    async def export(self, scan_id: UUID, fmt: str = "json") -> str:
+    def _export_sarif(self, scan_data: dict[str, Any], findings: list[dict[str, Any]]) -> str:
+        results: list[dict[str, Any]] = []
+        for finding in findings:
+            confidence_score = finding.get("confidence_score", 0.0)
+            try:
+                confidence_value = float(confidence_score)
+            except (TypeError, ValueError):
+                confidence_value = 0.0
+            if confidence_value < 0.85:
+                continue
+
+            attack_class = str(finding.get("attack_class", "unknown"))
+            severity = str(finding.get("severity", "")).strip().lower()
+            affected_endpoint = str(finding.get("affected_endpoint") or "unknown")
+            level = "note"
+            if severity in ("high", "critical"):
+                level = "error"
+            elif severity == "medium":
+                level = "warning"
+
+            results.append(
+                {
+                    "ruleId": attack_class,
+                    "level": level,
+                    "message": {
+                        "text": f"{attack_class} vulnerability detected at {affected_endpoint} with confidence {confidence_value:.2f}"
+                    },
+                    "locations": [
+                        {
+                            "physicalLocation": {
+                                "artifactLocation": {
+                                    "uri": affected_endpoint or "unknown",
+                                }
+                            }
+                        }
+                    ],
+                }
+            )
+
+        output = {
+            "version": "2.1.0",
+            "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0.json",
+            "runs": [
+                {
+                    "tool": {
+                        "driver": {
+                            "name": "ProofScan",
+                            "version": "1.0",
+                            "informationUri": "https://proofscan.io",
+                            "rules": [],
+                        }
+                    },
+                    "results": results,
+                }
+            ],
+        }
+        return json.dumps(output, indent=2, ensure_ascii=False)
+
+    def _export_html(self, scan_data: dict[str, Any], findings: list[dict[str, Any]]) -> str:
+        def esc(value: Any) -> str:
+            return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        high_count = 0
+        medium_count = 0
+        low_count = 0
+        for finding in findings:
+            severity = str(finding.get("severity", "")).strip().lower()
+            if severity in ("high", "critical"):
+                high_count += 1
+            elif severity == "medium":
+                medium_count += 1
+            elif severity == "low":
+                low_count += 1
+
+        rows: list[str] = []
+        for finding in findings:
+            confidence_score = finding.get("confidence_score", 0.0)
+            try:
+                confidence_display = f"{float(confidence_score):.2f}"
+            except (TypeError, ValueError):
+                confidence_display = "0.00"
+            rows.append(
+                "<tr>"
+                f"<td>{esc(finding.get('id', ''))}</td>"
+                f"<td>{esc(finding.get('severity', ''))}</td>"
+                f"<td>{esc(finding.get('affected_endpoint', 'unknown'))}</td>"
+                f"<td>{esc(finding.get('attack_class', 'unknown'))}</td>"
+                f"<td>{esc(confidence_display)}</td>"
+                "</tr>"
+            )
+
+        findings_table_rows = "".join(rows) if rows else "<tr><td colspan='5'>No findings</td></tr>"
+        scan_id = esc(scan_data.get("scan_id", ""))
+        target = esc(scan_data.get("target", ""))
+        total_findings = len(findings)
+
+        return (
+            "<!DOCTYPE html>"
+            "<html>"
+            "<head>"
+            "<meta charset='utf-8' />"
+            "<title>ProofScan Report</title>"
+            "<style>"
+            "body{font-family:Arial,sans-serif;margin:24px;color:#1a1a1a;}"
+            "table{border-collapse:collapse;width:100%;margin-bottom:24px;}"
+            "th,td{border:1px solid #d1d5db;padding:8px;text-align:left;}"
+            "th{background:#f3f4f6;}"
+            "h1,h2{margin-bottom:12px;}"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<h1>ProofScan Report</h1>"
+            "<h2>Executive Summary</h2>"
+            "<table>"
+            "<tr><th>scan_id</th><th>target</th><th>total_findings</th><th>high_count</th><th>medium_count</th><th>low_count</th></tr>"
+            f"<tr><td>{scan_id}</td><td>{target}</td><td>{total_findings}</td><td>{high_count}</td><td>{medium_count}</td><td>{low_count}</td></tr>"
+            "</table>"
+            "<h2>Findings</h2>"
+            "<table>"
+            "<tr><th>ID</th><th>Severity</th><th>Endpoint</th><th>Attack Class</th><th>Confidence</th></tr>"
+            f"{findings_table_rows}"
+            "</table>"
+            "<h2>Compliance Mapping</h2>"
+            "<p>Compliance mapping placeholder: map findings to applicable control frameworks.</p>"
+            "</body>"
+            "</html>"
+        )
+
+    async def export(
+        self, scan_id: UUID, fmt: Literal["json", "markdown", "sarif", "html"] = "json"
+    ) -> str:
         report = await self.assemble_report(scan_id)
         redacted_report = self._redact_report(report)
+        findings = redacted_report.get("findings")
+        findings_list = findings if isinstance(findings, list) else []
 
         if fmt == "markdown":
             return self.render_markdown(redacted_report)
         if fmt == "json":
             return self.render_json(redacted_report)
+        if fmt == "sarif":
+            return self._export_sarif(redacted_report, findings_list)
+        if fmt == "html":
+            return self._export_html(redacted_report, findings_list)
         raise ValueError(f"Unsupported export format: {fmt}")
+
+    async def generate_executive_summary(self, scan_id: str, scan_data: dict, findings: list[dict]) -> dict:
+        logger.debug("generate_executive_summary_started", scan_id=scan_id, findings_count=len(findings))
+        exploitable_risk: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            confidence_score = finding.get("confidence_score")
+            if confidence_score is None:
+                proof_artifacts = finding.get("proof_artifacts")
+                if isinstance(proof_artifacts, list):
+                    confidence_score = max(
+                        (
+                            float(item.get("confidence_score", 0.0))
+                            for item in proof_artifacts
+                            if isinstance(item, dict)
+                        ),
+                        default=0.0,
+                    )
+            try:
+                confidence_value = float(confidence_score)
+            except (TypeError, ValueError):
+                confidence_value = 0.0
+            if confidence_value < 0.85:
+                continue
+            severity_key = str(finding.get("severity", "")).strip().lower()
+            if severity_key in exploitable_risk:
+                exploitable_risk[severity_key] += 1
+
+        skipped_blocked = scan_data.get("skipped_blocked") if isinstance(scan_data, dict) else {}
+        coverage_truth: list[dict[str, Any]] = []
+        if isinstance(skipped_blocked, dict):
+            for attack_class in skipped_blocked.get("skipped", []) or []:
+                coverage_truth.append({"attack_class": str(attack_class), "status": "skipped", "reason": None})
+            for item in skipped_blocked.get("blocked", []) or []:
+                if isinstance(item, dict):
+                    coverage_truth.append(
+                        {
+                            "attack_class": str(item.get("attack_class", "unknown")),
+                            "status": "blocked",
+                            "reason": item.get("reason"),
+                        }
+                    )
+                else:
+                    coverage_truth.append({"attack_class": str(item), "status": "blocked", "reason": None})
+
+        seen_classes = {str(item.get("attack_class")) for item in coverage_truth if isinstance(item, dict)}
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            attack_class = str(finding.get("attack_class", "unknown"))
+            if attack_class not in seen_classes:
+                seen_classes.add(attack_class)
+                coverage_truth.append({"attack_class": attack_class, "status": "tested", "reason": None})
+
+        owners: dict[str, dict[str, Any]] = {}
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            metadata = finding.get("metadata")
+            owner = "unassigned"
+            if isinstance(metadata, dict):
+                owner_annotation = metadata.get("owner")
+                if isinstance(owner_annotation, str) and owner_annotation.strip():
+                    owner = owner_annotation.strip()
+                elif isinstance(owner_annotation, dict):
+                    owner = str(
+                        owner_annotation.get("team")
+                        or owner_annotation.get("service")
+                        or owner_annotation.get("owner")
+                        or "unassigned"
+                    ).strip() or "unassigned"
+            endpoint = str(finding.get("affected_endpoint") or "unknown")
+            bucket = owners.setdefault(owner, {"owner": owner, "finding_count": 0, "endpoints": set()})
+            bucket["finding_count"] += 1
+            bucket["endpoints"].add(endpoint)
+
+        top_service_owners: list[dict[str, Any]] = []
+        for owner_data in sorted(owners.values(), key=lambda item: item["finding_count"], reverse=True):
+            top_service_owners.append(
+                {
+                    "owner": owner_data["owner"],
+                    "finding_count": owner_data["finding_count"],
+                    "endpoints": sorted(owner_data["endpoints"]),
+                }
+            )
+
+        release_gate_status = "PASS" if (exploitable_risk["critical"] + exploitable_risk["high"]) == 0 else "BLOCK"
+        summary = {
+            "exploitable_risk": exploitable_risk,
+            "coverage_truth": coverage_truth,
+            "top_service_owners": top_service_owners,
+            "release_gate_status": release_gate_status,
+            "generated_at": datetime.now(UTC).isoformat(),
+        }
+        logger.debug("generate_executive_summary_completed", scan_id=scan_id, release_gate_status=release_gate_status)
+        return summary
+
+    async def generate_developer_report(self, scan_id: str, findings: list[dict]) -> list[dict]:
+        logger.debug("generate_developer_report_started", scan_id=scan_id, findings_count=len(findings))
+        fix_hints = {
+            "bola": "Enforce object-level authorization checks for every resource access.",
+            "idor": "Validate ownership for object identifiers on read/write operations.",
+            "bfla": "Apply function-level authorization middleware before handler execution.",
+            "auth_bypass": "Require authentication on this route and deny anonymous fallback paths.",
+            "privilege_escalation": "Bind action permissions to verified role claims on each request.",
+            "mass_assignment": "Use explicit allowlists for writable fields in request payloads.",
+            "sensitive_exposure": "Remove secrets from responses and source values from secure storage.",
+            "default": "Apply least-privilege validation and add a regression test for this case.",
+        }
+
+        def _redacted_headers(headers: dict[str, Any]) -> dict[str, str]:
+            sanitized: dict[str, str] = {}
+            for key, value in headers.items():
+                key_text = str(key)
+                if key_text.lower() in {"authorization", "cookie"}:
+                    sanitized[key_text] = REDACTED
+                else:
+                    sanitized[key_text] = str(value)
+            return sanitized
+
+        def _escape_single_quotes(text: str) -> str:
+            return text.replace("'", "'\"'\"'")
+
+        report: list[dict[str, Any]] = []
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+
+            metadata = finding.get("metadata") if isinstance(finding.get("metadata"), dict) else {}
+            method = str(finding.get("method") or metadata.get("method") or "GET").upper()
+            path = str(finding.get("affected_endpoint") or metadata.get("endpoint_url") or metadata.get("path") or "")
+            affected_endpoint = f"{method} {path}".strip()
+
+            proof_artifacts = finding.get("proof_artifacts")
+            artifact = proof_artifacts[0] if isinstance(proof_artifacts, list) and proof_artifacts else {}
+            if not isinstance(artifact, dict):
+                artifact = {}
+            confidence_score = artifact.get("confidence_score", finding.get("confidence_score"))
+            artifact_type = artifact.get("proof_type") or artifact.get("artifact_type") or "unknown"
+
+            request_data = artifact.get("request") if isinstance(artifact.get("request"), dict) else {}
+            replay: str | None = None
+            if request_data:
+                replay_method = str(request_data.get("method") or method).upper()
+                replay_url = str(request_data.get("url") or path).strip()
+                if replay_url:
+                    curl_parts: list[str] = [f"curl -X {replay_method}", f"'{_escape_single_quotes(replay_url)}'"]
+                    headers = request_data.get("headers")
+                    if isinstance(headers, dict):
+                        for key, value in _redacted_headers(headers).items():
+                            header_text = f"{key}: {value}"
+                            curl_parts.append(f"-H '{_escape_single_quotes(header_text)}'")
+                    body = request_data.get("body")
+                    if body is not None:
+                        if isinstance(body, (dict, list)):
+                            body_text = json.dumps(body, ensure_ascii=False)
+                        else:
+                            body_text = str(body)
+                        curl_parts.append(f"--data '{_escape_single_quotes(body_text)}'")
+                    replay = " ".join(curl_parts)
+
+            owner = "unassigned"
+            owner_annotation = metadata.get("owner")
+            if isinstance(owner_annotation, str) and owner_annotation.strip():
+                owner = owner_annotation.strip()
+            elif isinstance(owner_annotation, dict):
+                owner = str(
+                    owner_annotation.get("team")
+                    or owner_annotation.get("service")
+                    or owner_annotation.get("owner")
+                    or "unassigned"
+                ).strip() or "unassigned"
+
+            attack_class = str(finding.get("attack_class") or "unknown")
+            report.append(
+                {
+                    "finding_id": str(finding.get("id") or finding.get("finding_id") or ""),
+                    "attack_class": attack_class,
+                    "severity": str(finding.get("severity") or "unknown"),
+                    "affected_endpoint": affected_endpoint,
+                    "proof": {
+                        "confidence_score": confidence_score,
+                        "artifact_type": str(artifact_type),
+                    },
+                    "replay": replay,
+                    "owner": owner,
+                    "fix_hint": fix_hints.get(attack_class, fix_hints["default"]),
+                    "state_diff": metadata.get("state_diff") if isinstance(metadata.get("state_diff"), dict) else None,
+                }
+            )
+
+        logger.debug("generate_developer_report_completed", scan_id=scan_id, report_count=len(report))
+        return report
 
     def _artifact_payload(self, scan_id: UUID, finding_id: UUID, artifact: ProofArtifact) -> dict[str, Any]:
         evidence_payload = self._read_evidence_payload(scan_id=scan_id, finding_id=finding_id, artifact=artifact)
@@ -834,6 +2334,23 @@ class ReportingService:
         if isinstance(severity, Severity):
             return severity.value
         return str(severity)
+
+    def _get_provider_id(self, finding: Any) -> str | None:
+        try:
+            probe = finding.raw_probes[0] if finding.raw_probes else None
+            if probe and hasattr(probe, "metadata") and isinstance(probe.metadata, dict):
+                return probe.metadata.get("provider_id")
+        except (AttributeError, IndexError):
+            pass
+        return None
+
+    def _get_validator_strategy(self, finding: Any) -> str | None:
+        try:
+            if finding.proof_artifact and hasattr(finding.proof_artifact, "validator_name"):
+                return finding.proof_artifact.validator_name
+        except AttributeError:
+            pass
+        return None
 
     def _severity_factors_for_finding(self, finding: dict[str, Any]) -> list[dict[str, Any]]:
         factors = finding.get("severity_factors")
@@ -995,7 +2512,10 @@ class ReportingService:
     def _parse_secret_metadata(self, evidence_notes: str) -> dict[str, str] | None:
         parsed: dict[str, str] = {}
         for key, value in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=([^;,\n]+)", evidence_notes):
-            parsed[key.strip()] = value.strip()
+            normalized_key = key.strip()
+            if normalized_key.lower() in {"raw_secret", "secret_value", "token", "password", "bearer_token"}:
+                continue
+            parsed[normalized_key] = value.strip()
         if "secret_type" not in parsed:
             return None
         return parsed
@@ -1231,9 +2751,12 @@ class ReportingService:
         if isinstance(value, dict):
             output: dict[str, Any] = {}
             for key, item in value.items():
-                if key in _SAFE_SECRET_METADATA_KEYS:
+                key_text = str(key)
+                if key_text == "evidence_notes":
+                    output[key] = self._redact_evidence_notes(str(item))
+                elif key_text in _SAFE_SECRET_METADATA_KEYS:
                     output[key] = self._redact_value(item)
-                elif _SENSITIVE_KEY_PATTERN.search(key):
+                elif _SENSITIVE_KEY_PATTERN.search(key_text):
                     output[key] = REDACTED
                 else:
                     output[key] = self._redact_value(item)
@@ -1245,6 +2768,20 @@ class ReportingService:
                 if pattern.search(value):
                     return REDACTED
         return value
+
+    def _redact_evidence_notes(self, evidence_notes: str) -> str:
+        secret_assignment_pattern = (
+            r"(?i)\b(raw_secret|secret_value|access[_-]?token|refresh[_-]?token|session[_-]?token|"
+            r"api[_-]?key|client[_-]?secret|bearer[_-]?token|password|token)\s*=\s*[^;,\n]+"
+        )
+        redacted = re.sub(
+            secret_assignment_pattern,
+            lambda match: f"{match.group(1)}={REDACTED}",
+            evidence_notes,
+        )
+        redacted = re.sub(r"(?i)\bbearer\s+[a-z0-9\-\._~\+/]+=*", REDACTED, redacted)
+        redacted = re.sub(r"(?i)\beyJ[a-z0-9\-_]+\.[a-z0-9\-_]+(?:\.[a-z0-9\-_]+)?", REDACTED, redacted)
+        return redacted
 
     def _extract_secret_blast_radius_matrix_from_metadata(self, metadata: Any) -> list[dict[str, Any]]:
         if not isinstance(metadata, dict):
@@ -1560,6 +3097,34 @@ class ReportingService:
             ]
         )
 
+    def _build_attack_chain_timeline_section(self, finding: dict[str, Any]) -> str:
+        timeline = finding.get("attack_chain_timeline")
+        if not isinstance(timeline, list) or not timeline:
+            return ""
+
+        rows: list[str] = []
+        for item in timeline:
+            if not isinstance(item, dict):
+                continue
+            step = self._truncate_markdown_cell(str(item.get("step") or "-"), limit=16)
+            task_id = self._truncate_markdown_cell(str(item.get("task_id") or "-"), limit=36)
+            attack_class = self._truncate_markdown_cell(str(item.get("attack_class") or "-"), limit=32)
+            endpoint_id = self._truncate_markdown_cell(str(item.get("endpoint_id") or "-"), limit=36)
+            replan_reason = self._truncate_markdown_cell(str(item.get("replan_reason") or "-"), limit=36)
+            timestamp = self._truncate_markdown_cell(str(item.get("timestamp") or "-"), limit=40)
+            rows.append(f"| {step} | {task_id} | {attack_class} | {endpoint_id} | {replan_reason} | {timestamp} |")
+
+        if not rows:
+            return ""
+        return "\n".join(
+            [
+                "### Attack Chain Timeline",
+                "| Step | Task ID | Attack Class | Endpoint ID | Replan Reason | Timestamp |",
+                "|---|---|---|---|---|---|",
+                *rows,
+            ]
+        )
+
     def _truncate_markdown_cell(self, value: str, limit: int) -> str:
         if len(value) <= limit:
             return value
@@ -1613,3 +3178,82 @@ class ReportingService:
             else:
                 active_rules.append(name)
         return all_rules, active_rules, skipped_rules
+
+
+def generate_authorization_pack(
+    scan_id: str,
+    policy: ScanPolicyV2,
+    contact_email: str | None = None,
+    base_url: str = "",
+) -> AuthorizationPackResponse:
+    """Generates a compliance artifact for enterprise buyers showing what will be tested."""
+    return AuthorizationPackResponse(
+        scan_id=scan_id,
+        policy_version=policy.version,
+        scope_summary={
+            "allowed_domains": list(policy.scope.allowed_domains),
+            "denied_pattern_count": len(policy.scope.denied_path_patterns),
+        },
+        contact_email=contact_email,
+        maintenance_windows=[
+            {"start_hour": tw.start_hour, "end_hour": tw.end_hour, "weekdays": tw.weekdays}
+            for tw in policy.time_windows
+        ],
+        emergency_stop_url=f"{base_url}/scans/{scan_id}/kill",
+        generated_at=datetime.now(UTC),
+        policy_json=policy.model_dump(),
+    )
+
+
+def authorization_pack_section(scan_id: str, policy: ScanPolicyV2 | None, contact_email: str | None = None) -> dict:
+    """Returns authorization pack dict for inclusion in assembled report, or empty dict if no policy."""
+    if policy is None:
+        return {}
+    pack = generate_authorization_pack(scan_id, policy, contact_email)
+    return {"authorization_pack": pack.model_dump(mode="json")}
+
+
+def generate_coverage_report(scan_id: str, endpoint_statuses: list[dict]) -> dict:
+    by_status: dict[str, int] = {}
+    per_endpoint: dict[str, dict[str, Any]] = {}
+
+    for item in endpoint_statuses:
+        status = str(item.get("status", "unknown"))
+        by_status[status] = by_status.get(status, 0) + 1
+
+        endpoint_pattern = str(item.get("endpoint_pattern", ""))
+        method = str(item.get("method", "")).upper()
+        endpoint_key = f"{method} {endpoint_pattern}"
+        per_endpoint[endpoint_key] = {
+            "status": status,
+            "tested_classes": list(item.get("tested_classes", [])),
+            "finding_count": int(item.get("finding_count", 0)),
+        }
+
+    return {
+        "scan_id": scan_id,
+        "total_endpoints": len(endpoint_statuses),
+        "by_status": by_status,
+        "per_endpoint": per_endpoint,
+    }
+
+
+def compute_attack_class_readiness(service_coverage: dict[str, dict]) -> dict[str, dict]:
+    readiness: dict[str, dict] = {}
+
+    for service, item in service_coverage.items():
+        tested = int(item.get("tested", 0))
+        discovered = int(item.get("discovered", 0))
+        auth_discovery = (tested / discovered) if discovered > 0 else 0.0
+        identity_tests = 1.0 if bool(item.get("identity_tested")) else 0.0
+        stateful_proof = 1.0 if bool(item.get("stateful_proof_tested")) else 0.0
+        overall = (auth_discovery + identity_tests + stateful_proof) / 3.0
+
+        readiness[service] = {
+            "auth_discovery": auth_discovery,
+            "identity_tests": identity_tests,
+            "stateful_proof": stateful_proof,
+            "overall": overall,
+        }
+
+    return readiness

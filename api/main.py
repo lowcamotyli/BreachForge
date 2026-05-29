@@ -8,7 +8,20 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from api.middleware.logging import configure_logging
-from api.routers import auth_check_router, findings_router, recon_router, reports_router, scans_router, session_router
+from api.routers import (
+    auth_check_router,
+    audit_router,
+    findings_router,
+    inventory_router,
+    orgs_router,
+    recon_router,
+    reports_router,
+    runners_router,
+    scans_router,
+    secrets_router,
+    session_router,
+    webhooks_router,
+)
 
 _FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
@@ -27,7 +40,13 @@ app.include_router(auth_check_router, prefix="/auth", tags=["auth"])
 app.include_router(findings_router, tags=["findings"])
 app.include_router(reports_router, tags=["reports"])
 app.include_router(recon_router, tags=["recon"])
+app.include_router(runners_router, tags=["runners"])
+app.include_router(secrets_router, tags=["secrets"])
+app.include_router(orgs_router, tags=["orgs"])
+app.include_router(audit_router, tags=["audit"])
+app.include_router(inventory_router)
 app.include_router(session_router)
+app.include_router(webhooks_router)
 
 
 @app.middleware("http")

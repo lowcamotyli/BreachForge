@@ -1,0 +1,18 @@
+{
+  "lab_id": "business_race",
+  "lab_version": "1.0.0",
+  "attack_classes": ["RACE_CONDITION", "IDEMPOTENCY", "NEGATIVE_QUANTITY", "APPROVAL_WORKFLOW_SKIP", "STATE_INCONSISTENCY"],
+  "identities": [
+    {"username": "alice", "role": "user", "tenant": "tenant_a"},
+    {"username": "bob", "role": "admin", "tenant": "tenant_a"}
+  ],
+  "expected_surface": ["/api/coupons/redeem", "/api/coupons/check-balance", "/api/orders", "/api/cart/add", "/api/orders/{order_id}/submit-for-approval", "/api/orders/{order_id}/final-confirm"],
+  "expected_endpoints": ["/api/coupons/redeem", "/api/coupons/check-balance", "/api/orders", "/api/cart/add", "/api/orders/{order_id}/submit-for-approval", "/api/orders/{order_id}/final-confirm"],
+  "vulnerabilities": [
+    {"id": "br-vuln-001", "type": "RACE_CONDITION", "endpoint": "/api/coupons/redeem", "method": "POST", "severity": "HIGH", "description": "Coupon redemption has no atomic check -- concurrent calls can both succeed"},
+    {"id": "br-vuln-002", "type": "IDEMPOTENCY", "endpoint": "/api/orders", "method": "POST", "severity": "MEDIUM", "description": "Order creation has no idempotency key -- duplicate orders possible"},
+    {"id": "br-vuln-003", "type": "NEGATIVE_QUANTITY", "endpoint": "/api/cart/add", "method": "POST", "severity": "MEDIUM", "description": "Cart allows negative quantities -- inventory manipulation possible"},
+    {"id": "br-vuln-004", "type": "APPROVAL_WORKFLOW_SKIP", "endpoint": "/api/orders/{order_id}/final-confirm", "method": "POST", "severity": "HIGH", "description": "Final confirm does not require approval step"},
+    {"id": "br-vuln-005", "type": "STATE_INCONSISTENCY", "endpoint": "/api/coupons/check-balance", "method": "GET", "severity": "MEDIUM", "description": "Balance check does not reflect redemption state -- requires follow-up probe after redeem to detect", "requires_followup": true}
+  ]
+}

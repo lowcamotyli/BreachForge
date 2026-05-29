@@ -1,0 +1,17 @@
+{
+  "lab_id": "spa_har",
+  "lab_version": "1.0.0",
+  "attack_classes": ["BFLA", "HIDDEN_ENDPOINT", "DISCOVERY"],
+  "identities": [
+    {"username": "alice", "role": "user", "tenant": "tenant_a"},
+    {"username": "bob", "role": "admin", "tenant": "tenant_a"}
+  ],
+  "expected_surface": ["/api/users", "/api/admin/stats", "/api/internal/metrics", "/api/profile"],
+  "expected_endpoints": ["/api/users", "/api/admin/stats", "/api/internal/metrics", "/api/profile"],
+  "discovery_surface": ["/api/admin/stats", "/api/internal/metrics"],
+  "vulnerabilities": [
+    {"id": "sh-vuln-001", "type": "BFLA", "endpoint": "/api/admin/stats", "method": "GET", "severity": "HIGH", "description": "Admin stats accessible by regular user"},
+    {"id": "sh-vuln-002", "type": "HIDDEN_ENDPOINT", "endpoint": "/api/internal/metrics", "method": "GET", "severity": "MEDIUM", "description": "Internal metrics endpoint discoverable from JS, no auth"},
+    {"id": "sh-vuln-003", "type": "DISCOVERY", "endpoint": "/api/internal/metrics", "method": "GET", "severity": "LOW", "description": "Endpoint discoverable from JS bundle but absent from official API docs"}
+  ]
+}

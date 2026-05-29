@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from base64 import urlsafe_b64encode
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -11,7 +12,7 @@ import pytest
 
 import control_plane.auth_manager as auth_manager_module
 from api.models.requests import AuthContextCreate
-from control_plane.auth_manager import AuthManager, SessionSnapshot
+from control_plane.auth_manager import AuthManager, AuthRecorder, IdentityContext, IdentityRole, SessionSnapshot
 from storage.db.encryption import EncryptedBlob
 from storage.db.models import ScanStatus
 
@@ -28,6 +29,21 @@ def _failing_session_factory() -> _FailingSessionContext:
     return _FailingSessionContext()
 
 
+class _ProbeResponse:
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        self.content = b""
+
+    def json(self) -> dict[str, object]:
+        return {}
+
+
+def _jwt_with_exp(exp: int) -> str:
+    header = urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').rstrip(b"=").decode("ascii")
+    payload = urlsafe_b64encode(json.dumps({"exp": exp}).encode("utf-8")).rstrip(b"=").decode("ascii")
+    return f"{header}.{payload}.signature"
+
+
 @pytest.fixture(autouse=True)
 def mock_playwright(monkeypatch: pytest.MonkeyPatch) -> None:
     class _PlaywrightContext:
@@ -41,6 +57,80 @@ def mock_playwright(monkeypatch: pytest.MonkeyPatch) -> None:
             return None
 
     monkeypatch.setattr(auth_manager_module, "async_playwright", lambda: _PlaywrightContext())
+
+
+def test_auth_recorder_records_browser_material_and_successful_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_request: dict[str, object] = {}
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            assert kwargs["timeout"] == 15.0
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def get(self, url: str, **kwargs: object) -> _ProbeResponse:
+            captured_request["url"] = url
+            captured_request["headers"] = kwargs["headers"]
+            captured_request["cookies"] = kwargs["cookies"]
+            return _ProbeResponse(200)
+
+    monkeypatch.setattr(auth_manager_module.httpx, "Client", _Client)
+
+    snapshot = AuthRecorder().record_session(
+        "https://example.com/account",
+        cookies={"sid": "cookie-secret"},
+        storage={"localStorage": {"access_token": "storage-token"}},
+        headers={
+            "Authorization": "Bearer token-secret",
+            "Cookie": "sid=cookie-secret",
+            "X-CSRF-Token": "csrf-secret",
+            "X-Ignored": "not-auth",
+        },
+    )
+
+    assert snapshot.url == "https://example.com/account"
+    assert snapshot.cookies == {"sid": "cookie-secret"}
+    assert snapshot.storage == {"localStorage": {"access_token": "storage-token"}}
+    assert snapshot.headers == {
+        "Authorization": "Bearer token-secret",
+        "Cookie": "sid=cookie-secret",
+        "X-CSRF-Token": "csrf-secret",
+    }
+    assert snapshot.probe_success is True
+    assert captured_request["url"] == "https://example.com/account"
+    assert captured_request["cookies"] == {"sid": "cookie-secret"}
+    assert captured_request["headers"] == snapshot.headers
+
+
+def test_auth_recorder_marks_probe_failed_on_unauthorized(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def get(self, url: str, **kwargs: object) -> _ProbeResponse:
+            del url, kwargs
+            return _ProbeResponse(401)
+
+    monkeypatch.setattr(auth_manager_module.httpx, "Client", _Client)
+
+    snapshot = AuthRecorder().record_session(
+        "https://example.com/account",
+        cookies={"sid": "cookie-secret"},
+        storage={},
+        headers={"Authorization": "Bearer token-secret"},
+    )
+
+    assert snapshot.probe_success is False
 
 
 @pytest.mark.asyncio
@@ -147,6 +237,189 @@ async def test_get_session_snapshot_returns_copy_not_reference() -> None:
     assert manager._session_snapshot.auth_headers["Authorization"] == "Bearer original-token"
 
 
+def test_auth_coverage_metrics_return_counts_only() -> None:
+    scan_id = uuid4()
+    manager = AuthManager(scan_id, _failing_session_factory, AsyncMock())
+    captured_at = datetime.now(UTC)
+
+    user_identity = IdentityContext(
+        scan_id=scan_id,
+        role=IdentityRole.user,
+        cookies=[{"name": "sessionid", "value": "cookie-secret"}],
+        auth_headers={},
+        csrf_tokens={},
+        captured_at=captured_at,
+        tenant_hint="tenant-a",
+        active=True,
+    )
+    admin_identity = IdentityContext(
+        scan_id=scan_id,
+        role=IdentityRole.admin,
+        cookies=[{"name": "sessionid", "value": "admin-cookie-secret"}],
+        auth_headers={},
+        csrf_tokens={},
+        captured_at=captured_at,
+        tenant_hint="tenant-b",
+        active=False,
+        auth_state="expired",
+    )
+    named_identity = IdentityContext(
+        scan_id=scan_id,
+        role=IdentityRole.user,
+        cookies=[],
+        auth_headers={"Authorization": "Bearer token-secret"},
+        csrf_tokens={},
+        captured_at=captured_at,
+        name="named-user",
+        tenant_hint="tenant-b",
+        active=True,
+    )
+    anonymous_identity = IdentityContext(
+        scan_id=scan_id,
+        role=IdentityRole.anon,
+        cookies=[],
+        auth_headers={},
+        csrf_tokens={},
+        captured_at=captured_at,
+        active=True,
+    )
+
+    manager._identity_contexts = {
+        IdentityRole.user: user_identity,
+        IdentityRole.admin: admin_identity,
+        "named-user": named_identity,
+        IdentityRole.anon: anonymous_identity,
+    }
+    manager._named_identities = {"named-user": named_identity}
+    manager._record_identity_failure("admin", "expired")
+    manager._health_check_results = [True, False, True]
+
+    metrics = manager.get_auth_coverage_metrics()
+
+    assert metrics == {
+        "session_valid_count": 2,
+        "role_count": 3,
+        "tenant_count": 2,
+        "health_check_pass_rate": pytest.approx(2 / 3),
+    }
+    assert "secret" not in json.dumps(metrics)
+
+
+def test_auth_manager_attaches_identity_health_matrix() -> None:
+    scan_id = uuid4()
+    manager = AuthManager(scan_id, _failing_session_factory, AsyncMock())
+    identity = IdentityContext(
+        scan_id=scan_id,
+        role=IdentityRole.user,
+        cookies=[],
+        auth_headers={},
+        csrf_tokens={},
+        captured_at=datetime.now(UTC),
+        tenant_hint="tenantA",
+        active=True,
+    )
+
+    manager.identity_health_matrix.record_probe(identity, success=True, status_code=200)
+
+    summary = manager.identity_health_matrix.summary
+    assert summary["per_role"]["user"]["pass_rate"] == 1.0
+    assert summary["per_tenant"]["tenantA"]["total_probes"] == 1
+    assert summary["role_markers"] == ["user"]
+    assert summary["tenant_markers"] == ["tenantA"]
+
+
+def test_predict_expiry_detects_expired_jwt() -> None:
+    scan_id = uuid4()
+    manager = AuthManager(scan_id, _failing_session_factory, AsyncMock())
+    expired_at = int(datetime.now(UTC).timestamp()) - 120
+    token = _jwt_with_exp(expired_at)
+    snapshot = SessionSnapshot(
+        scan_id=scan_id,
+        cookies=[],
+        auth_headers={"Authorization": f"Bearer {token}"},
+        csrf_tokens={},
+        captured_at=datetime.now(UTC),
+        expires_at=None,
+    )
+
+    predicted = manager.predict_expiry(snapshot)
+
+    assert predicted is not None
+    assert predicted <= datetime.now(UTC)
+
+
+def test_refresh_bearer_returns_none_on_401(monkeypatch: pytest.MonkeyPatch) -> None:
+    scan_id = uuid4()
+    manager = AuthManager(scan_id, _failing_session_factory, AsyncMock())
+    identity = IdentityContext(
+        scan_id=scan_id,
+        role=IdentityRole.user,
+        cookies=[],
+        auth_headers={"Authorization": "Bearer abc.def.ghi"},
+        csrf_tokens={},
+        captured_at=datetime.now(UTC),
+        refresh_url="https://example.com/auth/refresh",
+        active=True,
+    )
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def post(self, *args: object, **kwargs: object) -> _ProbeResponse:
+            del args, kwargs
+            return _ProbeResponse(401)
+
+    monkeypatch.setattr(auth_manager_module.httpx, "Client", _Client)
+
+    refreshed = manager.refresh_bearer(identity)
+
+    assert refreshed is None
+    assert manager._last_refresh_status_code == 401
+
+
+def test_relogin_cookie_returns_none_when_login_recipe_absent() -> None:
+    scan_id = uuid4()
+    manager = AuthManager(scan_id, _failing_session_factory, AsyncMock())
+    identity = IdentityContext(
+        scan_id=scan_id,
+        role=IdentityRole.user,
+        cookies=[],
+        auth_headers={},
+        csrf_tokens={},
+        captured_at=datetime.now(UTC),
+        login_recipe=None,
+        active=True,
+    )
+
+    assert manager.relogin_cookie(identity) is None
+
+
+@pytest.mark.asyncio
+async def test_health_check_records_overall_pass_rate() -> None:
+    scan_id = uuid4()
+    manager = AuthManager(scan_id, _failing_session_factory, AsyncMock())
+    manager._pause_with_error = AsyncMock()
+
+    manager._probe_authenticated_endpoint = AsyncMock(return_value=False)
+    manager._attempt_refresh = AsyncMock(return_value=True)
+
+    assert await manager.health_check() is True
+    assert manager.health_check_pass_rate == 1.0
+
+    manager._probe_authenticated_endpoint = AsyncMock(return_value=False)
+    manager._attempt_refresh = AsyncMock(return_value=False)
+
+    assert await manager.health_check() is False
+    assert manager.health_check_pass_rate == pytest.approx(0.5)
+
+
 @pytest.mark.asyncio
 async def test_health_loop_pauses_scan_with_explicit_error_when_probe_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     scan_id = uuid4()
@@ -155,8 +428,21 @@ async def test_health_loop_pauses_scan_with_explicit_error_when_probe_fails(monk
 
     manager._auth_type = "token"
     manager._auth_input = AuthContextCreate(type="token", bearer_token="token-value")
+    manager._identity_contexts = {
+        IdentityRole.user: IdentityContext(
+            scan_id=scan_id,
+            role=IdentityRole.user,
+            cookies=[],
+            auth_headers={"Authorization": f"Bearer {_jwt_with_exp(int(datetime.now(UTC).timestamp()) - 60)}"},
+            csrf_tokens={},
+            captured_at=datetime.now(UTC),
+            refresh_url="https://example.com/refresh",
+            active=True,
+        )
+    }
     manager._probe_authenticated_endpoint = AsyncMock(return_value=False)
     manager._attempt_refresh = AsyncMock(return_value=False)
+    manager._attempt_identity_refresh = AsyncMock(return_value=False)
     manager._mark_auth_context_unhealthy = AsyncMock()
 
     async def _no_wait(_: float) -> None:
@@ -166,6 +452,7 @@ async def test_health_loop_pauses_scan_with_explicit_error_when_probe_fails(monk
 
     await manager._health_loop()
 
+    manager._attempt_identity_refresh.assert_awaited()
     pause_scan.assert_awaited_once_with(scan_id, "auth_expired")
     manager._mark_auth_context_unhealthy.assert_awaited_once_with("auth_expired")
 

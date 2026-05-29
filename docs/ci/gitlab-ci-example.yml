@@ -1,0 +1,17 @@
+# Reusable GitLab CI job template for running BreachForge in the security stage.
+# Extend this hidden job from a project-specific job and override TARGET_URL.
+.breachforge_scan:
+  stage: security
+  image: python:3.12-slim
+  variables:
+    BREACHFORGE_API_URL: "http://localhost:8000"
+    TARGET_URL: "https://your-staging-url"
+  before_script:
+    - pip install -e . --quiet
+  script:
+    - breachforge scan run --target "$TARGET_URL" --gate .breachforge.yml --timeout 600
+  artifacts:
+    paths: [breachforge-report.json]
+    expire_in: 7 days
+    when: always
+  allow_failure: false

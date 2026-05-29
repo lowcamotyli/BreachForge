@@ -80,8 +80,9 @@ from execution_plane.validator.strategies.race_advanced import (
     IdempotencyBypassStrategy,
     DistributedLockEvasionStrategy,
 )
+from execution_plane.validator.strategies.race_condition import RaceConditionStrategy
 from execution_plane.validator.state_diff import compute_diff
-from execution_plane.planner.decision_log import FeedbackPayload, TaskOutcome
+from execution_plane.planner.decision_log import FeedbackPayload, FeedbackReason, TaskOutcome
 from storage.db.models import AttackTask, ProofArtifact, RawProbe
 from storage.db.session import AsyncSessionLocal
 from storage.evidence.store import EvidenceStore
@@ -100,6 +101,16 @@ logger = structlog.get_logger(__name__)
 DEFAULT_PROOF_CONFIDENCE_THRESHOLD = float(os.getenv("DEFAULT_PROOF_CONFIDENCE_THRESHOLD", "0.85"))
 LOW_CONFIDENCE_STORE_THRESHOLD = 0.50
 _FORBIDDEN_IDENTITY_LABEL_TOKENS: tuple[str, ...] = ("token", "cookie", "bearer", "authorization", "password", "secret")
+_RACE_RECONCILE_CLASSES: frozenset[str] = frozenset(
+    {
+        "race_condition",
+        "double_spend",
+        "limit_override_race",
+        "inventory_reservation_abuse",
+        "idempotency_bypass",
+        "distributed_lock_evasion",
+    }
+)
 SUPPORTED_ATTACK_CLASSES: set[str] = {
     "bola",
     "tenant_isolation",
@@ -144,7 +155,21 @@ SUPPORTED_ATTACK_CLASSES: set[str] = {
     "security_headers",
     "cors_analysis",
     "tls_analysis",
+    "race_condition",
 }
+
+_OUTCOME_TO_REASON: dict[TaskOutcome, FeedbackReason] = {
+    TaskOutcome.no_signal: FeedbackReason.no_signal,
+    TaskOutcome.blocked: FeedbackReason.auth_drift,
+    TaskOutcome.unsafe_blocked: FeedbackReason.unsafe_blocked,
+    TaskOutcome.interesting: FeedbackReason.interesting_diff,
+    TaskOutcome.needs_followup: FeedbackReason.state_changed,
+    TaskOutcome.success: FeedbackReason.interesting_diff,
+}
+
+
+def _outcome_to_reason(outcome: TaskOutcome) -> FeedbackReason | None:
+    return _OUTCOME_TO_REASON.get(outcome)
 
 
 class _BolaStrategy(BolaStrategy):
@@ -476,6 +501,33 @@ class ExploitValidator:
             )
             return
 
+        race_reconcile_passed = self._race_reconcile_passed(
+            scan_id=scan_id,
+            attack_task=attack_task,
+            attack_probe=attack_probe,
+        )
+        if race_reconcile_passed is False:
+            self._feedback_buffer.append(
+                FeedbackPayload(
+                    outcome=TaskOutcome.no_signal,
+                    scan_id=str(scan_id),
+                    task_id=str(attack_task.id),
+                    endpoint=str(attack_task.endpoint_id),
+                    finding_class=attack_task.attack_class,
+                    confidence=0.0,
+                    follow_up_hints=[],
+                    parent_evidence_ref=None,
+                    reason=FeedbackReason.no_signal,
+                    metadata={"reconcile_required": True, "reconcile_passed": False},
+                )
+            )
+            logger.info(
+                "validator_race_probe_downgraded_no_signal",
+                scan_id=str(scan_id),
+                attack_task_id=str(attack_task.id),
+            )
+            return
+
         strategy = self._strategies.get(attack_task.attack_class)
         if strategy is None:
             if attack_task.attack_class in SUPPORTED_ATTACK_CLASSES:
@@ -512,6 +564,20 @@ class ExploitValidator:
             if not has_meaningful_diff:
                 artifact.confidence_score = min(artifact.confidence_score, 0.60)
                 artifact.evidence_notes = (artifact.evidence_notes or "") + "; state_effect_required=no_diff_found"
+        if artifact is not None and race_reconcile_passed is not None:
+            artifact.evidence_notes = (
+                f"{artifact.evidence_notes}; reconcile_required=true; "
+                f"reconcile_passed={'true' if race_reconcile_passed else 'false'}"
+            )
+            setattr(
+                artifact,
+                "metadata",
+                {
+                    **(getattr(artifact, "metadata", {}) if isinstance(getattr(artifact, "metadata", None), dict) else {}),
+                    "reconcile_required": True,
+                    "reconcile_passed": race_reconcile_passed,
+                },
+            )
         artifact = await self._apply_differential_proof_gate(
             attack_task=attack_task,
             strategy=strategy,
@@ -907,6 +973,7 @@ class ExploitValidator:
             "cors_analysis": _CorsAnalysisStrategy(),
             "tls_analysis": _TlsAnalysisStrategy(),
             "limit_override_race": LimitOverrideRaceStrategy(),
+            "race_condition": RaceConditionStrategy(),
             "double_spend": DoubleSpendStrategy(),
             "idempotency_bypass": IdempotencyBypassStrategy(),
             "distributed_lock_evasion": DistributedLockEvasionStrategy(),
@@ -996,6 +1063,64 @@ class ExploitValidator:
                 return None
         return stripped
 
+    def _race_reconcile_passed(
+        self,
+        *,
+        scan_id: UUID | str,
+        attack_task: AttackTask,
+        attack_probe: RawProbe,
+    ) -> bool | None:
+        attack_class = str(attack_task.attack_class).strip().lower()
+        if attack_class not in _RACE_RECONCILE_CLASSES and "race" not in attack_class:
+            return None
+
+        race_group_id = self._race_group_id_from_probe(attack_probe)
+        if race_group_id is None:
+            return None
+
+        key = f"race_reconcile:{scan_id}:{race_group_id}"
+        try:
+            payload = self._redis.hgetall(key)
+        except Exception:
+            return None
+        if not isinstance(payload, dict) or not payload:
+            return None
+        raw_value = payload.get("reconcile_passed")
+        if raw_value is None:
+            raw_value = payload.get(b"reconcile_passed")
+        if isinstance(raw_value, bytes):
+            raw_value = raw_value.decode("utf-8", errors="ignore")
+        if isinstance(raw_value, bool):
+            return raw_value
+        if isinstance(raw_value, str):
+            normalized = raw_value.strip().lower()
+            if normalized in {"true", "1", "yes", "passed"}:
+                return True
+            if normalized in {"false", "0", "no", "failed", "no_signal"}:
+                return False
+        return None
+
+    def _race_group_id_from_probe(self, attack_probe: RawProbe) -> str | None:
+        request = attack_probe.request
+        direct = request.get("_race_group_id") if isinstance(request, dict) else None
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+
+        body = request.get("body") if isinstance(request, dict) else None
+        if not isinstance(body, str) or not body.strip():
+            return None
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        for key in ("_race_group_id", "race_group_id"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
     def _set_identity_labels(self, artifact: ProofArtifact, identity_labels: list[str]) -> None:
         setattr(artifact, "identity_labels", identity_labels)
 
@@ -1043,6 +1168,7 @@ class ExploitValidator:
                 confidence=float(confidence),
                 follow_up_hints=self._follow_up_hints_for_finding_class(finding_class),
                 parent_evidence_ref=parent_evidence_ref,
+                reason=_outcome_to_reason(outcome),
             )
         )
 

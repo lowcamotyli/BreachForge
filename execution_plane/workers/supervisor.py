@@ -12,7 +12,9 @@ from uuid import UUID, uuid4
 
 import structlog
 from redis import Redis
+from redis.exceptions import RedisError
 from rq import Queue, Worker
+from rq.exceptions import NoSuchJobError
 from rq.job import Job
 
 from control_plane.auth_manager import SessionSnapshot
@@ -26,6 +28,12 @@ logger = structlog.get_logger(__name__)
 
 class WorkerGuardrailViolation(RuntimeError):
     pass
+
+
+class WorkerCrashError(RuntimeError):
+    def __init__(self, job_id: str) -> None:
+        self.job_id = job_id
+        super().__init__(f"worker crashed while processing job {job_id}")
 
 
 @dataclass(slots=True)
@@ -100,32 +108,55 @@ class WorkerSupervisor:
         if state is None:
             return
 
-        logger.error(
-            "worker_crash_detected",
-            worker_id=worker_id,
-            queue=state.queue_name,
-            exitcode=state.process.exitcode,
-        )
+        logger.error("worker_crash_detected", worker_id=worker_id, queue=state.queue_name, exitcode=state.process.exitcode)
         self._terminate_worker(worker_id)
         self._spawn_worker(worker_id=worker_id, queue_name=state.queue_name)
+
+    def simulate_crash(self, job_id: str) -> None:
+        raise WorkerCrashError(job_id)
+
+    def run_with_retry(self, job: Job) -> object | None:
+        job_id = self._job_id(job)
+        perform = getattr(job, "perform", None)
+        if not callable(perform):
+            raise WorkerGuardrailViolation(f"job has no callable perform: {job_id}")
+        try:
+            return perform()
+        except WorkerCrashError as exc:
+            meta = getattr(job, "meta", None)
+            if meta is None:
+                job.meta = {}
+                meta = job.meta
+            if not isinstance(meta, dict):
+                raise WorkerGuardrailViolation(f"job meta is not a dict: {job_id}") from exc
+            try:
+                retries = int(meta.get("worker_crash_retries", 0))
+            except (TypeError, ValueError) as retry_exc:
+                raise WorkerGuardrailViolation(f"invalid worker crash retry count for job {job_id}") from retry_exc
+
+            logger.warning("worker_crash_detected_for_job", job_id=job_id, crash_job_id=exc.job_id, retries=retries)
+            if retries >= 1:
+                logger.error("worker_crash_retry_exhausted", job_id=job_id, retries=retries)
+                raise
+
+            meta["worker_crash_retries"] = retries + 1
+            save_meta = getattr(job, "save_meta", None)
+            if callable(save_meta):
+                save_meta()
+            queue = self._job_queue(job)
+            queue.enqueue_job(job)
+            logger.info("worker_crash_job_requeued", job_id=job_id, retries=retries + 1)
+            return None
 
     def _spawn_worker(self, worker_id: str, queue_name: str) -> None:
         process = Process(
             target=_run_worker_process,
-            kwargs={
-                "worker_id": worker_id,
-                "queue_name": queue_name,
-                "redis_url": self._redis_url,
-            },
+            kwargs={"worker_id": worker_id, "queue_name": queue_name, "redis_url": self._redis_url},
             daemon=True,
             name=f"rq-worker-{worker_id}",
         )
         process.start()
-        self._workers[worker_id] = WorkerProcessState(
-            worker_id=worker_id,
-            queue_name=queue_name,
-            process=process,
-        )
+        self._workers[worker_id] = WorkerProcessState(worker_id=worker_id, queue_name=queue_name, process=process)
         logger.info("worker_started", worker_id=worker_id, queue=queue_name, pid=process.pid)
 
     def _terminate_worker(self, worker_id: str) -> None:
@@ -141,6 +172,25 @@ class WorkerSupervisor:
         self._workers.pop(worker_id, None)
         logger.info("worker_terminated", worker_id=worker_id, queue=state.queue_name)
 
+    def _job_id(self, job: Job) -> str:
+        value = getattr(job, "id", None) or getattr(job, "job_id", None)
+        if value is None:
+            raise WorkerGuardrailViolation("job id is required")
+        return str(value)
+
+    def _job_queue(self, job: Job) -> Queue:
+        queue = getattr(job, "queue", None)
+        if queue is not None:
+            return queue
+        get_queue = getattr(job, "get_queue", None)
+        queue = get_queue() if callable(get_queue) else None
+        if queue is not None:
+            return queue
+        origin = getattr(job, "origin", None)
+        if not isinstance(origin, str) or not origin:
+            raise WorkerGuardrailViolation(f"job queue is required for retry: {self._job_id(job)}")
+        return Queue(name=origin, connection=self._redis)
+
     def _is_task_timeout_exceeded(self, worker_id: str) -> bool:
         worker_key = f"rq:worker:{worker_id}"
         current_job_id = self._redis.hget(worker_key, "current_job")
@@ -149,7 +199,7 @@ class WorkerSupervisor:
 
         try:
             job = Job.fetch(str(current_job_id), connection=self._redis)
-        except Exception as exc:
+        except (NoSuchJobError, RedisError) as exc:
             raise WorkerGuardrailViolation(
                 f"failed to load current job metadata for worker={worker_id} job={current_job_id}"
             ) from exc
@@ -233,3 +283,6 @@ def _run_worker_process(worker_id: str, queue_name: str, redis_url: str) -> None
     queue = Queue(name=queue_name, connection=connection)
     worker = Worker(queues=[queue], connection=connection, name=worker_id)
     worker.work(with_scheduler=True, logging_level="INFO")
+
+
+Supervisor = WorkerSupervisor

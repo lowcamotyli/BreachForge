@@ -11,6 +11,7 @@ os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 
 from api.main import app
 from api.routers import scans as scans_module
+from control_plane.orchestrator import PreflightResult
 from storage.db.models import AuthContext, Scan, ScanStatus, Target
 
 
@@ -87,6 +88,35 @@ class _FailingQueue:
         raise RuntimeError("queue unavailable")
 
 
+class _FakeKillRedis:
+    def get(self, key: str) -> None:
+        del key
+        return None
+
+
+def _stub_preflight(monkeypatch, result: PreflightResult | None = None) -> None:
+    async def _preflight(scan_config: object) -> PreflightResult:
+        del scan_config
+        return result or PreflightResult(
+            status="ok",
+            failures=[],
+            missing_roles=[],
+            missing_tenants=[],
+            csrf_status="ok",
+        )
+
+    monkeypatch.setattr(scans_module, "preflight_auth_check", _preflight)
+
+
+def _stub_encryption(monkeypatch) -> None:
+    class _FakeEncryption:
+        def encrypt_credential(self, plaintext: str, scan_id: UUID):
+            del plaintext, scan_id
+            return type("_Blob", (), {"encrypted_data_key": "key", "ciphertext": "cipher"})()
+
+    monkeypatch.setattr(scans_module, "EnvelopeEncryption", _FakeEncryption)
+
+
 def test_post_and_get_scan_with_mock_db_and_mock_redis(monkeypatch) -> None:
     fake_db = _FakeSession()
     fake_queue = _FakeQueue()
@@ -95,13 +125,16 @@ def test_post_and_get_scan_with_mock_db_and_mock_redis(monkeypatch) -> None:
         yield fake_db
 
     monkeypatch.setattr(scans_module, "_get_auth_bootstrap_queue", lambda: fake_queue)
+    monkeypatch.setattr(scans_module.Redis, "from_url", lambda *args, **kwargs: _FakeKillRedis())
+    _stub_preflight(monkeypatch)
+    _stub_encryption(monkeypatch)
     app.dependency_overrides[scans_module.get_db] = _override_get_db
 
     client = TestClient(app)
 
     create_payload = {
         "target_url": "https://app.example.com",
-        "auth_context": {"type": "none"},
+        "auth_context": {"type": "token", "bearer_token": "valid-token"},
     }
     create_response = client.post("/scans", json=create_payload)
 
@@ -116,6 +149,7 @@ def test_post_and_get_scan_with_mock_db_and_mock_redis(monkeypatch) -> None:
     get_body = get_response.json()
     assert get_body["id"] == scan_id
     assert get_body["status"] == "running"
+    assert create_body["warnings"] == []
     assert len(fake_queue.calls) == 1
 
     app.dependency_overrides.clear()
@@ -129,6 +163,8 @@ def test_post_unauth_scan_enqueues_recon_job(monkeypatch) -> None:
         yield fake_db
 
     monkeypatch.setattr(scans_module, "_get_recon_queue", lambda: fake_queue)
+    monkeypatch.setattr(scans_module.Redis, "from_url", lambda *args, **kwargs: _FakeKillRedis())
+    _stub_preflight(monkeypatch)
     app.dependency_overrides[scans_module.get_db] = _override_get_db
 
     client = TestClient(app)
@@ -163,6 +199,8 @@ def test_post_unauth_scan_enqueue_failure_marks_scan_failed(monkeypatch) -> None
         yield fake_db
 
     monkeypatch.setattr(scans_module, "_get_recon_queue", lambda: _FailingQueue())
+    monkeypatch.setattr(scans_module.Redis, "from_url", lambda *args, **kwargs: _FakeKillRedis())
+    _stub_preflight(monkeypatch)
     app.dependency_overrides[scans_module.get_db] = _override_get_db
 
     client = TestClient(app)
@@ -180,5 +218,83 @@ def test_post_unauth_scan_enqueue_failure_marks_scan_failed(monkeypatch) -> None
     [scan] = list(fake_db.scans.values())
     assert scan.status == ScanStatus.failed
     assert scan.phase == "failed:enqueue"
+
+    app.dependency_overrides.clear()
+
+
+def test_post_scan_invalid_session_preflight_returns_422(monkeypatch) -> None:
+    fake_db = _FakeSession()
+    fake_queue = _FakeQueue()
+
+    async def _override_get_db():
+        yield fake_db
+
+    monkeypatch.setattr(scans_module, "_get_auth_bootstrap_queue", lambda: fake_queue)
+    _stub_preflight(
+        monkeypatch,
+        PreflightResult(
+            status="failed",
+            failures=["invalid_session"],
+            missing_roles=[],
+            missing_tenants=[],
+            csrf_status="not_checked",
+        ),
+    )
+    app.dependency_overrides[scans_module.get_db] = _override_get_db
+
+    client = TestClient(app)
+    response = client.post(
+        "/scans",
+        json={
+            "target_url": "https://app.example.com",
+            "auth_context": {"type": "token", "bearer_token": "expired-token"},
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["failures"] == ["invalid_session"]
+    assert fake_db.scans == {}
+    assert fake_queue.calls == []
+
+    app.dependency_overrides.clear()
+
+
+def test_post_scan_degraded_preflight_returns_warning_and_continues(monkeypatch) -> None:
+    fake_db = _FakeSession()
+    fake_queue = _FakeQueue()
+
+    async def _override_get_db():
+        yield fake_db
+
+    monkeypatch.setattr(scans_module, "_get_auth_bootstrap_queue", lambda: fake_queue)
+    monkeypatch.setattr(scans_module.Redis, "from_url", lambda *args, **kwargs: _FakeKillRedis())
+    _stub_encryption(monkeypatch)
+    _stub_preflight(
+        monkeypatch,
+        PreflightResult(
+            status="degraded",
+            failures=[],
+            missing_roles=[],
+            missing_tenants=[],
+            csrf_status="deferred",
+        ),
+    )
+    app.dependency_overrides[scans_module.get_db] = _override_get_db
+
+    client = TestClient(app)
+    response = client.post(
+        "/scans",
+        json={
+            "target_url": "https://app.example.com",
+            "auth_context": {"type": "credential", "credentials": {"username": "alice", "password": "secret"}},
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "running"
+    assert body["warnings"][0]["code"] == "auth_preflight_degraded"
+    assert body["warnings"][0]["preflight"]["status"] == "degraded"
+    assert len(fake_queue.calls) == 1
 
     app.dependency_overrides.clear()

@@ -5,6 +5,7 @@ from dataclasses import asdict
 import json
 import os
 import random
+import re
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -15,17 +16,21 @@ import httpx
 import structlog
 from redis import Redis
 
+from api.middleware.logging import redact_for_audit
 from api.models.requests import ScanPolicy
 from control_plane.auth_manager import AuthManager, IdentityRole, SessionSnapshot
 from control_plane.rate_limiter import DomainRateLimiter
 from execution_plane.planner.decision_log import FeedbackPayload, TaskOutcome
 from execution_plane.planner.planner import rq_enqueue_replan
+from execution_plane.policy.kill_switch import KillSwitch, KillSwitchLevel
 from execution_plane.workers.behavior_profiles import BehaviorConfig, BehaviorProfile, get_profile_config
 from storage.evidence.state_store import StateSnapshot, StateStore
-from storage.db.models import AttackTask, RawProbe
+from storage.db.models import AttackTask, AuditEvent, AuditEventType, RawProbe
+from storage.db.session import AsyncSessionLocal
 
 logger = structlog.get_logger(__name__)
 _SENSITIVE_LOG_KEYS = {"authorization", "cookie", "x-auth-token", "password", "token", "x-api-key"}
+_CHAIN_EXTRACT_KEY_PATTERN = re.compile(r"(^id$|_id$|id$|token|session)", re.IGNORECASE)
 BUSINESS_LOGIC_MUTATING_CLASSES = frozenset(
     {
         "coupon_stacking",
@@ -48,10 +53,16 @@ class AuthExpiredError(RuntimeError):
 
 
 class PolicyViolationError(RuntimeError):
-    pass
+    def __init__(self, reason: str, *, policy_field: str | None = None) -> None:
+        super().__init__(reason)
+        self.policy_field = policy_field
 
 
 class KillSwitchError(RuntimeError):
+    pass
+
+
+class ProbeKilledException(Exception):
     pass
 
 
@@ -74,6 +85,8 @@ class AttackWorker:
         self._snapshot_versions: dict[tuple[str, str], int] = {}
         self._rate_limit_wait_timeout_s = max(0.0, float(os.getenv("RATE_LIMIT_WAIT_TIMEOUT_S", "15")))
         self._scan_id: UUID | None = None
+        self.scan_id: UUID | None = None
+        self._kill_switch: KillSwitch | None = None
 
     async def execute(
         self,
@@ -85,6 +98,7 @@ class AttackWorker:
         race_group_id: UUID | None = None,
         policy: ScanPolicy | None = None,
     ) -> RawProbe | None:
+        self.scan_id = task.scan_id
         self._save_state_snapshot(task=task, status="pre")
         probe_race_group_id = race_group_id
         attack_class = str(task.attack_class).strip().lower()
@@ -124,6 +138,13 @@ class AttackWorker:
             try:
                 self._check_kill_switch(self._kill_switch_redis, str(task.scan_id))
             except KillSwitchError:
+                await self._write_audit_event(
+                    scan_id=task.scan_id,
+                    event_type=AuditEventType.SCAN_KILLED,
+                    actor="kill_switch",
+                    details={"task_id": str(task.id)},
+                    redact=True,
+                )
                 logger.warning("attack_task_killed", scan_id=str(task.scan_id), attack_task_id=str(task.id))
                 return None
 
@@ -131,6 +152,14 @@ class AttackWorker:
             try:
                 self._check_policy(task, policy)
             except PolicyViolationError as exc:
+                policy_field = exc.policy_field or self._policy_field_from_reason(str(exc))
+                await self._write_audit_event(
+                    scan_id=task.scan_id,
+                    event_type=AuditEventType.POLICY_VIOLATION,
+                    actor="attack_worker",
+                    details={"task_id": str(task.id), "reason": str(exc), "policy_field": policy_field},
+                    redact=True,
+                )
                 logger.warning(
                     "attack_task_policy_blocked",
                     scan_id=str(task.scan_id),
@@ -139,20 +168,26 @@ class AttackWorker:
                 )
                 return None
 
-        try:
-            execution_session = await self._resolve_execution_session(
-                task=task,
-                provided_session=session,
-                identity_role=identity_role,
-                identity_name=identity_name,
-            )
-        except Exception:
-            self._save_state_snapshot(task=task, status="failed")
-            raise
         raw_probe: RawProbe | None = None
         result_confidence: float | None = None
         try:
             hypothesis_config = self._parse_hypothesis(hypothesis_override if hypothesis_override is not None else task.hypothesis)
+            task_identity_role, task_identity_name = self._resolve_task_identity_request(
+                task=task,
+                hypothesis_config=hypothesis_config,
+                explicit_identity_role=identity_role,
+                explicit_identity_name=identity_name,
+            )
+            try:
+                execution_session = await self._resolve_execution_session(
+                    task=task,
+                    provided_session=session,
+                    identity_role=task_identity_role,
+                    identity_name=task_identity_name,
+                )
+            except Exception:
+                self._save_state_snapshot(task=task, status="failed")
+                raise
             result_confidence = self._extract_result_confidence(hypothesis_config)
             chain_steps = hypothesis_config.get("chain_steps")
             if isinstance(chain_steps, list) and chain_steps:
@@ -161,6 +196,8 @@ class AttackWorker:
                     session=execution_session,
                     steps=chain_steps,
                     hypothesis_config=hypothesis_config,
+                    current_identity=self._identity_label(task_identity_name if task_identity_name is not None else task_identity_role),
+                    race_group_id=probe_race_group_id,
                 )
             else:
                 method = endpoint.method.upper()
@@ -217,6 +254,8 @@ class AttackWorker:
                     latency_ms=latency_ms,
                     probe_type=probe_type,
                 )
+                if probe_race_group_id is not None:
+                    raw_probe.request["_race_group_id"] = str(probe_race_group_id)
 
                 evidence_metadata: dict[str, str] = {}
                 if probe_type == "replay":
@@ -236,7 +275,7 @@ class AttackWorker:
             self._save_state_snapshot(task=task, status="failed")
             raise
 
-        if probe_race_group_id is not None:
+        if probe_race_group_id is not None and raw_probe is not None:
             raw_probe.request["_race_group_id"] = str(probe_race_group_id)
         self._maybe_enqueue_adaptive_replan(task=task, raw_probe=raw_probe, confidence=result_confidence)
 
@@ -265,7 +304,7 @@ class AttackWorker:
         )
         method = str(raw_method).upper()
         if method in {"POST", "PUT", "PATCH", "DELETE"} and not policy.mutating_allowed:
-            raise PolicyViolationError("mutating request blocked by policy")
+            raise PolicyViolationError("mutating request blocked by policy", policy_field="mutating_allowed")
 
         if policy.allowed_domains:
             target_url_hint = getattr(task, "target_url", None)
@@ -277,7 +316,16 @@ class AttackWorker:
             hostname = self._normalize_domain(urlparse(str(target_url)).hostname)
             allowed_domains = {self._normalize_domain(domain) for domain in policy.allowed_domains}
             if not hostname or hostname not in allowed_domains:
-                raise PolicyViolationError("domain not in allowed_domains")
+                raise PolicyViolationError("domain not in allowed_domains", policy_field="allowed_domains")
+
+        if not policy.oob_allowed and self._task_has_oob_markers(task):
+            raise PolicyViolationError("oob_callbacks_not_allowed", policy_field="oob_allowed")
+
+        if not policy.replay_allowed and self._task_has_replay_markers(task):
+            raise PolicyViolationError("replay_not_allowed", policy_field="replay_allowed")
+
+        if self._scan_requests_sent(str(task.scan_id)) >= policy.max_requests:
+            raise PolicyViolationError("max_requests_exceeded", policy_field="max_requests")
 
     def _check_kill_switch(self, redis: Redis, scan_id: str) -> None:
         scan_flag = redis.get(f"kill:{scan_id}")
@@ -286,6 +334,84 @@ class AttackWorker:
             isinstance(global_flag, (str, bytes)) and global_flag
         ):
             raise KillSwitchError(f"kill switch active for scan {scan_id}")
+
+    def _task_has_oob_markers(self, task: AttackTask) -> bool:
+        return self._task_contains_any_marker(task, ("oob", "callback", "burp_collaborator"))
+
+    def _task_has_replay_markers(self, task: AttackTask) -> bool:
+        return self._task_contains_any_marker(task, ("replay",))
+
+    def _task_contains_any_marker(self, task: AttackTask, markers: tuple[str, ...]) -> bool:
+        values: list[str] = []
+        attack_class = getattr(task, "attack_class", None)
+        if isinstance(attack_class, str) and attack_class.strip():
+            values.append(attack_class)
+        hypothesis = getattr(task, "hypothesis", None)
+        if isinstance(hypothesis, str) and hypothesis.strip():
+            values.append(hypothesis)
+        target_parameter = getattr(task, "target_parameter", None)
+        if isinstance(target_parameter, str) and target_parameter.strip():
+            values.append(target_parameter)
+        endpoint = getattr(task, "endpoint", None)
+        url_pattern = getattr(endpoint, "url_pattern", None)
+        if isinstance(url_pattern, str) and url_pattern.strip():
+            values.append(url_pattern)
+        haystack = " ".join(values).lower()
+        return any(marker in haystack for marker in markers)
+
+    def _scan_requests_sent(self, scan_id: str) -> int:
+        try:
+            value = self._redis.xlen(f"evidence:{scan_id}")
+        except Exception:
+            logger.exception("attack_worker_request_count_failed", scan_id=scan_id)
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    def _policy_field_from_reason(self, reason: str) -> str:
+        normalized = reason.strip().lower()
+        if normalized == "mutating request blocked by policy":
+            return "mutating_allowed"
+        if normalized == "domain not in allowed_domains":
+            return "allowed_domains"
+        if normalized == "oob_callbacks_not_allowed":
+            return "oob_allowed"
+        if normalized == "replay_not_allowed":
+            return "replay_allowed"
+        if normalized == "max_requests_exceeded":
+            return "max_requests"
+        return "unknown"
+
+    async def _write_audit_event(
+        self,
+        *,
+        scan_id: UUID,
+        event_type: AuditEventType,
+        actor: str,
+        details: dict[str, Any] | None,
+        redact: bool,
+    ) -> None:
+        payload = redact_for_audit(details) if redact and isinstance(details, dict) else details
+        try:
+            async with AsyncSessionLocal() as db:
+                db.add(
+                    AuditEvent(
+                        scan_id=scan_id,
+                        event_type=event_type,
+                        actor=actor,
+                        details=payload,
+                    )
+                )
+                await db.commit()
+        except Exception:
+            logger.exception(
+                "attack_worker_audit_event_write_failed",
+                scan_id=str(scan_id),
+                event_type=str(event_type),
+                actor=actor,
+            )
 
     async def _execute_reconciliation_probe(
         self,
@@ -691,6 +817,20 @@ class AttackWorker:
             return None
         return task.hypothesis.encode("utf-8")
 
+    def _build_chain_step_body(self, step: dict[str, Any], extracted_values: dict[str, Any]) -> bytes | None:
+        for key in ("body", "json", "data"):
+            if key not in step:
+                continue
+            rendered = self._apply_templates_to_value(step[key], extracted_values)
+            if rendered is None:
+                return None
+            if isinstance(rendered, bytes):
+                return rendered
+            if isinstance(rendered, str):
+                return rendered.encode("utf-8")
+            return json.dumps(rendered, sort_keys=True).encode("utf-8")
+        return None
+
     def _cap_blast_radius_body(self, body: bytes | str | None, *, max_bytes: int = 4096) -> str | None:
         if body is None:
             return None
@@ -710,6 +850,68 @@ class AttackWorker:
         if not isinstance(parsed, dict):
             return {}
         return parsed
+
+    def _resolve_task_identity_request(
+        self,
+        *,
+        task: AttackTask,
+        hypothesis_config: dict[str, Any],
+        explicit_identity_role: IdentityRole | str | None,
+        explicit_identity_name: str | None,
+    ) -> tuple[IdentityRole | str | None, str | None]:
+        if explicit_identity_role is not None or explicit_identity_name is not None:
+            return explicit_identity_role, explicit_identity_name
+
+        task_identity_name = getattr(task, "identity_name", None)
+        if isinstance(task_identity_name, str) and task_identity_name.strip():
+            return None, task_identity_name.strip()
+
+        task_identity_role = getattr(task, "identity_role", None)
+        if isinstance(task_identity_role, IdentityRole):
+            return task_identity_role, None
+        if isinstance(task_identity_role, str) and task_identity_role.strip():
+            return task_identity_role.strip(), None
+
+        hypothesis_identity_name = hypothesis_config.get("identity_name")
+        if isinstance(hypothesis_identity_name, str) and hypothesis_identity_name.strip():
+            return None, hypothesis_identity_name.strip()
+
+        hypothesis_identity_role = hypothesis_config.get("identity_role")
+        if isinstance(hypothesis_identity_role, str) and hypothesis_identity_role.strip():
+            return hypothesis_identity_role.strip(), None
+
+        identity_selector = hypothesis_config.get("identity_selector")
+        if isinstance(identity_selector, str) and identity_selector.strip():
+            selected = identity_selector.strip()
+            if selected == "anonymous" or self._auth_manager is not None:
+                return None, selected
+
+        return None, None
+
+    def _identity_request_from_step(self, step: dict[str, Any]) -> tuple[IdentityRole | str | None, str | None]:
+        identity_name = step.get("identity_name")
+        if isinstance(identity_name, str) and identity_name.strip():
+            return None, identity_name.strip()
+
+        identity_role = step.get("identity_role")
+        if isinstance(identity_role, str) and identity_role.strip():
+            return identity_role.strip(), None
+
+        identity_selector = step.get("identity_selector")
+        if isinstance(identity_selector, str) and identity_selector.strip():
+            selected = identity_selector.strip()
+            if selected == "anonymous" or self._auth_manager is not None:
+                return None, selected
+
+        return None, None
+
+    def _identity_label(self, value: IdentityRole | str | None) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, IdentityRole):
+            return value.value
+        text = str(value).strip()
+        return text or None
 
     def _extract_result_confidence(self, hypothesis_config: dict[str, Any]) -> float | None:
         raw_confidence = hypothesis_config.get("confidence")
@@ -806,6 +1008,11 @@ class AttackWorker:
         cookies: httpx.Cookies | None = None,
         params: dict[str, Any] | None = None,
     ) -> tuple[httpx.Request, httpx.Response, int]:
+        # Check kill switch before each probe (kill switch takes priority over retry/replan)
+        if hasattr(self, "_kill_switch") and self._kill_switch is not None:
+            _ = KillSwitchLevel
+            if self.scan_id is not None and self._kill_switch.is_active(str(self.scan_id)):
+                raise ProbeKilledException(f"Scan {self.scan_id} killed via kill switch")
         if self._behavior_config.request_delay_ms > 0:
             await asyncio.sleep(self._behavior_config.request_delay_ms / 1000)
         if headers is None and params is None and cookies is None:
@@ -864,12 +1071,22 @@ class AttackWorker:
             },
         )
 
+    def _response_payload(self, response: httpx.Response, latency_ms: int) -> dict[str, Any]:
+        return {
+            "status": response.status_code,
+            "headers": dict(response.headers),
+            "body": self._cap_blast_radius_body(response.text),
+            "latency_ms": latency_ms,
+        }
+
     async def _execute_chain_steps(
         self,
         task: AttackTask,
         session: SessionSnapshot,
         steps: list[Any],
         hypothesis_config: dict[str, Any],
+        current_identity: str | None = None,
+        race_group_id: UUID | None = None,
     ) -> RawProbe:
         endpoint = task.endpoint
         if endpoint is None:
@@ -877,8 +1094,11 @@ class AttackWorker:
 
         worker_id = self._worker_id()
         allowed_domains = self._resolve_allowed_domains(task)
-        carried_values: dict[str, Any] = {}
+        extracted_values: dict[str, Any] = {}
         chain_entries: list[dict[str, Any]] = []
+        read_probe_responses: list[dict[str, Any]] = []
+        active_session = session
+        active_identity = current_identity
 
         last_request: httpx.Request | None = None
         last_response: httpx.Response | None = None
@@ -890,9 +1110,22 @@ class AttackWorker:
                 if not isinstance(step, dict):
                     continue
 
+                step_identity_role, step_identity_name = self._identity_request_from_step(step)
+                requested_identity = self._identity_label(
+                    step_identity_name if step_identity_name is not None else step_identity_role
+                )
+                if requested_identity is not None and requested_identity != active_identity:
+                    active_session = await self._resolve_execution_session(
+                        task=task,
+                        provided_session=active_session,
+                        identity_role=step_identity_role,
+                        identity_name=step_identity_name,
+                    )
+                    active_identity = requested_identity
+
                 method = str(step.get("method") or endpoint.method).upper()
                 step_url = str(step.get("url_pattern") or endpoint.url_pattern)
-                url = self._apply_value_templates(step_url, carried_values)
+                url = self._apply_value_templates(step_url, extracted_values)
                 probe_type = step.get("probe_type")
                 identity_selector = step.get("identity_selector")
                 last_probe_type = probe_type
@@ -913,12 +1146,12 @@ class AttackWorker:
                 await self._apply_timing_profile(hypothesis_config.get("timing_profile"))
 
                 headers = self._build_probe_headers(
-                    session=session,
+                    session=active_session,
                     probe_type=probe_type,
                     identity_selector=identity_selector if isinstance(identity_selector, str) else None,
                 )
                 cookies = self._build_probe_cookies(
-                    session=session,
+                    session=active_session,
                     probe_type=probe_type,
                     identity_selector=identity_selector if isinstance(identity_selector, str) else None,
                 )
@@ -926,8 +1159,10 @@ class AttackWorker:
                 if isinstance(extra_headers, dict):
                     for key, value in extra_headers.items():
                         if isinstance(key, str):
-                            headers[key] = self._apply_value_templates(str(value), carried_values)
-                for key, value in carried_values.items():
+                            headers[key] = self._apply_value_templates(str(value), extracted_values)
+                for key, value in extracted_values.items():
+                    if self._is_sensitive_chain_key(key):
+                        continue
                     header_name = f"X-Chain-{key}"
                     headers.setdefault(header_name, str(value))
 
@@ -936,14 +1171,18 @@ class AttackWorker:
                 if isinstance(step_params, dict):
                     for key, value in step_params.items():
                         if isinstance(key, str):
-                            params_payload[key] = self._apply_value_templates(str(value), carried_values)
-                for key, value in carried_values.items():
+                            params_payload[key] = self._apply_value_templates(str(value), extracted_values)
+                for key, value in extracted_values.items():
+                    if self._is_sensitive_chain_key(key):
+                        continue
                     params_payload.setdefault(key, str(value))
 
+                request_body = self._build_chain_step_body(step, extracted_values)
                 request, response, latency_ms = await self._send_request(
                     client=client,
                     method=method,
                     url=url,
+                    content=request_body,
                     headers=headers,
                     cookies=cookies,
                     params=params_payload or None,
@@ -953,17 +1192,13 @@ class AttackWorker:
                 last_latency_ms = latency_ms
 
                 chain_entry = {"chain_step": idx, "probe_type": probe_type}
+                if active_identity is not None:
+                    chain_entry["identity_role"] = active_identity
                 if probe_type == "replay":
                     chain_entry["reused_token"] = True
                 mutation_class = self._mutation_class_for_probe_type(probe_type)
                 if mutation_class is not None:
                     chain_entry["mutation_class"] = mutation_class
-                chain_entries.append(chain_entry)
-                logger.info(
-                    "attack_probe_chain_entry",
-                    attack_task_id=str(task.id),
-                    entry=self._strip_sensitive(chain_entry),
-                )
 
                 extract_spec = step.get("extract")
                 if isinstance(extract_spec, dict):
@@ -973,7 +1208,40 @@ class AttackWorker:
                             continue
                         extracted = self._extract_json_path(response_json, path)
                         if extracted is not None:
-                            carried_values[key] = extracted
+                            extracted_values[key] = extracted
+                extracted_values.update(self._extract_patterned_json_values(self._response_json(response)))
+                if extracted_values:
+                    chain_entry["extracted_keys"] = sorted(extracted_values.keys())
+
+                if method in DomainRateLimiter.MUTATING_METHODS:
+                    await self._enforce_rate_limit(scan_id=str(task.scan_id), domain=domain, method="GET", worker_id=worker_id)
+                    read_request, read_response, read_latency_ms = await self._send_request(
+                        client=client,
+                        method="GET",
+                        url=url,
+                        headers=headers,
+                        cookies=cookies,
+                        params=params_payload or None,
+                    )
+                    read_probe_response = self._response_payload(read_response, read_latency_ms)
+                    read_probe_responses.append(
+                        {
+                            "chain_step": idx,
+                            "request": {
+                                "method": read_request.method,
+                                "url": str(read_request.url),
+                            },
+                            "response": read_probe_response,
+                        }
+                    )
+                    chain_entry["read_probe_response"] = read_probe_response
+
+                chain_entries.append(chain_entry)
+                logger.info(
+                    "attack_probe_chain_entry",
+                    attack_task_id=str(task.id),
+                    entry=self._strip_sensitive(chain_entry),
+                )
 
         if last_request is None or last_response is None:
             raise GuardrailViolation(f"No executable chain step found for task {task.id}")
@@ -986,6 +1254,15 @@ class AttackWorker:
             latency_ms=last_latency_ms,
             probe_type=last_probe_type,
         )
+        if extracted_values:
+            raw_probe.response["extracted_values"] = {
+                key: "[REDACTED]" if self._is_sensitive_chain_key(key) else value
+                for key, value in extracted_values.items()
+            }
+        if read_probe_responses:
+            raw_probe.response["read_probe_responses"] = read_probe_responses
+        if race_group_id is not None:
+            raw_probe.request["_race_group_id"] = str(race_group_id)
         chain_metadata: dict[str, str] = {
             "chain_id": f"{task.id}_chain",
             "chain_entries": json.dumps(chain_entries),
@@ -1030,11 +1307,48 @@ class AttackWorker:
             return None
         return current
 
+    def _extract_patterned_json_values(self, payload: Any) -> dict[str, Any]:
+        extracted: dict[str, Any] = {}
+
+        def _walk(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if isinstance(key, str) and _CHAIN_EXTRACT_KEY_PATTERN.search(key) and self._is_scalar_chain_value(item):
+                        extracted.setdefault(key, item)
+                    _walk(item)
+                return
+            if isinstance(value, list):
+                for item in value:
+                    _walk(item)
+
+        _walk(payload)
+        return extracted
+
+    def _is_scalar_chain_value(self, value: Any) -> bool:
+        return isinstance(value, (str, int, float, bool)) and value not in ("", None)
+
     def _apply_value_templates(self, value: str, carried_values: dict[str, Any]) -> str:
         resolved = value
         for key, item in carried_values.items():
             resolved = resolved.replace("{" + key + "}", str(item))
+            resolved = resolved.replace("{extracted." + key + "}", str(item))
         return resolved
+
+    def _apply_templates_to_value(self, value: Any, extracted_values: dict[str, Any]) -> Any:
+        if isinstance(value, str):
+            return self._apply_value_templates(value, extracted_values)
+        if isinstance(value, list):
+            return [self._apply_templates_to_value(item, extracted_values) for item in value]
+        if isinstance(value, dict):
+            return {
+                str(key): self._apply_templates_to_value(item, extracted_values)
+                for key, item in value.items()
+            }
+        return value
+
+    def _is_sensitive_chain_key(self, key: str) -> bool:
+        lowered = key.lower()
+        return lowered in _SENSITIVE_LOG_KEYS or any(token in lowered for token in ("token", "session", "secret", "password"))
 
     def _to_httpx_cookies(self, cookies: list[dict[str, Any]]) -> httpx.Cookies:
         jar = httpx.Cookies()

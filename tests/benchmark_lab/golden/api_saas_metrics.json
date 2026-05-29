@@ -1,0 +1,26 @@
+{
+  "attack_classes": [
+    "BOLA",
+    "BFLA",
+    "TENANT_ISOLATION",
+    "MASS_ASSIGNMENT",
+    "HIDDEN_ENDPOINT"
+  ],
+  "coverage": 0.0,
+  "coverage_by_attack_class": {
+    "BFLA": 0.0,
+    "BOLA": 0.0,
+    "HIDDEN_ENDPOINT": 0.0,
+    "MASS_ASSIGNMENT": 0.0,
+    "TENANT_ISOLATION": 0.0
+  },
+  "fn": 5,
+  "fp": 0,
+  "ground_truth_count": 5,
+  "lab_id": "api_saas",
+  "lab_version": "1.0.0",
+  "max_fp": 0,
+  "min_coverage": 0.0,
+  "mode": "quick",
+  "tp": 0
+}

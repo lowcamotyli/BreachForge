@@ -1,0 +1,39 @@
+name: BreachForge Security Scan
+description: Run BreachForge security scan in CI
+inputs:
+  target:
+    required: true
+    description: Target URL to scan
+  gate_config:
+    required: false
+    default: .breachforge.yml
+    description: Gate policy file
+  api_url:
+    required: false
+    default: "http://localhost:8000"
+  api_token:
+    required: true
+    description: BreachForge API token (secret)
+runs:
+  using: composite
+  steps:
+    - name: Install BreachForge
+      shell: bash
+      run: pip install -e . --quiet
+    - name: Run scan
+      shell: bash
+      env:
+        BREACHFORGE_API_URL: ${{ inputs.api_url }}
+        BREACHFORGE_TOKEN: ${{ inputs.api_token }}
+      run: |
+        breachforge scan run \
+          --target "${{ inputs.target }}" \
+          --gate "${{ inputs.gate_config }}" \
+          --timeout 600
+    - name: Upload report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: breachforge-report
+        path: breachforge-report.json
+        if-no-files-found: ignore

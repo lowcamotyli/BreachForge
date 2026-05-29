@@ -1,3 +1,4 @@
+# DEV ONLY — contains LocalStack and hardcoded credentials. Use docker-compose.prod.yml for production.
 services:
   postgres:
     image: postgres:16

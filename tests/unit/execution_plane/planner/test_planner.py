@@ -137,13 +137,7 @@ def test_filter_tasks_blocks_mutating() -> None:
     allowed, skipped = filter_tasks_by_policy([task], ScanPolicy(mutating_allowed=False))
 
     assert allowed == []
-    assert skipped == [
-        {
-            "task_id": str(task.id),
-            "reason": "mutating method POST blocked by policy",
-            "attack_class": "mass_assignment",
-        }
-    ]
+    assert skipped == [(task, "mutating_allowed")]
 
 
 def test_filter_tasks_allows_get() -> None:

@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import os
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, TypeAlias
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, TypeAlias, TypedDict
 from uuid import UUID
 
 import httpx
@@ -38,15 +39,21 @@ logger = structlog.get_logger(__name__)
 
 __all__ = [
     "AuthManager",
+    "AuthRecorder",
+    "AuthSnapshot",
+    "AuthCoverageMetrics",
     "BrowserSessionImporter",
     "IdentityRole",
     "IdentityContext",
+    "IdentityFailure",
+    "IdentityHealthMatrix",
     "IdentityProfile",
     "IdentityMatrix",
     "SessionSnapshot",
 ]
 
 AUTH_STATE_VALUES = {"active", "expired", "none"}
+IdentityFailureReason: TypeAlias = Literal["expired", "missing", "forbidden", "csrf_failed", "refresh_failed"]
 
 
 @dataclass(slots=True)
@@ -64,6 +71,142 @@ class IdentityProfile:
 
 
 IdentityMatrix: TypeAlias = dict[str, IdentityProfile]
+
+
+class AuthCoverageMetrics(TypedDict):
+    session_valid_count: int
+    role_count: int
+    tenant_count: int
+    health_check_pass_rate: float
+
+
+@dataclass(slots=True)
+class AuthSnapshot:
+    url: str
+    cookies: dict[str, str]
+    storage: dict[str, Any]
+    headers: dict[str, str]
+    probed_at: datetime
+    probe_success: bool
+
+
+class AuthRecorder:
+    _ALLOWED_HEADERS = {"authorization", "cookie", "x-csrf-token"}
+
+    def record_session(
+        self,
+        target_url: str,
+        cookies: dict[str, Any],
+        storage: dict[str, Any],
+        headers: dict[str, Any],
+    ) -> AuthSnapshot:
+        snapshot = AuthSnapshot(
+            url=target_url,
+            cookies={str(key): str(value) for key, value in cookies.items()},
+            storage=deepcopy(storage),
+            headers=self._filter_auth_headers(headers),
+            probed_at=datetime.now(UTC),
+            probe_success=False,
+        )
+        snapshot.probe_success = self.verify_auth_probe(snapshot)
+        return snapshot
+
+    def verify_auth_probe(self, snapshot: AuthSnapshot) -> bool:
+        request_headers = dict(snapshot.headers)
+        snapshot.probed_at = datetime.now(UTC)
+        try:
+            with httpx.Client(timeout=15.0, follow_redirects=True, max_redirects=5) as client:
+                response = client.get(snapshot.url, headers=request_headers, cookies=snapshot.cookies)
+        except httpx.HTTPError:
+            snapshot.probe_success = False
+            return False
+
+        snapshot.probe_success = response.status_code not in {401, 403}
+        return snapshot.probe_success
+
+    def _filter_auth_headers(self, headers: dict[str, Any]) -> dict[str, str]:
+        return {
+            str(key): str(value)
+            for key, value in headers.items()
+            if str(key).lower() in self._ALLOWED_HEADERS and value is not None
+        }
+
+
+@dataclass(slots=True)
+class IdentityFailure:
+    identity_id: str
+    reason: IdentityFailureReason
+    timestamp: datetime
+
+
+class IdentityHealthMatrix:
+    def __init__(self) -> None:
+        self._role_stats: dict[str, dict[str, int]] = {}
+        self._tenant_stats: dict[str, dict[str, int]] = {}
+        self._role_markers: list[str] = []
+        self._tenant_markers: list[str] = []
+
+    def record_probe(self, identity: IdentityContext, success: bool, status_code: int) -> None:
+        role_marker = identity.role.value if isinstance(identity.role, IdentityRole) else str(identity.role)
+        role_marker = role_marker.strip()
+        if role_marker:
+            self._record_marker(self._role_markers, role_marker)
+            self._record_stats(self._role_stats, role_marker, success=success, status_code=status_code)
+
+        tenant_marker = (identity.tenant_hint or "").strip()
+        if tenant_marker:
+            self._record_marker(self._tenant_markers, tenant_marker)
+            self._record_stats(self._tenant_stats, tenant_marker, success=success, status_code=status_code)
+
+    @property
+    def summary(self) -> dict[str, Any]:
+        return {
+            "per_role": self._summarize_stats(self._role_stats),
+            "per_tenant": self._summarize_stats(self._tenant_stats),
+            "role_markers": list(self._role_markers),
+            "tenant_markers": list(self._tenant_markers),
+        }
+
+    def _record_marker(self, markers: list[str], marker: str) -> None:
+        if marker not in markers:
+            markers.append(marker)
+
+    def _record_stats(
+        self,
+        stats_by_marker: dict[str, dict[str, int]],
+        marker: str,
+        *,
+        success: bool,
+        status_code: int,
+    ) -> None:
+        stats = stats_by_marker.setdefault(
+            marker,
+            {"total_probes": 0, "successful_probes": 0, "failed_probes": 0, "degraded_probes": 0},
+        )
+        stats["total_probes"] += 1
+        if success:
+            stats["successful_probes"] += 1
+            return
+
+        stats["failed_probes"] += 1
+        if status_code >= 500:
+            stats["degraded_probes"] += 1
+
+    def _summarize_stats(self, stats_by_marker: dict[str, dict[str, int]]) -> dict[str, dict[str, float | int]]:
+        summary: dict[str, dict[str, float | int]] = {}
+        for marker, stats in stats_by_marker.items():
+            total_probes = stats["total_probes"]
+            successful_probes = stats["successful_probes"]
+            degraded_probes = stats["degraded_probes"]
+            summary[marker] = {
+                "pass_rate": successful_probes / total_probes if total_probes else 0.0,
+                "failed_rate": stats["failed_probes"] / total_probes if total_probes else 0.0,
+                "degraded_rate": degraded_probes / total_probes if total_probes else 0.0,
+                "total_probes": total_probes,
+                "failed_probes": stats["failed_probes"],
+                "degraded_probes": degraded_probes,
+            }
+        return summary
 
 
 class AuthPauseRequiredError(RuntimeError):
@@ -236,6 +379,8 @@ class IdentityContext:
     tenant_hint: str | None = None
     auth_state: str = "active"
     expires_at: datetime | None = None
+    refresh_url: str | None = None
+    login_recipe: dict[str, Any] | None = None
     active: bool = True
 
     def to_session_snapshot(self) -> SessionSnapshot:
@@ -250,6 +395,10 @@ class IdentityContext:
 
 
 class AuthManager:
+    _REFRESH_MAX_RETRIES = 3
+    _REFRESH_BACKOFF_SECONDS = 2
+    _EXPIRY_SOON_WINDOW = timedelta(minutes=2)
+
     def __init__(
         self,
         scan_id: UUID,
@@ -272,6 +421,10 @@ class AuthManager:
         self._auth_type: str = "none"
         self._auth_input: AuthContextCreate | None = None
         self._health_task: asyncio.Task[None] | None = None
+        self._identity_failures: list[IdentityFailure] = []
+        self._health_check_results: list[bool] = []
+        self.identity_health_matrix = IdentityHealthMatrix()
+        self._last_refresh_status_code: int = 0
 
     async def bootstrap(self, auth_input: AuthContextCreate) -> AuthContext:
         try:
@@ -356,21 +509,26 @@ class AuthManager:
         try:
             ok = await self._probe_authenticated_endpoint()
         except Exception:
+            self._record_health_check_result(False)
             await self._pause_with_error("auth_expired:health_check_failed")
             return False
 
         if ok:
+            self._record_health_check_result(True)
             return True
 
         try:
             refreshed = await self._attempt_refresh()
         except Exception:
+            self._record_health_check_result(False)
             await self._pause_with_error("auth_expired:refresh_failed")
             return False
 
         if refreshed:
+            self._record_health_check_result(True)
             return True
 
+        self._record_health_check_result(False)
         await self._pause_with_error("auth_expired")
         return False
 
@@ -394,6 +552,8 @@ class AuthManager:
                 if identity_context is None:
                     identity_context = self._named_identities.get(role)
             if identity_context is None:
+                identity_id = role.value if isinstance(role, IdentityRole) else str(role)
+                self._record_identity_failure(identity_id=identity_id, reason="missing")
                 raise RuntimeError(f"Identity context is not initialized for role={role}")
             return deepcopy(identity_context)
 
@@ -409,31 +569,62 @@ class AuthManager:
                 self._identity_contexts = self._build_identity_contexts(self._session_snapshot)
 
             self._ensure_minimum_active_identities()
-            active = [deepcopy(identity) for identity in self._identity_contexts.values() if identity.active]
-            for identity in self._named_identities.values():
+            active: list[IdentityContext] = []
+            for identity in self._identity_contexts.values():
+                identity_id = identity.role.value if isinstance(identity.role, IdentityRole) else str(identity.role)
+                if identity.active:
+                    active.append(deepcopy(identity))
+                    continue
+                reason: IdentityFailureReason = "expired" if identity.auth_state == "expired" else "missing"
+                self._record_identity_failure(identity_id=identity_id, reason=reason)
+            for identity_name, identity in self._named_identities.items():
                 if identity.auth_state == "active":
                     active.append(deepcopy(identity))
+                    continue
+                reason = "expired" if identity.auth_state == "expired" else "missing"
+                self._record_identity_failure(identity_id=identity_name, reason=reason)
             return active
 
     async def bootstrap_identities(self, identities: list[IdentityReference]) -> IdentityMatrix:
         matrix: IdentityMatrix = {}
         for identity in identities:
+            identity_id = identity.name
             auth_context = identity.auth_context
-            if auth_context.type == "session":
-                snapshot = self._from_cookies(auth_context)
-            elif auth_context.type == "token":
-                snapshot = self._from_bearer(auth_context)
-            elif auth_context.type == "credential":
-                snapshot = await self._playwright_login(auth_context)
-            elif auth_context.type == "none":
-                snapshot = self._empty_snapshot()
-            else:
+            if auth_context.type not in {"session", "token", "credential", "none"}:
+                self._record_identity_failure(identity_id=identity_id, reason="missing")
+                continue
+            if auth_context.type == "token" and not auth_context.bearer_token:
+                self._record_identity_failure(identity_id=identity_id, reason="missing")
+                continue
+            if auth_context.type == "session" and not auth_context.cookies:
+                self._record_identity_failure(identity_id=identity_id, reason="missing")
+                continue
+            if auth_context.type in {"session", "credential"} and auth_context.type != "none":
+                csrf_tokens = self._csrf_tokens_from_cookies(auth_context.cookies or [])
+                if auth_context.type == "session" and auth_context.cookies and not csrf_tokens:
+                    self._record_identity_failure(identity_id=identity_id, reason="csrf_failed")
+                    continue
+
+            try:
+                if auth_context.type == "session":
+                    snapshot = self._from_cookies(auth_context)
+                elif auth_context.type == "token":
+                    snapshot = self._from_bearer(auth_context)
+                elif auth_context.type == "credential":
+                    snapshot = await self._playwright_login(auth_context)
+                else:
+                    snapshot = self._empty_snapshot()
+            except Exception:
+                self._record_identity_failure(identity_id=identity_id, reason="refresh_failed")
                 continue
 
             role = IdentityRole.user
             if identity.role_hint is not None:
                 with contextlib.suppress(ValueError):
                     role = IdentityRole(identity.role_hint)
+                if identity.role_hint != role.value:
+                    self._record_identity_failure(identity_id=identity_id, reason="forbidden")
+                    continue
 
             context = IdentityContext(
                 scan_id=self._scan_id,
@@ -446,6 +637,11 @@ class AuthManager:
                 tenant_hint=identity.tenant_hint,
                 auth_state="active",
                 expires_at=snapshot.expires_at,
+                refresh_url=auth_context.login_recipe.get("refresh_url")
+                if isinstance(auth_context.login_recipe, dict)
+                and isinstance(auth_context.login_recipe.get("refresh_url"), str)
+                else None,
+                login_recipe=deepcopy(auth_context.login_recipe) if isinstance(auth_context.login_recipe, dict) else None,
                 active=True,
             )
             async with self._lock:
@@ -484,9 +680,17 @@ class AuthManager:
                         if response.status_code == 405:
                             response = await client.get(self._authenticated_probe_url, headers=headers)
                         is_healthy = response.status_code not in {401, 403} and response.status_code < 500
+                        if response.status_code == 401:
+                            self._record_identity_failure(identity_id=identity_name, reason="expired")
+                        elif response.status_code == 403:
+                            self._record_identity_failure(identity_id=identity_name, reason="forbidden")
                     except httpx.HTTPError:
+                        self._record_identity_failure(identity_id=identity_name, reason="refresh_failed")
                         is_healthy = False
+                else:
+                    self._record_identity_failure(identity_id=identity_name, reason="missing")
                 results[identity_name] = is_healthy
+                self._record_health_check_result(is_healthy)
 
                 if not is_healthy:
                     async with self._lock:
@@ -496,10 +700,65 @@ class AuthManager:
                             live_identity.active = False
         return results
 
+    async def get_identity_failures(self) -> list[IdentityFailure]:
+        async with self._lock:
+            return deepcopy(self._identity_failures)
+
+    @property
+    def session_valid_count(self) -> int:
+        failed_identity_ids = self._failed_identity_ids()
+        return sum(
+            1
+            for identity_id, identity in self._iter_metric_identities()
+            if identity_id not in failed_identity_ids and self._identity_has_active_session(identity)
+        )
+
+    @property
+    def role_count(self) -> int:
+        roles: set[str] = set()
+        for _, identity in self._iter_metric_identities():
+            role = identity.role.value if isinstance(identity.role, IdentityRole) else str(identity.role)
+            role = role.strip()
+            if role:
+                roles.add(role)
+        return len(roles)
+
+    @property
+    def tenant_count(self) -> int:
+        tenants: set[str] = set()
+        for _, identity in self._iter_metric_identities():
+            tenant_id = self._tenant_id_for_metrics(identity)
+            if tenant_id is not None:
+                tenants.add(tenant_id)
+        return len(tenants)
+
+    @property
+    def health_check_pass_rate(self) -> float:
+        if not self._health_check_results:
+            return 0.0
+        passed = sum(1 for result in self._health_check_results if result)
+        return passed / len(self._health_check_results)
+
+    def get_auth_coverage_metrics(self) -> AuthCoverageMetrics:
+        return {
+            "session_valid_count": self.session_valid_count,
+            "role_count": self.role_count,
+            "tenant_count": self.tenant_count,
+            "health_check_pass_rate": self.health_check_pass_rate,
+        }
+
     async def _set_snapshot(self, snapshot: SessionSnapshot, auth_input: AuthContextCreate) -> None:
         async with self._lock:
             self._session_snapshot = deepcopy(snapshot)
             self._identity_contexts = self._build_identity_contexts(snapshot)
+            refresh_url = None
+            if isinstance(auth_input.login_recipe, dict):
+                raw_refresh_url = auth_input.login_recipe.get("refresh_url")
+                if isinstance(raw_refresh_url, str):
+                    refresh_url = raw_refresh_url
+            for identity in self._identity_contexts.values():
+                identity.login_recipe = deepcopy(auth_input.login_recipe) if isinstance(auth_input.login_recipe, dict) else None
+                identity.refresh_url = refresh_url
             self._auth_type = auth_input.type
             self._auth_input = auth_input.model_copy(deep=True)
 
@@ -634,20 +893,234 @@ class AuthManager:
             try:
                 ok = await self._probe_authenticated_endpoint()
                 if ok:
+                    self._record_health_check_result(True)
                     continue
 
-                refreshed = await self._attempt_refresh()
+                refreshed = await self._refresh_expired_or_expiring_identities()
                 if not refreshed:
+                    refreshed = await self._attempt_refresh()
+                if not refreshed:
+                    self._mark_default_identity_stale()
+                    self._record_health_check_result(False)
                     await self._pause_with_error("auth_expired")
                     return
+                self._record_health_check_result(True)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self._record_health_check_result(False)
                 await self._pause_with_error(f"auth_health_check_failed:{type(exc).__name__}:{exc}")
                 return
 
+    async def _refresh_expired_or_expiring_identities(self) -> bool:
+        async with self._lock:
+            identities = {key: deepcopy(value) for key, value in self._identity_contexts.items() if value.active}
+
+        now = datetime.now(UTC)
+        refreshed_any = False
+        for identity_key, identity in identities.items():
+            if identity.role == IdentityRole.anon:
+                continue
+
+            snapshot = identity.to_session_snapshot()
+            predicted_expiry = self.predict_expiry(snapshot)
+            if predicted_expiry is None or predicted_expiry > (now + self._EXPIRY_SOON_WINDOW):
+                continue
+
+            refreshed = await self._attempt_identity_refresh(identity_key, identity)
+            refreshed_any = refreshed_any or refreshed
+        return refreshed_any
+
+    async def _attempt_identity_refresh(self, identity_key: IdentityRole | str, identity: IdentityContext) -> bool:
+        for attempt in range(1, self._REFRESH_MAX_RETRIES + 1):
+            refreshed_snapshot: SessionSnapshot | None = None
+            if identity.refresh_url:
+                refreshed_snapshot = self.refresh_bearer(identity)
+                self.identity_health_matrix.record_probe(
+                    identity,
+                    success=refreshed_snapshot is not None,
+                    status_code=self._last_refresh_status_code,
+                )
+            elif identity.login_recipe:
+                refreshed_snapshot = self.relogin_cookie(identity)
+                self.identity_health_matrix.record_probe(
+                    identity,
+                    success=refreshed_snapshot is not None,
+                    status_code=self._last_refresh_status_code,
+                )
+
+            if refreshed_snapshot is not None:
+                await self._update_identity_from_snapshot(identity_key, refreshed_snapshot)
+                self._log_refresh_attempt(identity, attempt, True, self._last_refresh_status_code)
+                return True
+
+            self._log_refresh_attempt(identity, attempt, False, self._last_refresh_status_code)
+            if attempt < self._REFRESH_MAX_RETRIES:
+                await asyncio.sleep(self._REFRESH_BACKOFF_SECONDS)
+        return False
+
+    async def _update_identity_from_snapshot(
+        self,
+        identity_key: IdentityRole | str,
+        snapshot: SessionSnapshot,
+    ) -> None:
+        async with self._lock:
+            identity = self._identity_contexts.get(identity_key)
+            if identity is None:
+                return
+            identity.cookies = deepcopy(snapshot.cookies) if isinstance(snapshot.cookies, list) else []
+            identity.auth_headers = deepcopy(snapshot.auth_headers)
+            identity.csrf_tokens = deepcopy(snapshot.csrf_tokens)
+            identity.captured_at = snapshot.captured_at
+            identity.expires_at = self.predict_expiry(snapshot)
+            identity.auth_state = "active"
+            identity.active = True
+
+    def _mark_default_identity_stale(self) -> None:
+        identity = self._identity_contexts.get(IdentityRole.user)
+        if identity is None:
+            return
+        identity.auth_state = "expired"
+        identity.active = False
+
+    def predict_expiry(self, snapshot: SessionSnapshot) -> datetime | None:
+        if snapshot.expires_at is not None:
+            return snapshot.expires_at
+
+        authorization = snapshot.auth_headers.get("Authorization", "")
+        if not authorization.lower().startswith("bearer "):
+            return None
+        token = authorization.split(" ", 1)[1].strip()
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        try:
+            payload_segment = parts[1]
+            payload_segment += "=" * (-len(payload_segment) % 4)
+            payload_raw = base64.urlsafe_b64decode(payload_segment.encode("utf-8")).decode("utf-8")
+            payload = json.loads(payload_raw)
+        except Exception:
+            return None
+
+        exp = payload.get("exp")
+        if not isinstance(exp, (int, float)):
+            return None
+        return datetime.fromtimestamp(exp, tz=UTC)
+
+    def refresh_bearer(self, identity: IdentityContext) -> SessionSnapshot | None:
+        self._last_refresh_status_code = 0
+        refresh_url = (identity.refresh_url or "").strip()
+        authorization = identity.auth_headers.get("Authorization", "")
+        if not refresh_url or not authorization:
+            return None
+
+        token = authorization.split(" ", 1)[1].strip() if " " in authorization else authorization.strip()
+        refresh_logger = logger.bind(
+            scan_id=str(self._scan_id),
+            identity=identity.name or identity.role.value,
+            refresh_url=refresh_url,
+            token_prefix=self._redact_token_prefix(token),
+        )
+        refresh_logger.info("auth_refresh_bearer_attempt")
+        try:
+            with httpx.Client(timeout=15.0, follow_redirects=True, max_redirects=5) as client:
+                response = client.post(
+                    refresh_url,
+                    headers={"Authorization": authorization},
+                    json={"token": token},
+                )
+        except httpx.HTTPError:
+            return None
+
+        self._last_refresh_status_code = response.status_code
+        if response.status_code >= 400:
+            return None
+
+        payload = response.json() if response.content else {}
+        if not isinstance(payload, dict):
+            return None
+
+        refreshed_token = payload.get("access_token") or payload.get("token")
+        if not isinstance(refreshed_token, str) or not refreshed_token.strip():
+            return None
+
+        snapshot = identity.to_session_snapshot()
+        snapshot.auth_headers["Authorization"] = f"Bearer {refreshed_token.strip()}"
+        snapshot.captured_at = datetime.now(UTC)
+        snapshot.expires_at = self.predict_expiry(snapshot)
+        return snapshot
+
+    def relogin_cookie(self, identity: IdentityContext) -> SessionSnapshot | None:
+        self._last_refresh_status_code = 0
+        recipe = identity.login_recipe or {}
+        if not isinstance(recipe, dict):
+            return None
+        url = recipe.get("url")
+        credentials = recipe.get("credentials")
+        if not isinstance(url, str) or not url.strip() or not isinstance(credentials, dict):
+            return None
+
+        relogin_logger = logger.bind(
+            scan_id=str(self._scan_id),
+            identity=identity.name or identity.role.value,
+            login_url=url,
+            credential_keys=sorted(str(key) for key in credentials.keys()),
+        )
+        relogin_logger.info("auth_relogin_cookie_attempt")
+        try:
+            with httpx.Client(timeout=15.0, follow_redirects=True, max_redirects=5) as client:
+                response = client.post(url, data=credentials)
+        except httpx.HTTPError:
+            return None
+        self._last_refresh_status_code = response.status_code
+        if response.status_code >= 400:
+            return None
+
+        snapshot = identity.to_session_snapshot()
+        snapshot.cookies = [
+            {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path,
+            }
+            for cookie in response.cookies.jar
+        ]
+        snapshot.captured_at = datetime.now(UTC)
+        snapshot.expires_at = self._infer_expiry_from_cookies(snapshot.cookies)
+        return snapshot
+
+    def renew_csrf(self, snapshot: SessionSnapshot, csrf_url: str) -> SessionSnapshot:
+        with httpx.Client(timeout=15.0, follow_redirects=True, max_redirects=5) as client:
+            response = client.get(csrf_url, headers=snapshot.auth_headers)
+            response.raise_for_status()
+            payload = response.json() if response.content else {}
+        if isinstance(payload, dict):
+            for key in ("csrf", "csrf_token", "token"):
+                token = payload.get(key)
+                if isinstance(token, str) and token.strip():
+                    snapshot.csrf_tokens["X-CSRF-Token"] = token.strip()
+                    break
+        return snapshot
+
+    def _log_refresh_attempt(self, identity: IdentityContext, attempt: int, success: bool, status_code: int) -> None:
+        logger.bind(
+            scan_id=str(self._scan_id),
+            identity=identity.name or identity.role.value,
+            attempt=attempt,
+            success=success,
+            status_code=status_code,
+        ).info("auth_refresh_attempt")
+
+    def _redact_token_prefix(self, token: str) -> str:
+        token = token.strip()
+        if not token:
+            return ""
+        return f"{token[:4]}..."
+
     async def _probe_or_pause(self, error_code: str) -> None:
         ok = await self._probe_authenticated_endpoint()
+        self._record_health_check_result(ok)
         if ok:
             return
         await self._pause_with_error(error_code)
@@ -934,6 +1407,82 @@ class AuthManager:
                 active_count += 1
             if active_count >= 3:
                 return
+
+    def _record_identity_failure(self, identity_id: str, reason: IdentityFailureReason) -> None:
+        safe_identity_id = self._redact_sensitive_text(str(identity_id).strip() or "unknown")
+        self._identity_failures.append(
+            IdentityFailure(identity_id=safe_identity_id, reason=reason, timestamp=datetime.now(UTC))
+        )
+
+    def _record_health_check_result(self, passed: bool) -> None:
+        self._health_check_results.append(bool(passed))
+
+    def _failed_identity_ids(self) -> set[str]:
+        return {failure.identity_id for failure in self._identity_failures}
+
+    def _iter_metric_identities(self) -> list[tuple[str, IdentityContext]]:
+        identities: list[tuple[str, IdentityContext]] = []
+        seen_context_ids: set[int] = set()
+
+        for identity_key, identity in self._identity_contexts.items():
+            context_id = id(identity)
+            if context_id in seen_context_ids:
+                continue
+            identities.append((self._identity_id_for_metrics(identity_key, identity), identity))
+            seen_context_ids.add(context_id)
+
+        for identity_name, identity in self._named_identities.items():
+            context_id = id(identity)
+            if context_id in seen_context_ids:
+                continue
+            identity_id = str(identity_name).strip() or self._identity_id_for_metrics(identity_name, identity)
+            identities.append((identity_id, identity))
+            seen_context_ids.add(context_id)
+
+        return identities
+
+    def _identity_id_for_metrics(self, identity_key: IdentityRole | str, identity: IdentityContext) -> str:
+        if isinstance(identity_key, IdentityRole):
+            return identity_key.value
+        identity_id = str(identity_key).strip()
+        if identity_id:
+            return identity_id
+        if identity.name.strip():
+            return identity.name.strip()
+        role = identity.role.value if isinstance(identity.role, IdentityRole) else str(identity.role)
+        return role.strip() or "unknown"
+
+    def _identity_has_active_session(self, identity: IdentityContext) -> bool:
+        if not identity.active or identity.auth_state != "active":
+            return False
+        if identity.expires_at is not None and identity.expires_at <= datetime.now(UTC):
+            return False
+        if identity.cookies:
+            return True
+        return self._has_auth_material(identity.auth_headers)
+
+    def _has_auth_material(self, auth_headers: dict[str, str]) -> bool:
+        synthetic_header_keys = {"x-identity-role", "x-tenant-context"}
+        for key, value in auth_headers.items():
+            if key.lower() in synthetic_header_keys:
+                continue
+            if str(value).strip():
+                return True
+        return False
+
+    def _tenant_id_for_metrics(self, identity: IdentityContext) -> str | None:
+        if identity.tenant_hint is not None:
+            tenant_hint = identity.tenant_hint.strip()
+            if tenant_hint:
+                return tenant_hint
+        if not self._identity_has_active_session(identity):
+            return None
+        for key, value in identity.auth_headers.items():
+            if key.lower() == "x-tenant-context":
+                tenant_id = str(value).strip()
+                if tenant_id:
+                    return tenant_id
+        return None
 
 
 async def default_pause_scan(scan_id: UUID, reason: str) -> None:

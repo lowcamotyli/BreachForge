@@ -6,6 +6,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 from uuid import UUID
 
@@ -39,6 +40,36 @@ _SEVERITY_BY_CORRELATOR_VALUE: dict[str, Severity] = {
     "high": Severity.high,
     "critical": Severity.critical,
 }
+_READ_ONLY_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
+_DESTRUCTIVE_METHODS: frozenset[str] = frozenset({"PUT", "DELETE"})
+_DESTRUCTIVE_ATTACK_TOKENS: tuple[str, ...] = ("delete", "destruct")
+_SYNTHETIC_ACCOUNT_ATTACK_TOKENS: tuple[str, ...] = ("auth", "session", "token")
+DedupFingerprint = tuple[str, str, str, str, str]
+
+
+class ReplaySafetyLabel(str, Enum):
+    READ_ONLY = "READ_ONLY"
+    STATE_CHANGING = "STATE_CHANGING"
+    DESTRUCTIVE_BLOCKED = "DESTRUCTIVE_BLOCKED"
+    REQUIRES_SYNTHETIC_ACCOUNT = "REQUIRES_SYNTHETIC_ACCOUNT"
+
+
+def classify_replay_safety(attack_class: str, http_method: str) -> ReplaySafetyLabel:
+    method = http_method.strip().upper()
+    if method in _READ_ONLY_METHODS:
+        return ReplaySafetyLabel.READ_ONLY
+
+    normalized_attack_class = attack_class.strip().lower()
+    if (
+        any(token in normalized_attack_class for token in _DESTRUCTIVE_ATTACK_TOKENS)
+        or method in _DESTRUCTIVE_METHODS
+    ):
+        return ReplaySafetyLabel.DESTRUCTIVE_BLOCKED
+
+    if any(token in normalized_attack_class for token in _SYNTHETIC_ACCOUNT_ATTACK_TOKENS):
+        return ReplaySafetyLabel.REQUIRES_SYNTHETIC_ACCOUNT
+
+    return ReplaySafetyLabel.STATE_CHANGING
 
 
 def _ensure_unit_interval(name: str, value: float) -> float:
@@ -145,6 +176,12 @@ class FindingScorer:
         if duplicate is not None:
             artifact.finding = duplicate
             artifact.finding_id = duplicate.id
+            self._attach_replay_safety_metadata(
+                finding=duplicate,
+                attack_class=attack_task.attack_class,
+                endpoint=endpoint,
+            )
+            self._attach_dedup_fingerprint_metadata(finding=duplicate, fingerprint=fingerprint)
             self._attach_follow_up_hints_metadata(finding=duplicate, artifact=artifact)
             self._attach_privilege_fingerprint_metadata(
                 finding=duplicate,
@@ -152,6 +189,7 @@ class FindingScorer:
             )
             self._record_secret_blast_radius_matrix(artifact=artifact, finding=duplicate, endpoint=endpoint)
             self._attach_leak_source_metadata(finding=duplicate, artifact=artifact)
+            self._attach_race_reconciliation_metadata(finding=duplicate, artifact=artifact)
             return None
 
         scoring_output = self._build_scoring_output(artifact=artifact)
@@ -173,10 +211,13 @@ class FindingScorer:
             },
         )
 
+        self._attach_replay_safety_metadata(finding=finding, attack_class=attack_task.attack_class, endpoint=endpoint)
+        self._attach_dedup_fingerprint_metadata(finding=finding, fingerprint=fingerprint)
         self._attach_follow_up_hints_metadata(finding=finding, artifact=artifact)
         artifact.finding = finding
         self._record_secret_blast_radius_matrix(artifact=artifact, finding=finding, endpoint=endpoint)
         self._attach_leak_source_metadata(finding=finding, artifact=artifact)
+        self._attach_race_reconciliation_metadata(finding=finding, artifact=artifact)
         self._apply_secret_exposure_correlation(finding=finding, artifact=artifact)
         chain_root_cause = self._chain_root_cause_id([str(fingerprint)])
         metadata = _finding_metadata(finding)
@@ -188,15 +229,22 @@ class FindingScorer:
     def score_output(self, artifact: ProofArtifact) -> dict[str, Any]:
         return self._build_scoring_output(artifact=artifact)
 
-    def compute_fingerprint(self, artifact: ProofArtifact, endpoint: Endpoint) -> tuple[str, str, str]:
+    def compute_fingerprint(self, artifact: ProofArtifact, endpoint: Endpoint) -> DedupFingerprint:
         attack_task = artifact.attack_task
         if attack_task is None:
             raise ValueError("ProofArtifact.attack_task is required to compute fingerprint")
 
+        owner = self._dedup_owner_for(artifact=artifact, attack_task=attack_task, endpoint=endpoint)
         return (
-            attack_task.attack_class,
+            owner,
+            (
+                self._dedup_service_for(artifact=artifact, attack_task=attack_task, endpoint=endpoint)
+                if owner
+                else ""
+            ),
             self.normalize_url_pattern(endpoint.url_pattern),
-            self._classify_parameter(attack_task.attack_class, attack_task.target_parameter),
+            attack_task.attack_class,
+            self._proof_hash_for(artifact=artifact, attack_task=attack_task),
         )
 
     def _chain_root_cause_id(self, fingerprints: list[str]) -> str:
@@ -205,8 +253,8 @@ class FindingScorer:
     def normalize_url_pattern(self, url_pattern: str) -> str:
         return _NUMERIC_SEGMENT_RE.sub("/{id}", url_pattern)
 
-    async def _find_duplicate(self, scan_id: UUID, fingerprint: tuple[str, str, str]) -> Finding | None:
-        attack_class, _, _ = fingerprint
+    async def _find_duplicate(self, scan_id: UUID, fingerprint: DedupFingerprint) -> Finding | None:
+        _, _, _, attack_class, _ = fingerprint
         result = await self._db.execute(
             select(Finding)
             .where(Finding.scan_id == scan_id, Finding.attack_class == attack_class)
@@ -225,18 +273,32 @@ class FindingScorer:
                 return finding
         return None
 
-    def _fingerprint_for_existing_finding(self, finding: Finding) -> tuple[str, str, str]:
-        param_class = "none"
+    def _fingerprint_for_existing_finding(self, finding: Finding) -> DedupFingerprint:
+        metadata = _finding_metadata(finding)
+        stored_fingerprint = metadata.get("dedup_fingerprint")
+        if isinstance(stored_fingerprint, dict):
+            owner = _clean_fingerprint_value(stored_fingerprint.get("owner"))
+            return (
+                owner,
+                _clean_fingerprint_value(stored_fingerprint.get("service")) if owner else "",
+                _clean_fingerprint_value(stored_fingerprint.get("endpoint")),
+                _clean_fingerprint_value(stored_fingerprint.get("attack_class")) or finding.attack_class,
+                _clean_fingerprint_value(stored_fingerprint.get("proof_hash")),
+            )
+
+        proof_hash = "none"
         for proof in finding.proof_artifacts:
             if proof.attack_task is None:
                 continue
-            param_class = self._classify_parameter(finding.attack_class, proof.attack_task.target_parameter)
+            proof_hash = self._proof_hash_for(artifact=proof, attack_task=proof.attack_task)
             break
 
         return (
-            finding.attack_class,
+            "",
+            "",
             self.normalize_url_pattern(finding.affected_endpoint.url_pattern),
-            param_class,
+            finding.attack_class,
+            proof_hash,
         )
 
     def _classify_parameter(self, attack_class: str, target_parameter: str | None) -> str:
@@ -258,6 +320,50 @@ class FindingScorer:
         if "id" in parameter:
             return "identifier"
         return "generic"
+
+    def _dedup_owner_for(self, artifact: ProofArtifact, attack_task: AttackTask, endpoint: Endpoint) -> str:
+        sources = self._fingerprint_sources(artifact=artifact, attack_task=attack_task, endpoint=endpoint)
+        return _first_clean_value(
+            sources=sources,
+            keys=("owner", "owner_identity", "service_owner", "owning_team", "team"),
+        )
+
+    def _dedup_service_for(self, artifact: ProofArtifact, attack_task: AttackTask, endpoint: Endpoint) -> str:
+        sources = self._fingerprint_sources(artifact=artifact, attack_task=attack_task, endpoint=endpoint)
+        return _first_clean_value(
+            sources=sources,
+            keys=("service", "service_name", "component", "application", "app"),
+        )
+
+    def _proof_hash_for(self, artifact: ProofArtifact, attack_task: AttackTask) -> str:
+        sources = self._fingerprint_sources(
+            artifact=artifact,
+            attack_task=attack_task,
+            endpoint=getattr(attack_task, "endpoint", None),
+        )
+        explicit_proof_hash = _first_clean_value(
+            sources=sources,
+            keys=("proof_hash", "evidence_hash", "fingerprint"),
+        )
+        if explicit_proof_hash:
+            return explicit_proof_hash
+
+        return self._classify_parameter(attack_task.attack_class, attack_task.target_parameter)
+
+    def _fingerprint_sources(
+        self,
+        artifact: ProofArtifact,
+        attack_task: AttackTask,
+        endpoint: Endpoint | None,
+    ) -> tuple[dict[str, Any], ...]:
+        return (
+            _metadata_dict(getattr(endpoint, "metadata", None)),
+            _metadata_dict(getattr(attack_task, "metadata", None)),
+            _parse_json_dict(getattr(attack_task, "hypothesis", None)),
+            _metadata_dict(getattr(artifact, "metadata", None)),
+            _metadata_dict(getattr(artifact, "state_diff", None)),
+            _parse_evidence_notes_metadata(getattr(artifact, "evidence_notes", None)),
+        )
 
     def _severity_for(self, attack_class: str, confidence: float, evidence_notes: str | None = None) -> Severity:
         lowered_evidence_notes = (evidence_notes or "").lower()
@@ -297,6 +403,16 @@ class FindingScorer:
                     reachability=score_components["reachability"],
                     repeatability=score_components["repeatability"],
                     blast_radius=score_components["blast_radius"],
+                    privilege=score_components.get("privilege", 1.0),
+                    safety_confidence=score_components.get("safety_confidence", 1.0),
+                )
+                risk_enrichment = self.enrich_risk_v2(
+                    finding={"severity": self._severity_for(
+                        attack_class=getattr(getattr(artifact, "attack_task", None), "attack_class", ""),
+                        confidence=confidence,
+                        evidence_notes=artifact.evidence_notes,
+                    ).value},
+                    score_data=score_components,
                 )
                 return {
                     "confidence_score": confidence,
@@ -304,6 +420,7 @@ class FindingScorer:
                     "exploitability_score": v2_score.total,
                     "score_explanation": v2_score.explanation,
                     "follow_up_hints": follow_up_hints,
+                    **risk_enrichment,
                 }
             except ValueError:
                 pass
@@ -316,12 +433,73 @@ class FindingScorer:
             "follow_up_hints": follow_up_hints,
         }
 
+    def enrich_risk_v2(self, finding: dict, score_data: dict) -> dict:
+        blast_radius = float(score_data.get("blast_radius", 0.0))
+        repeatability = float(score_data.get("repeatability", 0.0))
+        auth_level = str(score_data.get("auth_level", "low")).strip().lower()
+
+        if blast_radius >= 0.7 or auth_level in ("none", "low"):
+            business_impact = "HIGH"
+        elif blast_radius >= 0.4:
+            business_impact = "MEDIUM"
+        else:
+            business_impact = "LOW"
+
+        if repeatability >= 0.8:
+            exploit_repeatability = "always"
+        elif repeatability >= 0.5:
+            exploit_repeatability = "conditional"
+        else:
+            exploit_repeatability = "once"
+
+        severity_raw = str(finding.get("severity", "unknown"))
+        if "." in severity_raw:
+            severity_raw = severity_raw.split(".")[-1]
+        severity = severity_raw.upper()
+
+        pr_segment = "N"
+        if auth_level in ("low", "user", "basic", "authenticated"):
+            pr_segment = "L"
+        elif auth_level in ("high", "admin", "privileged"):
+            pr_segment = "H"
+        cvss_hint = f"AV:N/AC:L/PR:{pr_segment}/UI:N/S:U/C:H/I:H/A:N"
+
+        risk_explanation = (
+            f"Severity {severity} with {business_impact} business impact and "
+            f"{exploit_repeatability} exploit repeatability."
+        )
+
+        return {
+            "business_impact": business_impact,
+            "exploit_repeatability": exploit_repeatability,
+            "risk_explanation": risk_explanation,
+            "cvss_hint": cvss_hint,
+        }
+
     def _attach_follow_up_hints_metadata(self, finding: Finding, artifact: ProofArtifact) -> None:
         follow_up_hints = self._follow_up_hints_for_finding(attack_class=finding.attack_class, artifact=artifact)
         if not follow_up_hints:
             return
         metadata = _finding_metadata(finding)
         metadata["follow_up_hints"] = follow_up_hints
+        finding.extra_metadata = metadata
+
+    def _attach_replay_safety_metadata(self, finding: Finding, attack_class: str, endpoint: Endpoint) -> None:
+        safety_label = classify_replay_safety(attack_class=attack_class, http_method=endpoint.method)
+        metadata = _finding_metadata(finding)
+        metadata["safety_label"] = safety_label.value
+        finding.extra_metadata = metadata
+
+    def _attach_dedup_fingerprint_metadata(self, finding: Finding, fingerprint: DedupFingerprint) -> None:
+        owner, service, endpoint, attack_class, proof_hash = fingerprint
+        metadata = _finding_metadata(finding)
+        metadata["dedup_fingerprint"] = {
+            "owner": owner,
+            "service": service,
+            "endpoint": endpoint,
+            "attack_class": attack_class,
+            "proof_hash": proof_hash,
+        }
         finding.extra_metadata = metadata
 
     def _follow_up_hints_for_finding(self, attack_class: str, artifact: ProofArtifact) -> list[str]:
@@ -360,6 +538,9 @@ class FindingScorer:
         reachability = getattr(artifact, "_score_reachability", None)
         repeatability = getattr(artifact, "_score_repeatability", None)
         blast_radius = getattr(artifact, "_score_blast_radius", None)
+        privilege = getattr(artifact, "_score_privilege", 1.0)
+        safety_confidence = getattr(artifact, "_score_safety_confidence", 1.0)
+        auth_level = getattr(artifact, "_score_auth_level", "low")
         components = (impact, reachability, repeatability, blast_radius)
         if any(component is None for component in components):
             return None
@@ -368,6 +549,9 @@ class FindingScorer:
             "reachability": float(reachability),
             "repeatability": float(repeatability),
             "blast_radius": float(blast_radius),
+            "privilege": float(privilege),
+            "safety_confidence": float(safety_confidence),
+            "auth_level": str(auth_level),
         }
 
     def _build_title(self, attack_class: str, endpoint: Endpoint) -> str:
@@ -465,6 +649,19 @@ class FindingScorer:
 
         metadata = _finding_metadata(finding)
         metadata["leak_source"] = leak_source_metadata
+        finding.extra_metadata = metadata
+
+    def _attach_race_reconciliation_metadata(self, finding: Finding, artifact: ProofArtifact) -> None:
+        evidence_metadata = _parse_evidence_notes_metadata(getattr(artifact, "evidence_notes", None))
+        artifact_metadata = _metadata_dict(getattr(artifact, "metadata", None))
+        sources = (artifact_metadata, evidence_metadata)
+        reconcile_required = _first_bool(sources=sources, keys=("reconcile_required",), default=False)
+        if not reconcile_required and "reconcile_passed" not in artifact_metadata and "reconcile_passed" not in evidence_metadata:
+            return
+
+        metadata = _finding_metadata(finding)
+        metadata["reconcile_required"] = reconcile_required
+        metadata["reconcile_passed"] = _first_bool(sources=sources, keys=("reconcile_passed",), default=False)
         finding.extra_metadata = metadata
 
     def _probe_type_for_artifact(self, artifact: ProofArtifact) -> str | None:
@@ -643,12 +840,41 @@ def _finding_metadata(finding: Finding) -> dict[str, Any]:
     return _metadata_dict(finding.extra_metadata)
 
 
+def _parse_json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(parsed, dict):
+        return parsed
+    return {}
+
+
+def _clean_fingerprint_value(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _first_clean_value(sources: tuple[dict[str, Any], ...], keys: tuple[str, ...]) -> str:
+    for source in sources:
+        for key in keys:
+            value = _clean_fingerprint_value(source.get(key))
+            if value:
+                return value
+    return ""
+
+
 def _parse_evidence_notes_metadata(evidence_notes: str | None) -> dict[str, str]:
     if not isinstance(evidence_notes, str) or not evidence_notes.strip():
         return {}
 
     parsed: dict[str, str] = {}
-    for segment in evidence_notes.split(";"):
+    for segment in re.split(r"[;\n]", evidence_notes):
         if "=" not in segment:
             continue
         key, raw_value = segment.split("=", 1)

@@ -1,0 +1,26 @@
+{
+  "attack_classes": [
+    "RACE_CONDITION",
+    "IDEMPOTENCY",
+    "NEGATIVE_QUANTITY",
+    "APPROVAL_WORKFLOW_SKIP",
+    "STATE_INCONSISTENCY"
+  ],
+  "coverage": 0.0,
+  "coverage_by_attack_class": {
+    "APPROVAL_WORKFLOW_SKIP": 0.0,
+    "IDEMPOTENCY": 0.0,
+    "NEGATIVE_QUANTITY": 0.0,
+    "RACE_CONDITION": 0.0,
+    "STATE_INCONSISTENCY": 0.0
+  },
+  "fn": 5,
+  "fp": 0,
+  "ground_truth_count": 5,
+  "lab_id": "business_race",
+  "lab_version": "1.0.0",
+  "max_fp": 0,
+  "min_coverage": 0.0,
+  "mode": "quick",
+  "tp": 0
+}

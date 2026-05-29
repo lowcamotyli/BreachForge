@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import pytest
 
-from execution_plane.crawler.asset_map import AssetMapBuilder, Endpoint, Parameter
+from execution_plane.crawler.asset_map import AssetMapBuilder, Endpoint, Parameter, normalize_graphql_operation
 
 auth_manager_module = ModuleType("control_plane.auth_manager")
 
@@ -55,6 +55,20 @@ def test_normalize_url_pattern_replaces_numeric_segment() -> None:
     assert normalized == "/api/users/{id}"
 
 
+def test_normalize_url_pattern_rewrites_framework_parameters_and_strips_trailing_slash() -> None:
+    builder = AssetMapBuilder()
+
+    assert builder.normalize_url_pattern("/api/users/:user_id/orders/:order_id/") == (
+        "/api/users/{user_id}/orders/{order_id}"
+    )
+    assert builder.normalize_url_pattern("/api/users/<int:user_id>/") == "/api/users/{user_id}"
+    assert builder.normalize_url_pattern("/") == "/"
+
+
+def test_normalize_graphql_operation_appends_operation_name() -> None:
+    assert normalize_graphql_operation("/graphql", "GetUser") == "/graphql##GetUser"
+
+
 def test_add_endpoint_and_build_merges_duplicates_and_auth_required() -> None:
     builder = AssetMapBuilder()
 
@@ -86,12 +100,134 @@ def test_add_endpoint_and_build_merges_duplicates_and_auth_required() -> None:
     assert endpoint.method == "GET"
     assert endpoint.in_scope is True
     assert endpoint.auth_required is True
+    assert endpoint.source == ["crawler"]
     assert endpoint.observed_content_type == "application/json"
     assert endpoint.example_response_code == 200
     assert endpoint.parameters == [
         {"name": "limit", "location": "query", "type": "integer"},
         {"name": "include", "location": "query", "type": "string"},
     ]
+
+
+def test_add_endpoint_accepts_new_sources_and_aliases() -> None:
+    builder = AssetMapBuilder()
+
+    builder.add_endpoint(
+        url="/internal/users",
+        method="GET",
+        auth_required=True,
+        parameters=[],
+        source="code_extractor",
+    )
+    builder.add_endpoint(
+        url="/gateway/users",
+        method="GET",
+        auth_required=True,
+        parameters=[],
+        source="gateway",
+    )
+    builder.add_endpoint(
+        url="/gateway/events",
+        method="GET",
+        auth_required=True,
+        parameters=[],
+        source="gateway_log",
+    )
+
+    asset_map = builder.build()
+    indexed = {endpoint.url_pattern: endpoint for endpoint in asset_map.endpoints}
+
+    assert indexed["/internal/users"].source == ["code_extractor"]
+    assert indexed["/gateway/users"].source == ["gateway_log"]
+    assert indexed["/gateway/events"].source == ["gateway_log"]
+
+
+def test_add_endpoint_tracks_all_discovery_sources_for_same_endpoint() -> None:
+    builder = AssetMapBuilder()
+
+    builder.add_endpoint(
+        url="/api/users/:user_id/",
+        method="GET",
+        auth_required=False,
+        parameters=[],
+        source="crawler",
+    )
+    builder.add_endpoint(
+        url="/api/users/:user_id",
+        method="get",
+        auth_required=False,
+        parameters=[],
+        source="gateway_log",
+    )
+    builder.add_endpoint(
+        url="/api/users/<int:user_id>",
+        method="GET",
+        auth_required=False,
+        parameters=[],
+        source="gateway",
+    )
+
+    asset_map = builder.build()
+
+    assert len(asset_map.endpoints) == 1
+    assert asset_map.endpoints[0].source == ["crawler", "gateway_log"]
+
+
+def test_asset_map_source_summary_counts_primary_source_per_unique_endpoint() -> None:
+    builder = AssetMapBuilder()
+
+    builder.add_endpoint("/api/users", "GET", False, [], source="crawler")
+    builder.add_endpoint("/api/users", "GET", False, [], source="gateway_log")
+    builder.add_endpoint("/api/teams", "GET", False, [], source="gateway")
+    builder.add_endpoint("/api/projects", "GET", False, [], source="code_extractor")
+
+    asset_map = builder.build()
+
+    assert asset_map.source_summary() == {"crawler": 1, "gateway_log": 1, "code_extractor": 1}
+
+
+def test_graphql_operation_is_part_of_dedup_key() -> None:
+    builder = AssetMapBuilder()
+
+    builder.add_endpoint(
+        url="/graphql",
+        method="POST",
+        auth_required=True,
+        parameters=[],
+        source="crawler",
+        graphql_operation="GetUser",
+    )
+    builder.add_endpoint(
+        url="/graphql",
+        method="POST",
+        auth_required=True,
+        parameters=[],
+        source="gateway_log",
+        graphql_operation="GetUser",
+    )
+    builder.add_endpoint(
+        url="/graphql",
+        method="POST",
+        auth_required=True,
+        parameters=[],
+        source="code_extractor",
+        graphql_operation="UpdateUser",
+    )
+
+    asset_map = builder.build()
+
+    endpoint_signatures = {
+        (endpoint.url_pattern, endpoint.method, endpoint.graphql_operation)
+        for endpoint in asset_map.endpoints
+    }
+    assert endpoint_signatures == {
+        ("/graphql", "POST", "GetUser"),
+        ("/graphql", "POST", "UpdateUser"),
+    }
+    get_user = next(
+        endpoint for endpoint in asset_map.endpoints if endpoint.graphql_operation == "GetUser"
+    )
+    assert get_user.source == ["crawler", "gateway_log"]
 
 
 @pytest.mark.asyncio
@@ -194,6 +330,7 @@ def test_asset_map_deduplicate_endpoints_keeps_first_signature() -> None:
             method="GET",
             in_scope=True,
             auth_required=False,
+            source=["gateway_log"],
             parameters=[],
         ),
         Endpoint(
@@ -211,3 +348,4 @@ def test_asset_map_deduplicate_endpoints_keeps_first_signature() -> None:
         ("/users/{id}/posts/{id}", "GET"),
         ("/users/{id}/posts/{id}", "POST"),
     ]
+    assert asset_map.endpoints[0].source == ["crawler", "gateway_log"]

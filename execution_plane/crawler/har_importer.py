@@ -74,6 +74,7 @@ class HarImporter:
                 auth_required=self._has_auth_signal(request_headers),
                 parameters=parameters,
                 in_scope=True,
+                source="har",
                 observed_content_type=content_type,
                 example_response_code=status,
             )

@@ -62,6 +62,14 @@ S1 (Infra+Schema) -> S2 (AuthManager) -> S3 (Crawler) ----->
                     S57 (Full Benchmark Scan Loop) -> S58 (Benchmark Detection Lift) -> S59 (Multi-Lab Coverage)
                                                                                          |
                     S60 (Operator-Grade Auth/Discovery) -> S61 (Autonomous Stateful Loop) -> S62 (Scale/Reliability Gates)
+                                                                                         |
+                    S63 (Provider Sandbox/HexStrike) -> S64 (Competitive Benchmark Harness) -> S65 (Enterprise Auth)
+                                                                                         |
+                    S66 (Full Multi-Lab Live Corpus) -> S67 (Developer Evidence Workflow) -> S68 (Safe Active Policy)
+                                                                                         |
+                    S69 (SaaS Control Plane/Private Runners) -> S70 (CI/CD Gates) -> S71 (Inventory/Ownership Graph)
+                                                                                         |
+                    S72 (Buyer-Grade Reporting) -> S73 (Public Benchmark Trust Program)
 ```
 
 ## Sprinty
@@ -130,6 +138,34 @@ S1 (Infra+Schema) -> S2 (AuthManager) -> S3 (Crawler) ----->
 | Sprint 60 | Operator Grade Auth And Discovery: auth reliability, discovery completeness i jawne blind spots. | [sprint-60-operator-grade-auth-discovery.md](./sprint-60-operator-grade-auth-discovery.md) |
 | Sprint 61 | Autonomous Stateful Attack Loop: bounded replanning, stateful proof paths i adaptive benchmark scenarios. | [sprint-61-autonomous-stateful-attack-loop.md](./sprint-61-autonomous-stateful-attack-loop.md) |
 | Sprint 62 | Scale Reliability And Quality Gates: duza powierzchnia, failure injection, evidence consistency i release scorecard. | [sprint-62-scale-reliability-quality-gates.md](./sprint-62-scale-reliability-quality-gates.md) |
+| Sprint 63 | Execution Provider Sandbox And HexStrike Adapter: HexStrike i toolchain jako sandboxed providers, nie zrodlo findingow. | [sprint-63-execution-provider-sandbox-hexstrike-adapter.md](./sprint-63-execution-provider-sandbox-hexstrike-adapter.md) |
+| Sprint 64 | Competitive Scanner Benchmark Harness: porownanie native/HexStrike/ZAP/Nuclei/importow przez TP/FP/FN, proof depth i blind spots. | [sprint-64-competitive-scanner-benchmark-harness.md](./sprint-64-competitive-scanner-benchmark-harness.md) |
+| Sprint 65 | Enterprise Auth Recording And Identity Reliability: session recording/import, identity matrix health i auth preflight. | [sprint-65-enterprise-auth-recording-identity-reliability.md](./sprint-65-enterprise-auth-recording-identity-reliability.md) |
+| Sprint 66 | Full Multi-Lab Live Corpus v1: wszystkie laby dzialaja w `--full`, bez quick-only placeholderow. | [sprint-66-full-multi-lab-live-corpus-v1.md](./sprint-66-full-multi-lab-live-corpus-v1.md) |
+| Sprint 67 | Developer Evidence And Remediation Workflow: replay bundles, owner mapping, GitHub/Jira handoff i suppression lifecycle. | [sprint-67-developer-evidence-remediation-workflow.md](./sprint-67-developer-evidence-remediation-workflow.md) |
+| Sprint 68 | Safe Active Testing Policy Engine: formalna polityka scope/destrukcyjnosci, rollback-safe state probes, kill switch i authorization pack. | [sprint-68-safe-active-testing-policy-engine.md](./sprint-68-safe-active-testing-policy-engine.md) |
+| Sprint 69 | SaaS Control Plane And Private Runners: org/project tenancy, RBAC, private runner protocol, secrets vault i telemetry. | [sprint-69-saas-control-plane-private-runners.md](./sprint-69-saas-control-plane-private-runners.md) |
+| Sprint 70 | CI/CD And PR Quality Gates: CLI, GitHub/GitLab/Jenkins, diff-aware scans i deterministic gates. | [sprint-70-ci-cd-pr-quality-gates.md](./sprint-70-ci-cd-pr-quality-gates.md) |
+| Sprint 71 | API Inventory Code-To-Runtime Ownership Graph: inventory z runtime/spec/HAR/JS/code, owner graph i coverage truth views. | [sprint-71-api-inventory-code-to-runtime-ownership-graph.md](./sprint-71-api-inventory-code-to-runtime-ownership-graph.md) |
+| Sprint 72 | Buyer Grade Reporting Compliance And Trust Pack: executive/developer/auditor reports, standards mapping i signed evidence. | [sprint-72-buyer-grade-reporting-compliance-trust-pack.md](./sprint-72-buyer-grade-reporting-compliance-trust-pack.md) |
+| Sprint 73 | Public Benchmark Trust Program: publiczny reprodukowalny corpus, anti-gaming mode, scorecard i claims policy. | [sprint-73-public-benchmark-trust-program.md](./sprint-73-public-benchmark-trust-program.md) |
+
+---
+
+## Production Hardening Track (S74–S80)
+
+**Zamrożenie feature sprintów.** Sprinty 57–73 pozostają w kolejce jako `frozen_feature_queue`.
+Każdy z poniższych sprintów jest blokerem release. Cel: usunąć atrapy, nie dodać funkcje.
+
+| Sprint | Cel | Plik |
+|---|---|---|
+| Sprint 74 | Persistent State: podłączenie `orgs`, `api_keys`, `org_members`, `runners` do istniejącego schematu DB (migracja 20260528100000 już istnieje, kod jej nie używa). Usuwa 4 in-memory stores. | [sprint-74-persistent-state-db-wiring.md](./sprint-74-persistent-state-db-wiring.md) |
+| Sprint 75 | Real Auth: zastąpienie `X-Actor-Email` header trust realną weryfikacją `Authorization: Bearer <key>` przeciwko `api_keys` w DB. `VerifiedActor` zamiast fałszowalnego headera. | [sprint-75-real-auth-api-key-verification.md](./sprint-75-real-auth-api-key-verification.md) |
+| Sprint 76 | SecretsVault Real Encryption: zastąpienie XOR fake-encryption Fernetem (AES-128-CBC+HMAC) z `VAULT_ENCRYPTION_KEY` env var + persystencja vault w tabeli `secrets`. | [sprint-76-secrets-vault-real-encryption.md](./sprint-76-secrets-vault-real-encryption.md) |
+| Sprint 77 | Audit Log Persistence: zastąpienie `_AUDIT_EVENTS: list` (in-memory) tabelą `audit_events` w DB z tenant scoping i append-only enforcement. | [sprint-77-audit-log-persistence.md](./sprint-77-audit-log-persistence.md) |
+| Sprint 78 | Production Docker Config: `docker-compose.prod.yml` bez LocalStack, non-root Dockerfile, `.env.example`, weryfikacja `alembic upgrade head` od pustej DB. | [sprint-78-production-docker-config.md](./sprint-78-production-docker-config.md) |
+| Sprint 79 | Test Suite Green: naprawa 3 broken collection errors, integration test pełnego scan lifecycle, tenant isolation test. Cel: `python -m pytest tests/ -q` → 0 errors/failures. | [sprint-79-test-suite-green-integration.md](./sprint-79-test-suite-green-integration.md) |
+| Sprint 80 | PROD_READINESS.md + Release Gate: formalna checklista blokcyjna (26 poleceń weryfikacyjnych), Gemini invariants sweep (9 invariantów), decyzja SHIP/NO-SHIP. | [sprint-80-prod-readiness-release-gate.md](./sprint-80-prod-readiness-release-gate.md) |
 
 ---
 
@@ -153,4 +189,3 @@ S1 (Infra+Schema) -> S2 (AuthManager) -> S3 (Crawler) ----->
 | jwt_attack | **5%** | wymaga tokenu | JS leak / HAR |
 
 **Droga do 80% coverage bez credentials:** Sprint 44 (HAR/OpenAPI input) + Sprint 46 (unauth mode core).
-

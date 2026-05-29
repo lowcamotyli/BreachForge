@@ -16,6 +16,15 @@ class TaskOutcome(str, Enum):
     unsafe_blocked = "unsafe_blocked"
 
 
+class FeedbackReason(str, Enum):
+    no_signal = "no_signal"
+    auth_drift = "auth_drift"
+    interesting_diff = "interesting_diff"
+    state_changed = "state_changed"
+    needs_identity = "needs_identity"
+    unsafe_blocked = "unsafe_blocked"
+
+
 @dataclass
 class FeedbackPayload:
     outcome: TaskOutcome
@@ -24,6 +33,7 @@ class FeedbackPayload:
     endpoint: str
     finding_class: str
     confidence: float
+    reason: FeedbackReason | None = None
     follow_up_hints: list[str] = field(default_factory=list)
     parent_evidence_ref: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)

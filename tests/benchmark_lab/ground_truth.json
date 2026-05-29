@@ -1,6 +1,15 @@
 {
   "lab_version": "1.0.0",
   "description": "Ground truth manifest for ProofScan benchmark lab",
+  "expected_endpoints": [
+    "/users/{user_id}",
+    "/admin/orders/{order_id}/approve",
+    "/orders/{order_id}",
+    "/users/{user_id}/profile",
+    "/cart/checkout",
+    "/api-tokens",
+    "/jobs/export"
+  ],
   "vulnerabilities": [
     {"id": "vuln-001", "type": "BOLA", "endpoint": "/users/{user_id}", "method": "GET", "severity": "HIGH", "description": "Cross-user data access without tenant check"},
     {"id": "vuln-002", "type": "BFLA", "endpoint": "/admin/orders/{order_id}/approve", "method": "POST", "severity": "HIGH", "description": "Admin function accessible by regular user"},

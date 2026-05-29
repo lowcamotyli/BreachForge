@@ -1,0 +1,19 @@
+{
+  "lab_id": "api_saas",
+  "lab_version": "1.0.0",
+  "attack_classes": ["BOLA", "BFLA", "TENANT_ISOLATION", "MASS_ASSIGNMENT", "HIDDEN_ENDPOINT"],
+  "identities": [
+    {"username": "alice", "role": "user", "tenant": "tenant_a"},
+    {"username": "bob", "role": "admin", "tenant": "tenant_a"},
+    {"username": "carol", "role": "user", "tenant": "tenant_b"}
+  ],
+  "expected_surface": ["/api/v1/resources/{resource_id}", "/api/v1/admin/bulk-export", "/api/v1/internal/debug", "/api/v1/workspaces/{workspace_id}/data", "/api/v1/users/me"],
+  "expected_endpoints": ["/api/v1/resources/{resource_id}", "/api/v1/admin/bulk-export", "/api/v1/internal/debug", "/api/v1/workspaces/{workspace_id}/data", "/api/v1/users/me"],
+  "vulnerabilities": [
+    {"id": "as-vuln-001", "type": "BOLA", "endpoint": "/api/v1/resources/{resource_id}", "method": "GET", "severity": "HIGH", "description": "Resource accessible without ownership check"},
+    {"id": "as-vuln-002", "type": "BFLA", "endpoint": "/api/v1/admin/bulk-export", "method": "POST", "severity": "HIGH", "description": "Admin bulk-export accessible by non-admin"},
+    {"id": "as-vuln-003", "type": "HIDDEN_ENDPOINT", "endpoint": "/api/v1/internal/debug", "method": "GET", "severity": "MEDIUM", "description": "Debug endpoint not in OpenAPI spec but publicly accessible"},
+    {"id": "as-vuln-004", "type": "TENANT_ISOLATION", "endpoint": "/api/v1/workspaces/{workspace_id}/data", "method": "GET", "severity": "HIGH", "description": "Cross-tenant workspace data accessible"},
+    {"id": "as-vuln-005", "type": "MASS_ASSIGNMENT", "endpoint": "/api/v1/users/me", "method": "PATCH", "severity": "HIGH", "description": "is_admin field can be set via PATCH /api/v1/users/me"}
+  ]
+}

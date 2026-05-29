@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import pkgutil
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -17,6 +18,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from api.middleware.logging import redact_for_audit
 from api.models.requests import ScanPolicy
 from control_plane.codex_analyst import CodexAnalyst
 from execution_plane.planner.rules.base import AssetMap, AttackRule, ScanContext
@@ -27,7 +29,7 @@ from execution_plane.planner.path_ranker import PathRanker
 from execution_plane.planner.payload_registry import PayloadRegistry
 from execution_plane.planner.playbook_loader import load_builtin_playbooks
 from execution_plane.planner.playbooks import AttackPlaybook, PlaybookStep, assert_no_secret_like_data
-from storage.db.models import AttackTask, Endpoint, Scan
+from storage.db.models import AttackTask, AttackTaskStatus, AuditEvent, AuditEventType, Endpoint, Scan
 
 if TYPE_CHECKING:
     from control_plane.auth_manager import IdentityContext
@@ -77,6 +79,56 @@ _MAX_SEQUENCE_PRIORITY = max(_ATTACK_CLASS_SEQUENCE_PRIORITY.values()) + 1
 logger = structlog.get_logger(__name__)
 
 
+@dataclass
+class ReplanBudget:
+    scan_id: str
+    rounds_used: int = 0
+    max_rounds_per_scan: int = 3
+    rounds_per_class: dict[str, int] = field(default_factory=dict)
+    max_rounds_per_class: int = 2
+    rounds_per_endpoint: dict[str, int] = field(default_factory=dict)
+    max_rounds_per_endpoint: int = 2
+
+    def budget_exceeded(self, attack_class: str | None = None, endpoint_id: str | None = None) -> bool:
+        if self.rounds_used >= self.max_rounds_per_scan:
+            return True
+        if attack_class and self.rounds_per_class.get(attack_class, 0) >= self.max_rounds_per_class:
+            return True
+        if endpoint_id and self.rounds_per_endpoint.get(endpoint_id, 0) >= self.max_rounds_per_endpoint:
+            return True
+        return False
+
+    def increment(self, attack_class: str | None = None, endpoint_id: str | None = None) -> None:
+        self.rounds_used += 1
+        if attack_class:
+            self.rounds_per_class[attack_class] = self.rounds_per_class.get(attack_class, 0) + 1
+        if endpoint_id:
+            self.rounds_per_endpoint[endpoint_id] = self.rounds_per_endpoint.get(endpoint_id, 0) + 1
+
+
+@dataclass
+class ScanBudget:
+    max_requests: int
+    max_runtime_seconds: int
+    per_class_cap: dict[str, int]
+    priority_classes: list[str]
+    requests_dispatched: int = 0
+
+    def allows_dispatch(self, task: AttackTask) -> bool:
+        if self.max_requests <= 0:
+            return True
+        if self.requests_dispatched < self.max_requests:
+            return True
+        return str(task.attack_class) in self.priority_classes
+
+    def consume(self) -> None:
+        self.requests_dispatched += 1
+
+    @property
+    def remaining_requests(self) -> int:
+        return max(self.max_requests - self.requests_dispatched, 0)
+
+
 class PlannerState(str, enum.Enum):
     idle = "idle"
     planning = "planning"
@@ -104,6 +156,7 @@ class AttackPlanner:
         context: ScanContext,
         unauth_mode: bool = False,
         identity_matrix: dict[str, IdentityContext] | None = None,
+        scan_budget: ScanBudget | None = None,
     ) -> list[AttackTask]:
         self.state = PlannerState.planning
         rules = self.rules
@@ -135,8 +188,19 @@ class AttackPlanner:
             self.state = PlannerState.replanning
             dispatch_batch = self.replan(graph, outcomes, context=context, candidate_tasks=dispatch_batch)
 
+        if scan_budget is not None:
+            dispatch_batch = self._apply_scan_budget(dispatch_batch, scan_budget=scan_budget)
         self.state = PlannerState.idle
         return dispatch_batch
+
+    def _apply_scan_budget(self, tasks: list[AttackTask], *, scan_budget: ScanBudget) -> list[AttackTask]:
+        budgeted: list[AttackTask] = []
+        for task in tasks:
+            if not scan_budget.allows_dispatch(task):
+                continue
+            budgeted.append(task)
+            scan_budget.consume()
+        return budgeted
 
     def replan(
         self,
@@ -148,6 +212,11 @@ class AttackPlanner:
     ) -> list[AttackTask]:
         # Backward-compatible path: existing callers pass ScanContext only.
         if isinstance(graph_or_context, ScanContext):
+            if graph_or_context.replan_budget is None:
+                graph_or_context.replan_budget = ReplanBudget(scan_id=str(graph_or_context.scan_id))
+            if graph_or_context.replan_budget.budget_exceeded():
+                return []
+            graph_or_context.replan_budget.increment()
             candidates = self.plan(graph_or_context)
             return [task for task in candidates if task.id not in graph_or_context.completed_task_ids]
 
@@ -899,9 +968,9 @@ def _contains_any(value: str, needles: list[str]) -> bool:
     return any(needle.lower() in lowered for needle in needles)
 
 
-def filter_tasks_by_policy(tasks: list[AttackTask], policy: ScanPolicy) -> tuple[list[AttackTask], list[dict]]:
+def filter_tasks_by_policy(tasks: list[AttackTask], policy: ScanPolicy) -> tuple[list[AttackTask], list[tuple[AttackTask, str]]]:
     allowed_tasks: list[AttackTask] = []
-    skipped_records: list[dict] = []
+    skipped_tasks: list[tuple[AttackTask, str]] = []
     allowed_domains = {domain.strip().lower() for domain in policy.allowed_domains if domain.strip()}
 
     for task in tasks:
@@ -910,26 +979,18 @@ def filter_tasks_by_policy(tasks: list[AttackTask], policy: ScanPolicy) -> tuple
         url = str(getattr(endpoint, "url_pattern", "") or "")
 
         if method in _POLICY_MUTATING_METHODS and not policy.mutating_allowed:
-            skipped_records.append(_skipped_task_record(task, f"mutating method {method} blocked by policy"))
+            skipped_tasks.append((task, "mutating_allowed"))
             continue
 
         parsed_url = urlparse(url)
         hostname = (parsed_url.hostname or "").lower()
         if allowed_domains and hostname and hostname not in allowed_domains:
-            skipped_records.append(_skipped_task_record(task, f"domain {hostname} blocked by policy"))
+            skipped_tasks.append((task, "allowed_domains"))
             continue
 
         allowed_tasks.append(task)
 
-    return allowed_tasks, skipped_records
-
-
-def _skipped_task_record(task: AttackTask, reason: str) -> dict[str, str]:
-    return {
-        "task_id": str(task.id),
-        "reason": reason,
-        "attack_class": str(task.attack_class),
-    }
+    return allowed_tasks, skipped_tasks
 
 
 def plan_attack(scan_id: str, asset_map: dict[str, Any]) -> None:
@@ -1147,14 +1208,35 @@ async def _plan_attack_async(scan_id: str, asset_map: dict[str, Any]) -> None:
         scan_context = ScanContext(scan_id=scan_uuid, target_url=target_url, asset_map=scan_record.asset_map)
 
         planner = AttackPlanner()
-        tasks = planner.plan(scan_context)
+        scan_budget = _scan_budget_from_scan(scan_record)
+        tasks = planner.plan(scan_context, scan_budget=scan_budget)
         endpoint_by_id = {endpoint.id: endpoint for endpoint in endpoints}
         for task in tasks:
             endpoint = endpoint_by_id.get(task.endpoint_id)
             if endpoint is not None:
                 task.endpoint = endpoint
         policy = _policy_from_scan(scan_record)
-        tasks, skipped_records = filter_tasks_by_policy(tasks, policy)
+        tasks, skipped_tasks = filter_tasks_by_policy(tasks, policy)
+        skipped_records: list[dict[str, str]] = []
+        for skipped_task, policy_field in skipped_tasks:
+            skipped_task.status = AttackTaskStatus.failed
+            reason = f"policy:{policy_field}"
+            skipped_records.append(
+                {
+                    "task_id": str(skipped_task.id),
+                    "reason": reason,
+                    "attack_class": str(skipped_task.attack_class),
+                }
+            )
+            session.add(
+                AuditEvent(
+                    event_type=AuditEventType.TASK_SKIPPED,
+                    scan_id=scan_uuid,
+                    actor="planner",
+                    details=redact_for_audit({"task_id": str(skipped_task.id), "reason": reason}),
+                )
+            )
+        tasks.extend(skipped_task for skipped_task, _ in skipped_tasks)
         session.add_all(tasks)
         await session.commit()
         try:
@@ -1205,6 +1287,33 @@ def _policy_from_scan(scan: Scan) -> ScanPolicy:
     if isinstance(allowed_domains, list):
         return ScanPolicy(allowed_domains=[str(domain) for domain in allowed_domains if domain])
     return ScanPolicy()
+
+
+def _scan_budget_from_scan(scan: Scan) -> ScanBudget | None:
+    config = scan.target.config if scan.target is not None and isinstance(scan.target.config, dict) else {}
+    raw_budget = config.get("scan_budget")
+    if not isinstance(raw_budget, dict):
+        return None
+    max_requests = raw_budget.get("max_requests")
+    max_runtime_seconds = raw_budget.get("max_runtime_seconds")
+    if not isinstance(max_requests, int) or isinstance(max_requests, bool):
+        return None
+    if not isinstance(max_runtime_seconds, int) or isinstance(max_runtime_seconds, bool):
+        return None
+    raw_caps = raw_budget.get("per_class_cap", {})
+    per_class_cap: dict[str, int] = {}
+    if isinstance(raw_caps, dict):
+        for key, value in raw_caps.items():
+            if isinstance(key, str) and isinstance(value, int) and not isinstance(value, bool):
+                per_class_cap[key] = value
+    raw_priority = raw_budget.get("priority_classes", [])
+    priority_classes = [item for item in raw_priority if isinstance(item, str)]
+    return ScanBudget(
+        max_requests=max_requests,
+        max_runtime_seconds=max_runtime_seconds,
+        per_class_cap=per_class_cap,
+        priority_classes=priority_classes,
+    )
 
 
 def _store_skipped_task_records(redis_client: Any, scan_id: str, skipped_records: list[dict]) -> None:

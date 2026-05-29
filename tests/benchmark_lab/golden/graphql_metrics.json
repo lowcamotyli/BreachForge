@@ -1,0 +1,24 @@
+{
+  "attack_classes": [
+    "GRAPHQL_INTROSPECTION",
+    "GRAPHQL_BATCH",
+    "GRAPHQL_DEPTH",
+    "GRAPHQL_FIELD_AUTH"
+  ],
+  "coverage": 0.0,
+  "coverage_by_attack_class": {
+    "GRAPHQL_BATCH": 0.0,
+    "GRAPHQL_DEPTH": 0.0,
+    "GRAPHQL_FIELD_AUTH": 0.0,
+    "GRAPHQL_INTROSPECTION": 0.0
+  },
+  "fn": 4,
+  "fp": 0,
+  "ground_truth_count": 4,
+  "lab_id": "graphql",
+  "lab_version": "1.0.0",
+  "max_fp": 0,
+  "min_coverage": 0.0,
+  "mode": "quick",
+  "tp": 0
+}

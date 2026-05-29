@@ -21,6 +21,8 @@ class ScanContext:
     prior_findings: list[Finding] = field(default_factory=list)
     # Populated during replanning: IDs of tasks already executed (dedup guard).
     completed_task_ids: set[UUID] = field(default_factory=set)
+    # Populated during replanning: guard against unbounded replan loops.
+    replan_budget: ReplanBudget | None = None
 
 
 class AttackRule(ABC):

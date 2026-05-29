@@ -15,7 +15,7 @@ router = APIRouter()
 @router.get("/scans/{scan_id}/report")
 async def get_report(
     scan_id: UUID,
-    format: Literal["json", "markdown"] = Query(default="json"),
+    format: Literal["json", "markdown", "sarif", "html"] = Query(default="json"),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     reporting_service = ReportingService(db=db)
@@ -25,5 +25,11 @@ async def get_report(
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found") from exc
 
-    media_type = "application/json" if format == "json" else "text/markdown"
+    media_type_map = {
+        "json": "application/json",
+        "markdown": "text/markdown",
+        "sarif": "application/sarif+json",
+        "html": "text/html",
+    }
+    media_type = media_type_map.get(format, "application/json")
     return Response(content=payload, media_type=media_type, status_code=status.HTTP_200_OK)

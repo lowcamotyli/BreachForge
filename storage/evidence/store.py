@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
-from uuid import UUID
+from typing import Any
+from uuid import UUID, uuid4
 
 import boto3
 from botocore.client import BaseClient
+from botocore.exceptions import ClientError
 
 from storage.db.models import ProofArtifact, RawProbe
 
@@ -80,12 +83,57 @@ class EvidenceStore:
 
     def read_probe(self, scan_id: UUID | str, finding_id: UUID | str, probe_id: UUID | str) -> dict[str, object]:
         key = f"{self._stringify(scan_id)}/{self._stringify(finding_id)}/{self._stringify(probe_id)}.json.gz"
+        return self.read_json_object(key)
+
+    def read_json_object(self, key: str) -> dict[str, Any]:
         response = self._s3.get_object(Bucket=self._bucket_name, Key=key)
         body = response["Body"].read()
         payload = json.loads(gzip.decompress(body).decode("utf-8"))
         if not isinstance(payload, dict):
-            raise ValueError(f"Probe evidence payload is not an object: {key}")
+            raise ValueError(f"Evidence payload is not an object: {key}")
         return payload
+
+    async def save_bundle(self, finding_id: UUID, bundle_data: dict[str, Any]) -> UUID:
+        bundle_id = uuid4()
+        key = self._bundle_key(finding_id)
+        serialized_bundle = self._serialize_value(bundle_data)
+        if not isinstance(serialized_bundle, dict):
+            raise ValueError("Evidence bundle payload must be an object")
+        payload = {
+            **serialized_bundle,
+            "bundle_id": str(bundle_id),
+            "finding_id": str(finding_id),
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        await asyncio.to_thread(self._put_gzip_json, key, payload)
+        return bundle_id
+
+    async def load_bundle(self, finding_id: UUID) -> dict[str, Any] | None:
+        key = self._bundle_key(finding_id)
+        try:
+            return await asyncio.to_thread(self.read_json_object, key)
+        except ClientError as exc:
+            error = exc.response.get("Error", {})
+            if error.get("Code") in {"NoSuchKey", "404", "NotFound"}:
+                return None
+            raise
+
+    def list_scan_objects(self, scan_id: UUID | str) -> list[dict[str, Any]]:
+        prefix = f"{self._stringify(scan_id)}/"
+        paginator = self._s3.get_paginator("list_objects_v2")
+        records: list[dict[str, Any]] = []
+        for page in paginator.paginate(Bucket=self._bucket_name, Prefix=prefix):
+            contents = page.get("Contents", [])
+            if not isinstance(contents, list):
+                continue
+            for item in contents:
+                if not isinstance(item, dict):
+                    continue
+                key = item.get("Key")
+                if not isinstance(key, str) or not key.endswith(".json.gz"):
+                    continue
+                records.append({"key": key, "payload": self.read_json_object(key)})
+        return records
 
     def _put_gzip_json(self, key: str, payload: dict[str, object]) -> None:
         body = gzip.compress(json.dumps(payload, default=self._serialize_value, separators=(",", ":")).encode("utf-8"))
@@ -96,6 +144,9 @@ class EvidenceStore:
             ContentType="application/json",
             ContentEncoding="gzip",
         )
+
+    def _bundle_key(self, finding_id: UUID) -> str:
+        return f"bundles/{self._stringify(finding_id)}.json.gz"
 
     def _serialize_value(self, value: object) -> object:
         if isinstance(value, UUID):
